@@ -8,6 +8,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { consumeWrapupDirective } from "./time-limits.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -102,11 +103,11 @@ export function findLatestAssistantError(
   return null;
 }
 
-export function buildCompletionSidecar(messages: any[] | undefined):
-  | { type: "done" }
+export function buildCompletionSidecar(messages: any[] | undefined, wrapup = false):
+  | { type: "done"; wrapup?: true }
   | { type: "error"; errorMessage: string; stopReason: "error" } {
   const errorInfo = findLatestAssistantError(messages);
-  return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
+  return errorInfo ? { type: "error", ...errorInfo } : { type: "done", ...(wrapup ? { wrapup: true } : {}) };
 }
 
 export function parseDeniedTools(rawValue: string | undefined): string[] {
@@ -187,6 +188,7 @@ export default function (pi: ExtensionAPI) {
   let warnedOperatorTakeover = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
+  let wrapupInProgress = false;
 
   // Operator takeover (typed input or an Escape abort) permanently disarms
   // auto-exit for this session. The warning is latched so it is emitted
@@ -212,8 +214,11 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", (_event, ctx) => {
+  pi.on("input", (event, ctx) => {
     recorder.input();
+    // Extension-injected report directives are not operator takeover. This keeps
+    // the report-only continuation compatible with sticky auto-exit disarming.
+    if ((event as any).source === "extension") return;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
@@ -238,7 +243,24 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
     const stopReason = latestAssistantStopReason(latestAgentMessages);
+
+    // Time-limit wrap-up: an interrupt left the latest assistant turn aborted
+    // and a .wrapup directive exists. Consume it once and inject a report-only
+    // continuation. Checked BEFORE the Escape-disarm below so a machine-caused
+    // time-limit interrupt is never mistaken for operator takeover.
+    const directive = !wrapupInProgress && stopReason === "aborted"
+      ? consumeWrapupDirective(sessionFile)
+      : null;
+    if (directive) {
+      wrapupInProgress = true;
+      // Extension-sourced turn: pi.sendUserMessage re-enters the "input"
+      // event with source: "extension", which the input handler ignores, so
+      // this continuation never flips the operator-takeover disarm latch.
+      pi.sendUserMessage(directive);
+      return;
+    }
 
     // An Escape-triggered abort is operator takeover too: permanently disarm
     // (single warning above) and leave the session open for inspection.
@@ -246,9 +268,15 @@ export default function (pi: ExtensionAPI) {
       disarmAutoExit("Escape", ctx);
     }
 
-    const shouldExit = autoExit
+    // Exit when auto-exit says so, OR when a wrap-up continuation finished a
+    // non-aborted turn: that partial report must reach the parent even if the
+    // operator had disarmed auto-exit earlier. The one-shot re-arm is consumed
+    // only when the auto-exit branch itself decided the exit (L-95 rule).
+    const autoExitShouldFire = autoExit
       && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
-    if (shouldExit && oneShotReArm) {
+    const shouldExit = autoExitShouldFire
+      || (wrapupInProgress && stopReason !== "aborted");
+    if (autoExitShouldFire && oneShotReArm) {
       // Consume the one-shot re-arm: after this exit auto-exit is disarmed
       // again until the operator runs /auto-exit once more.
       oneShotReArm = false;
@@ -258,12 +286,11 @@ export default function (pi: ExtensionAPI) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (sessionFile) {
         try {
           writeFileSync(
             `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
+            JSON.stringify(buildCompletionSidecar(latestAgentMessages, wrapupInProgress)),
           );
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
@@ -404,7 +431,10 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) }),
+        );
       }
       ctx.shutdown();
       return {
