@@ -75,17 +75,22 @@ before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
 });
+const createdTestDirs: string[] = [];
+
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
   else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  for (const dir of createdTestDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 // --- Helpers ---
 
 function createTestDir(): string {
-  return mkdtempSync(join(tmpdir(), "subagents-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "subagents-test-"));
+  createdTestDirs.push(dir);
+  return dir;
 }
 
 function createSessionFile(dir: string, entries: object[]): string {
