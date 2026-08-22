@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import subagentDoneExtension, {
@@ -18,9 +18,11 @@ interface Notification {
 function createExtensionApi() {
   const eventHandlers = new Map<string, Array<Function>>();
   const registeredCommands: Array<{ name: string; handler: Function }> = [];
+  const sentUserMessages: string[] = [];
   return {
     eventHandlers,
     registeredCommands,
+    sentUserMessages,
     api: {
       on(event: string, handler: Function) {
         const handlers = eventHandlers.get(event) ?? [];
@@ -33,7 +35,9 @@ function createExtensionApi() {
       },
       registerMessageRenderer() {},
       registerShortcut() {},
-      sendUserMessage() {},
+      sendUserMessage(message: string) {
+        sentUserMessages.push(message);
+      },
       sendMessage() {},
       getAllTools() {
         return [];
@@ -77,7 +81,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       delete process.env.PI_SUBAGENT_SESSION;
     }
 
-    const { api, eventHandlers, registeredCommands } = createExtensionApi();
+    const { api, eventHandlers, registeredCommands, sentUserMessages } = createExtensionApi();
     subagentDoneExtension(api);
 
     const notifications: Notification[] = [];
@@ -99,6 +103,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       notifications,
       sessionFile,
       registeredCommands,
+      sentUserMessages,
       fire(event: string, payload: any = {}) {
         for (const handler of eventHandlers.get(event) ?? []) handler(payload, ctx);
       },
@@ -128,7 +133,8 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       [false, false, "stop", true],
       [false, false, "error", true],
       [false, false, "aborted", false],
-      [false, false, undefined, true],
+      [false, false, "toolUse", false],
+      [false, false, undefined, false],
       // Disarmed: never exits, whatever happened.
       [true, false, "stop", false],
       [true, false, "error", false],
@@ -139,6 +145,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       [true, true, "stop", true],
       [true, true, "error", true],
       [true, true, "aborted", false],
+      [true, true, "toolUse", false],
       // Re-arm while armed cannot occur via CLI but is harmless.
       [false, true, "stop", true],
     ];
@@ -157,6 +164,85 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     assert.equal(child.ctx.shutdowns, 1, "zero-real-input child still exits");
     assert.deepEqual(sidecarOf(child), { type: "done" });
     assert.equal(child.notifications.length, 0, "no warning for the injected task");
+  });
+
+  it("keeps the child alive after a tool-use turn until the final report", () => {
+    const child = boot();
+    child.fire("agent_start", {});
+    child.fire("tool_execution_start", { toolCallId: "call-1", toolName: "read" });
+    child.fire("tool_result", { toolCallId: "call-1", toolName: "read" });
+    child.fire("tool_execution_end", { toolCallId: "call-1", toolName: "read" });
+
+    child.settle([
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call-1",
+        isError: false,
+        content: [{ type: "text", text: "successful tool result" }],
+      },
+    ]);
+    assert.equal(child.ctx.shutdowns, 0, "tool-use boundary must not auto-exit");
+    assert.equal(sidecarOf(child), null, "no completion sidecar at tool-use boundary");
+
+    child.settle([
+      {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "final report" }],
+      },
+    ]);
+    assert.equal(child.ctx.shutdowns, 1, "later final assistant turn exits");
+    assert.deepEqual(sidecarOf(child), { type: "done" });
+  });
+
+  it("publishes an injected tool or policy error as a failure", () => {
+    const child = boot();
+    child.settle([
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "Tool execution blocked by policy",
+        content: [],
+      },
+    ]);
+    assert.equal(child.ctx.shutdowns, 1, "terminal tool error wakes the parent");
+    assert.deepEqual(sidecarOf(child), {
+      type: "error",
+      errorMessage: "Tool execution blocked by policy",
+      stopReason: "error",
+    });
+  });
+
+  it("does not treat a wrap-up tool-use boundary as the report", () => {
+    const child = boot();
+    writeFileSync(`${child.sessionFile}.wrapup`, "provide a final partial report");
+    child.settle([{ role: "assistant", stopReason: "aborted" }]);
+    assert.equal(child.ctx.shutdowns, 0);
+    assert.deepEqual(child.sentUserMessages, ["provide a final partial report"]);
+
+    child.settle([
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "call-wrapup", name: "read", arguments: {} }],
+      },
+    ]);
+    assert.equal(child.ctx.shutdowns, 0, "wrap-up stays open through tool use");
+
+    child.settle([
+      {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "partial report" }],
+      },
+    ]);
+    assert.equal(child.ctx.shutdowns, 1, "wrap-up exits on its final report");
+    assert.deepEqual(sidecarOf(child), { type: "done", wrapup: true });
   });
 
   it("operator input disarms auto-exit persistently across settled turns", () => {
