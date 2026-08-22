@@ -218,6 +218,41 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     });
   });
 
+  it("keeps a policy-denied tool boundary open before reporting terminal failure", () => {
+    const child = boot();
+    child.settle([
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "call-policy", name: "read", arguments: {} }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call-policy",
+        isError: true,
+        details: { error: "policy denied" },
+        content: [{ type: "text", text: "Tool execution blocked by policy" }],
+      },
+    ]);
+    assert.equal(child.ctx.shutdowns, 0, "policy tool-use boundary must not complete the child");
+    assert.equal(sidecarOf(child), null, "policy boundary is not a clean completion");
+
+    child.settle([
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "Tool execution blocked by policy",
+        content: [],
+      },
+    ]);
+    assert.equal(child.ctx.shutdowns, 1, "later terminal error wakes the parent");
+    assert.deepEqual(sidecarOf(child), {
+      type: "error",
+      errorMessage: "Tool execution blocked by policy",
+      stopReason: "error",
+    });
+  });
+
   it("does not treat a wrap-up tool-use boundary as the report", () => {
     const child = boot();
     writeFileSync(`${child.sessionFile}.wrapup`, "provide a final partial report");
