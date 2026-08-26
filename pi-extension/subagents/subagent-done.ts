@@ -14,28 +14,26 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
+function isTerminalAutoExitStopReason(stopReason: string | undefined): boolean {
+  return stopReason === "stop" || stopReason === "error";
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
+  // A tool-use response is an intermediate turn boundary. Keep the child
+  // alive so Pi can deliver the next assistant response or a tool failure.
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
+        return isTerminalAutoExitStopReason(msg.stopReason);
       }
     }
   }
 
-  return true;
+  return false;
 }
 
 export interface AutoExitDecisionState {
@@ -59,7 +57,7 @@ export function resolveAutoExit(
   stopReason: string | undefined,
 ): boolean {
   if (state.disarmed && !state.oneShotReArm) return false;
-  return stopReason !== "aborted";
+  return isTerminalAutoExitStopReason(stopReason);
 }
 
 function latestAssistantStopReason(messages: any[] | undefined): string | undefined {
@@ -275,7 +273,7 @@ export default function (pi: ExtensionAPI) {
     const autoExitShouldFire = autoExit
       && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
     const shouldExit = autoExitShouldFire
-      || (wrapupInProgress && stopReason !== "aborted");
+      || (wrapupInProgress && isTerminalAutoExitStopReason(stopReason));
     if (autoExitShouldFire && oneShotReArm) {
       // Consume the one-shot re-arm: after this exit auto-exit is disarmed
       // again until the operator runs /auto-exit once more.
