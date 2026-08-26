@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PiHarnessDriver } from "../pi-extension/subagents/harness/index.ts";
@@ -209,6 +210,83 @@ describe("termination regression", () => {
     assert.equal(testApi.blockedSelfSpawn("planner", "scout"), false);
     assert.equal(testApi.blockedSelfSpawn(undefined, "scout"), false);
     assert.equal(testApi.blockedSelfSpawn("scout", undefined), false);
+  });
+});
+
+describe("resume session cwd preflight", () => {
+  it("heals a missing cwd and preserves every byte after the header", () => {
+    const dir = mkdtempSync(join(tmpdir(), "resume-cwd-test-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      const resumeCwd = join(dir, "resuming");
+      mkdirSync(resumeCwd);
+      const header = {
+        type: "session",
+        version: 3,
+        id: "session-id",
+        timestamp: "2026-08-26T00:00:00.000Z",
+        cwd: join(dir, "pruned-worktree"),
+      };
+      const tail = `{"type":"message","id":"message-id","payload":"preserve me"}\n{"type":"turn_end","id":"turn-end-id"}\n`;
+      writeFileSync(sessionFile, JSON.stringify(header) + "\n" + tail, "utf8");
+      const before = readFileSync(sessionFile);
+      const firstNewline = before.indexOf(0x0a);
+      const tailHash = createHash("sha256").update(before.subarray(firstNewline + 1)).digest("hex");
+
+      const result = testApi.ensureResumeSessionCwd(sessionFile, resumeCwd);
+
+      assert.deepEqual(result, { ok: true, healed: true });
+      const after = readFileSync(sessionFile);
+      assert.equal(
+        createHash("sha256").update(after.subarray(after.indexOf(0x0a) + 1)).digest("hex"),
+        tailHash,
+      );
+      const healedHeader = JSON.parse(after.subarray(0, after.indexOf(0x0a)).toString("utf8"));
+      assert.equal(healedHeader.cwd, resumeCwd);
+      assert.equal(healedHeader.type, header.type);
+      assert.equal(healedHeader.id, header.id);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a session with an existing cwd byte-identical", () => {
+    const dir = mkdtempSync(join(tmpdir(), "resume-cwd-test-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      const header = {
+        type: "session",
+        cwd: dir,
+        id: "existing-cwd",
+      };
+      const original = Buffer.from(JSON.stringify(header) + "\r\nsecond line\n", "utf8");
+      writeFileSync(sessionFile, original);
+
+      const result = testApi.ensureResumeSessionCwd(sessionFile, join(dir, "other"));
+
+      assert.deepEqual(result, { ok: true, healed: false });
+      assert.deepEqual(readFileSync(sessionFile), original);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a corrupt header before resume can launch", () => {
+    const dir = mkdtempSync(join(tmpdir(), "resume-cwd-test-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      const original = Buffer.from("{not valid json\n{\"type\":\"message\"}\n", "utf8");
+      writeFileSync(sessionFile, original);
+
+      const result = testApi.ensureResumeSessionCwd(sessionFile, dir);
+
+      assert.equal(result.ok, false);
+      if (result.ok) assert.fail("corrupt headers must block resume");
+      assert.match(result.error, /parse.*header|header.*parse/i);
+      assert.deepEqual(readFileSync(sessionFile), original);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

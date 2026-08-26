@@ -2,14 +2,17 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import {
   readdirSync,
   readFileSync,
   writeFileSync,
   existsSync,
   mkdirSync,
+  renameSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -330,6 +333,72 @@ function readSpawnMetadata(sessionFile: string): { allowance?: unknown } | null 
   } catch {
     return null;
   }
+}
+
+type ResumeSessionCwdResult =
+  | { ok: true; healed: boolean }
+  | { ok: false; error: string };
+
+/** Ensure a resumed session has a cwd that pi can open without prompting. */
+function ensureResumeSessionCwd(sessionFile: string, resumingCwd: string): ResumeSessionCwdResult {
+  let raw: Buffer;
+  try {
+    raw = readFileSync(sessionFile);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Unable to read session file: ${reason}` };
+  }
+
+  const firstLineEnd = raw.indexOf(0x0a);
+  const firstLine = raw
+    .subarray(0, firstLineEnd === -1 ? raw.length : firstLineEnd)
+    .toString("utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(firstLine);
+  } catch {
+    return { ok: false, error: "Unable to parse the session header JSON" };
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    typeof (parsed as { cwd?: unknown }).cwd !== "string"
+  ) {
+    return { ok: false, error: "Session header has no valid cwd" };
+  }
+
+  const header = parsed as Record<string, unknown>;
+  if (existsSync(header.cwd as string)) return { ok: true, healed: false };
+
+  const lineEndingStart =
+    firstLineEnd !== -1 && firstLineEnd > 0 && raw[firstLineEnd - 1] === 0x0d
+      ? firstLineEnd - 1
+      : firstLineEnd === -1
+        ? raw.length
+        : firstLineEnd;
+  const rewritten = Buffer.concat([
+    Buffer.from(JSON.stringify({ ...header, cwd: resumingCwd }), "utf8"),
+    raw.subarray(lineEndingStart),
+  ]);
+  const tempFile = join(
+    dirname(sessionFile),
+    `.${basename(sessionFile)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(tempFile, rewritten, { flag: "wx", mode: 0o600 });
+    renameSync(tempFile, sessionFile);
+  } catch (error) {
+    try {
+      unlinkSync(tempFile);
+    } catch {
+      // Keep the original failure as the block reason.
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Unable to repair missing session cwd: ${reason}` };
+  }
+
+  return { ok: true, healed: true };
 }
 
 /** Same-agent respawn guard: an agent never spawns another instance of itself. */
@@ -1408,6 +1477,7 @@ export const __test__ = {
   decrementSpawnDepth,
   clampResumeSpawn,
   readSpawnMetadata,
+  ensureResumeSessionCwd,
   blockedSelfSpawn,
   SPAWNING_TOOLS,
   resolveInterruptTarget,
@@ -2300,6 +2370,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               { type: "text", text: `Error: session file not found: ${params.sessionPath}` },
             ],
             details: { error: "session not found" },
+          };
+        }
+
+        const resumeCwd = ensureResumeSessionCwd(params.sessionPath, ctx.cwd);
+        if (!resumeCwd.ok) {
+          return {
+            content: [{ type: "text", text: `Error: ${resumeCwd.error}` }],
+            details: { error: resumeCwd.error },
           };
         }
 
