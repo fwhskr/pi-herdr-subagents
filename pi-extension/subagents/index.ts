@@ -13,6 +13,8 @@ import {
   mkdirSync,
   renameSync,
   unlinkSync,
+  accessSync,
+  constants as fsConstants,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -102,6 +104,19 @@ import {
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+
+function preflightSubagentDonePath(subagentsDir = SUBAGENTS_DIR): string {
+  const subagentDonePath = join(subagentsDir, "subagent-done.ts");
+  try {
+    accessSync(subagentDonePath, fsConstants.R_OK);
+  } catch {
+    throw new Error(
+      `Cannot launch subagent: child extension "${subagentDonePath}" is missing or unreadable. ` +
+      "Likely cause: a live-package-swap (pi install/remove) while the parent session was running.",
+    );
+  }
+  return subagentDonePath;
+}
 
 // Survive /reload: replace presentation timers while keeping active completion
 // watchers and their registry alive. Old module closures continue watching the
@@ -1498,6 +1513,8 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  preflightSubagentDonePath,
+  enrichNoSessionFailure,
   runningSubagents,
   formatElapsed,
 };
@@ -1533,6 +1550,7 @@ async function launchSubagent(
   parentThinking: ThinkingLevel,
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
+  preflightSubagentDonePath();
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
@@ -1706,6 +1724,30 @@ async function launchSubagent(
   return running;
 }
 
+const FAILURE_PANE_TAIL_LINES = 20;
+
+function enrichNoSessionFailure(
+  result: Pick<import("./completion.ts").CompletionResult, "exitCode">,
+  running: Pick<RunningSubagent, "sessionFile" | "surface">,
+  summary: string,
+  readPaneFn: typeof readPane = readPane,
+): { summary: string; error?: string } {
+  if (result.exitCode === 0 || existsSync(running.sessionFile)) return { summary };
+
+  let paneTail: string;
+  try {
+    paneTail = readPaneFn(running.surface, FAILURE_PANE_TAIL_LINES);
+  } catch {
+    return { summary };
+  }
+  if (!paneTail.trim()) return { summary };
+
+  return {
+    summary: `${summary}\n\nChild pane output:\n${paneTail}`,
+    error: paneTail,
+  };
+}
+
 /**
  * Watch a launched subagent until it exits. Polls for completion, extracts
  * the summary from the session file, cleans up the surface,
@@ -1763,17 +1805,19 @@ async function watchSubagent(
       });
 
       if (extracted) {
+        const enriched = enrichNoSessionFailure(result, running, extracted.summary);
         closePane(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
-          : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
+          : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
 
         return {
           name,
           task,
-          summary: extracted.summary,
+          summary: enriched.summary,
           exitCode: result.exitCode,
           elapsed,
+          ...(enriched.error ? { error: enriched.error } : {}),
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
           ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
           ...extracted.details,
@@ -1826,19 +1870,21 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
+    const enriched = enrichNoSessionFailure(result, running, summary);
     closePane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
-      : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
+      : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
 
     return {
       name,
       task,
-      summary,
+      summary: enriched.summary,
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
+      ...(enriched.error ? { error: enriched.error } : {}),
       ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
@@ -2391,6 +2437,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
+        const subagentDonePath = preflightSubagentDonePath();
         const surface = createSubagentPane(name);
         if (params.message) {
           setPaneTask(surface, params.message);
@@ -2401,7 +2448,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellQuote(subagentDonePath));
 
         const sessionId = ctx.sessionManager.getSessionId();
