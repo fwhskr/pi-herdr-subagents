@@ -396,6 +396,44 @@ describe("session.ts", () => {
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
     });
+
+    it("L-162: returns text when final assistant message carries text alongside subagent_done toolCall", () => {
+      // The fix requires the report text to be in the SAME message as the
+      // subagent_done tool call; extraction must not drop the text when a
+      // toolCall block is present in the same content array.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Task complete: updated docs." },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Task complete: updated docs.");
+    });
+
+    it("L-162: returns null when final assistant message has only a subagent_done toolCall, so caller falls back to 'Sub-agent exited without output'", () => {
+      // muse-spark calls subagent_done with a thinking+toolCall message and no
+      // text block; the extractor must return nothing so the parent at
+      // index.ts:1813 falls back to the no-output wording.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "done" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      const extracted = findLastAssistantMessage([msg] as any[]);
+      assert.equal(extracted, null);
+      // Replicates the fallback branch in pi-extension/subagents/index.ts
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
   });
 
   describe("findObservedSessionRuntime", () => {
