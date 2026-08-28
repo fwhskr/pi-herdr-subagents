@@ -423,7 +423,10 @@ export default function (pi: ExtensionAPI) {
     description:
       "Call this tool when you have completed your task. " +
       "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
+      "The final report must be written as text in the SAME assistant message as this tool call — " +
+      "include the report text alongside the tool call. " +
+      "Calling it without accompanying text returns no summary to the caller " +
+      "(\"Sub-agent exited without output\").",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
