@@ -426,8 +426,17 @@ export default function (pi: ExtensionAPI) {
       "The final report must be written as text in the SAME assistant message as this tool call — " +
       "include the report text alongside the tool call. " +
       "Calling it without accompanying text returns no summary to the caller " +
-      "(\"Sub-agent exited without output\").",
-    parameters: Type.Object({}),
+      "(\"Sub-agent exited without output\"). " +
+      "Profiles which cannot emit text alongside tool calls must pass the report via the `report` argument.",
+    parameters: Type.Object({
+      report: Type.Optional(
+        Type.String({
+          description:
+            "Final report summary for the parent session. Use this when your profile cannot emit text alongside the tool call; otherwise prefer same-message text.",
+          minLength: 1,
+        }),
+      ),
+    }),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();

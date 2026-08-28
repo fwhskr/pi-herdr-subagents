@@ -434,6 +434,134 @@ describe("session.ts", () => {
       const fallback = extracted ?? "Sub-agent exited without output";
       assert.equal(fallback, "Sub-agent exited without output");
     });
+
+    it("L-162 phase2: same-message text wins over arguments.report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Preferred same-message report" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Fallback report param" } },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Preferred same-message report");
+    });
+
+    it("L-162 phase2: toolCall-only with non-empty report returns the report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report via arg" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Report via arg");
+    });
+
+    it("L-162 phase2: handles report via name field and stringified JSON arguments", () => {
+      const viaName = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "subagent_done", id: "tc-done", arguments: { report: "Via name field" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaName] as any[]), "Via name field");
+
+      const viaJsonString = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: JSON.stringify({ report: "Via JSON string" }) }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaJsonString] as any[]), "Via JSON string");
+    });
+
+    it("L-162 phase2: toolCall-only without report falls back to earlier assistant text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier summary" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier summary");
+    });
+
+    it("L-162 phase2: whitespace-only report is treated as empty and falls back to earlier text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier valid" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "   " } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier valid");
+    });
+
+    it("L-162 phase2: no report + no earlier text → null (fallback wording)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      const extracted = findLastAssistantMessage([final] as any[]);
+      assert.equal(extracted, null);
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: final error still beats stale earlier text (priority 3 > 4)", () => {
+      const earlierGood = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Stale earlier text" }],
+        },
+      };
+      const errorFinal = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "provider failed",
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlierGood, errorFinal] as any[]), "Subagent error: provider failed");
+    });
+
+    it("L-162 phase2: final report beats final error (priority 2 > 3)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report wins over error" } }],
+          stopReason: "error",
+          errorMessage: "should be ignored",
+        },
+      };
+      assert.equal(findLastAssistantMessage([final] as any[]), "Report wins over error");
+    });
   });
 
   describe("findObservedSessionRuntime", () => {
