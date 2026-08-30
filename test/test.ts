@@ -2452,7 +2452,7 @@ describe("subagent interruption", () => {
       surface: "pane-1",
       startTime: 0,
       sessionFile: "worker.jsonl",
-      interactive: false,
+      interactive: true,
       lifecycle: createLifecycle(0),
       ...overrides,
     };
@@ -2684,6 +2684,51 @@ describe("subagent interruption", () => {
 
       assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
       assert.equal(runningMap.has("a1"), true);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reaps autonomous first-run and resumed workers after interrupt", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const cases = [
+      ["first", "Worker", "worker.jsonl"],
+      ["resume", "Resumed", "resumed.jsonl"],
+    ] as const;
+
+    try {
+      for (const [id, name, sessionFile] of cases) {
+        let escapes = 0;
+        let closes = 0;
+        let aborts = 0;
+        const running = makeRunning({ id, name, sessionFile, interactive: false });
+        runningMap.clear();
+        runningMap.set(id, running);
+
+        const result = testApi.handleSubagentInterrupt(
+          { id },
+          (surface: string) => {
+            assert.equal(surface, "pane-1");
+            escapes += 1;
+          },
+          (surface: string) => {
+            assert.equal(surface, "pane-1");
+            closes += 1;
+          },
+          () => {
+            aborts += 1;
+          },
+        );
+
+        assert.equal(result.details.status, "interrupt_requested");
+        assert.equal(escapes, 1);
+        assert.equal(closes, 1, `${name} pane should be reaped`);
+        assert.equal(aborts, 1, `${name} watcher should be stopped`);
+        assert.equal(runningMap.has(id), false, `${name} should leave widget tracking`);
+        assert.equal(running.lifecycle.delivery, "suppressed");
+        assert.equal(shouldDeliverSubagentCompletion(running), false);
+      }
     } finally {
       runningMap.clear();
     }

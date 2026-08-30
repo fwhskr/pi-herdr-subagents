@@ -1179,6 +1179,28 @@ function isTerminalLifecycle(lifecycle: SubagentLifecycle): boolean {
   return lifecycle.process.kind === "completed" || lifecycle.process.kind === "failed";
 }
 
+/** Stop and forget an autonomous child after its parent requests an interrupt. */
+function reapInterruptedSubagent(
+  running: RunningSubagent,
+  closePaneKey: (surface: string) => void = closePane,
+  abortWatcherKey: (controller: AbortController | undefined) => void = (controller) => controller?.abort(),
+): boolean {
+  const lifecycle = ensureLifecycle(running);
+  if (lifecycle.delivery !== "pending") return false;
+
+  // Suppress a watcher that races the explicit close. The session file stays
+  // resumable, but a late sidecar/error must not recreate a widget row.
+  running.lifecycle = markDelivery(lifecycle, "suppressed");
+  try {
+    closePaneKey(running.surface);
+  } catch {}
+  try {
+    abortWatcherKey(running.abortController);
+  } catch {}
+  runningSubagents.delete(running.id);
+  return true;
+}
+
 /** Idempotent failure teardown shared with future hard-stop paths. */
 function failAndTeardownSubagent(
   running: RunningSubagent,
@@ -1338,6 +1360,8 @@ function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): Sub
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
   interruptPaneKey: (surface: string) => void = interruptPane,
+  closePaneKey: (surface: string) => void = closePane,
+  abortWatcherKey: (controller: AbortController | undefined) => void = (controller) => controller?.abort(),
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -1376,6 +1400,9 @@ function handleSubagentInterrupt(
   }
 
   running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
+  if (!running.interactive) {
+    reapInterruptedSubagent(running, closePaneKey, abortWatcherKey);
+  }
   updateWidget();
 
   return {
@@ -1482,6 +1509,7 @@ export const __test__ = {
   SPAWNING_TOOLS,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  reapInterruptedSubagent,
   failAndTeardownSubagent,
   advanceRunningRecovery,
   buildRecoveryKilledResult,
@@ -2186,13 +2214,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt the active turn of a running Pi-backed subagent. " +
+        "Autonomous one-shot children are reaped after Escape (their pane closes and late delivery is suppressed); " +
+        "interactive children remain open for user takeover. This returns only a local acknowledgement.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt the active turn of a running Pi-backed subagent. " +
+        "Autonomous one-shot children are reaped after Escape (their pane closes and late delivery is suppressed); " +
+        "interactive children remain open for user takeover. This returns only a local acknowledgement.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),

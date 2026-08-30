@@ -153,7 +153,7 @@ Projected labels include:
 - `active` — processing work (agent turn, provider request, streaming, or tool execution)
 - `blocked` — Herdr reports the child as blocked
 - `waiting` — turn finished; the process is intentionally open for more input or another stage
-- `interrupted` — the current turn was cancelled (Escape / `subagent_interrupt`); the process stays open and is **not** treated as active processing
+- `interrupted` — the current turn was cancelled (Escape / `subagent_interrupt`); interactive sessions stay open for takeover, while autonomous one-shot sessions are reaped
 - `stalled` — pane inspection is unhealthy long enough that the parent can no longer trust the run
 - `running` — fallback when only coarse process presence is known (e.g. non-Pi backends)
 - `finalizing` — completion was observed and delivery is in progress; the process elapsed timer freezes here
@@ -161,9 +161,9 @@ Projected labels include:
 The widget header counts **active** vs **open**:
 
 - **active** — `active`, `starting`, `running`, or `blocked`
-- **open** — everything else still tracked (`waiting`, `interrupted`, `stalled`, `finalizing`, …)
+- **open** — everything else still tracked (`waiting`, `interrupted`, `stalled`, `finalizing`, …); autonomous interrupted sessions leave tracking immediately after reaping
 
-When `activeCount === 0` (every tracked row is open), the border uses an amber accent. Process elapsed time (`MM:SS` on the left) freezes when the process reaches finalizing/completed/failed. Interrupt does **not** freeze that process clock; the interrupted state shows its own duration on the right while the process remains open.
+When `activeCount === 0` (every tracked row is open), the border uses an amber accent. Process elapsed time (`MM:SS` on the left) freezes when the process reaches finalizing/completed/failed. Interactive interrupts do **not** freeze that process clock; their interrupted state shows its own duration on the right while the process remains open.
 
 A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
@@ -260,9 +260,9 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+This sends Escape to the child pane, cancelling the in-progress model turn. Interactive subagent sessions stay alive for takeover. Autonomous one-shot sessions are reaped immediately after Escape: the pane/tab closes, the watcher stops, and late completion/error delivery is suppressed; the session file remains available for `subagent_resume`. Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt.
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+This remains a turn-level interrupt for interactive sessions; autonomous sessions are explicitly terminated and reaped.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
 
