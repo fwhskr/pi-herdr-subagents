@@ -1478,6 +1478,14 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
+function clearResumeExitSidecar(sessionFile: string): void {
+  try {
+    unlinkSync(`${sessionFile}.exit`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
 function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
   const autoExit = params.autoExit ?? true;
   return { autoExit, interactive: !autoExit };
@@ -1519,6 +1527,9 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  clearResumeExitSidecar,
+  preflightSubagentDonePath,
+  enrichNoSessionFailure,
   runningSubagents,
   formatElapsed,
 };
@@ -2408,6 +2419,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             details: { error: resumeCwd.error },
           };
         }
+
+        // A prior run may have left completion evidence behind after its watcher
+        // consumed the original sidecar. It belongs to the old run, not this one.
+        clearResumeExitSidecar(params.sessionPath);
 
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;

@@ -2027,6 +2027,90 @@ describe("completion.ts", () => {
   });
 });
 
+
+describe("resume completion sidecar", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("clears stale done or ping sidecars before the watcher can consume actual resumed output", async () => {
+    for (const [index, payload] of [
+      { type: "done" },
+      { type: "ping", name: "Worker", message: "needs help" },
+    ].entries()) {
+      const dir = createTestDir();
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", id: `session-${index}`, cwd: dir },
+      ]);
+      const entryCountBefore = getNewEntries(sessionFile, 0).length;
+      const exitFile = `${sessionFile}.exit`;
+      writeFileSync(exitFile, JSON.stringify(payload));
+
+      assert.equal(typeof testApi.clearResumeExitSidecar, "function");
+      testApi.clearResumeExitSidecar(sessionFile);
+      assert.equal(existsSync(exitFile), false, "resume must remove stale completion evidence");
+
+      writeFileSync(
+        sessionFile,
+        JSON.stringify({
+          type: "message",
+          id: `message-${index}`,
+          message: { role: "assistant", content: [{ type: "text", text: "actual resumed child output" }] },
+        }) + "\n",
+        { flag: "a" },
+      );
+      const completion = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "__SUBAGENT_DONE_0__",
+      });
+      assert.deepEqual(completion, { reason: "sentinel", exitCode: 0 });
+      assert.equal(
+        findLastAssistantMessage(getNewEntries(sessionFile, entryCountBefore)),
+        "actual resumed child output",
+      );
+    }
+  });
+});
+
+describe("child launch hardening", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("reports a missing child extension with the absolute path and swap cause", () => {
+    const missingRoot = createTestDir();
+    const missingPath = join(missingRoot, "subagent-done.ts");
+
+    assert.throws(
+      () => testApi.preflightSubagentDonePath(missingRoot),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, new RegExp(missingPath.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
+        assert.match(message, /live.*package.*swap/i);
+        return true;
+      },
+    );
+  });
+
+  it("includes a wider pane tail in non-zero no-session failures", () => {
+    const sessionFile = join(createTestDir(), "child.jsonl");
+    let requestedLines: number | undefined;
+    const paneTail = 'Error: Failed to load extension "/missing/subagent-done.ts"\n';
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { sessionFile, surface: "pane-1" },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => {
+        requestedLines = lines;
+        return paneTail;
+      },
+    );
+
+    assert.equal(requestedLines, 20);
+    assert.match(result.summary, /Sub-agent exited with code 1/);
+    assert.match(result.summary, /Failed to load extension/);
+    assert.equal(result.error, paneTail);
+  });
+});
+
 describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
