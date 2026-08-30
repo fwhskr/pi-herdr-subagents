@@ -2193,6 +2193,49 @@ describe("completion.ts", () => {
   });
 });
 
+describe("resume completion sidecar", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("clears stale done or ping sidecars before the watcher can consume actual resumed output", async () => {
+    for (const [index, payload] of [
+      { type: "done" },
+      { type: "ping", name: "Worker", message: "needs help" },
+    ].entries()) {
+      const dir = createTestDir();
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", id: `session-${index}`, cwd: dir },
+      ]);
+      const entryCountBefore = getNewEntries(sessionFile, 0).length;
+      const exitFile = `${sessionFile}.exit`;
+      writeFileSync(exitFile, JSON.stringify(payload));
+
+      assert.equal(typeof testApi.clearResumeExitSidecar, "function");
+      testApi.clearResumeExitSidecar(sessionFile);
+      assert.equal(existsSync(exitFile), false, "resume must remove stale completion evidence");
+
+      writeFileSync(
+        sessionFile,
+        JSON.stringify({
+          type: "message",
+          id: `message-${index}`,
+          message: { role: "assistant", content: [{ type: "text", text: "actual resumed child output" }] },
+        }) + "\n",
+        { flag: "a" },
+      );
+      const completion = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "__SUBAGENT_DONE_0__",
+      });
+      assert.deepEqual(completion, { reason: "sentinel", exitCode: 0 });
+      assert.equal(
+        findLastAssistantMessage(getNewEntries(sessionFile, entryCountBefore)),
+        "actual resumed child output",
+      );
+    }
+  });
+});
+
 describe("child launch hardening", () => {
   const testApi = (subagentsModule as any).__test__;
 

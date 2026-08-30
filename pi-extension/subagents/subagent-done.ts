@@ -187,6 +187,15 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
   let wrapupInProgress = false;
+  let exitSidecarWritten = false;
+
+  function writeExitSidecar(data: object): void {
+    if (exitSidecarWritten) return;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!sessionFile) return;
+    writeFileSync(`${sessionFile}.exit`, JSON.stringify(data));
+    exitSidecarWritten = true;
+  }
 
   // Operator takeover (typed input or an Escape abort) permanently disarms
   // auto-exit for this session. The warning is latched so it is emitted
@@ -286,10 +295,7 @@ export default function (pi: ExtensionAPI) {
       // can report a clear failure with the underlying error message.
       if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages, wrapupInProgress)),
-          );
+          writeExitSidecar(buildCompletionSidecar(latestAgentMessages, wrapupInProgress));
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
           // after shutdown if the completion sidecar cannot be written.
@@ -407,7 +413,7 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      writeExitSidecar(exitData);
 
       ctx.shutdown();
       return {
@@ -441,10 +447,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(
-          `${sessionFile}.exit`,
-          JSON.stringify({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) }),
-        );
+        writeExitSidecar({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) });
       }
       ctx.shutdown();
       return {

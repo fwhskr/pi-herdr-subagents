@@ -18,10 +18,12 @@ interface Notification {
 function createExtensionApi() {
   const eventHandlers = new Map<string, Array<Function>>();
   const registeredCommands: Array<{ name: string; handler: Function }> = [];
+  const registeredTools: any[] = [];
   const sentUserMessages: string[] = [];
   return {
     eventHandlers,
     registeredCommands,
+    registeredTools,
     sentUserMessages,
     api: {
       on(event: string, handler: Function) {
@@ -29,7 +31,9 @@ function createExtensionApi() {
         handlers.push(handler);
         eventHandlers.set(event, handlers);
       },
-      registerTool() {},
+      registerTool(tool: any) {
+        registeredTools.push(tool);
+      },
       registerCommand(name: string, command: any) {
         registeredCommands.push({ name, ...command });
       },
@@ -81,7 +85,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       delete process.env.PI_SUBAGENT_SESSION;
     }
 
-    const { api, eventHandlers, registeredCommands, sentUserMessages } = createExtensionApi();
+    const { api, eventHandlers, registeredCommands, registeredTools, sentUserMessages } = createExtensionApi();
     subagentDoneExtension(api);
 
     const notifications: Notification[] = [];
@@ -103,6 +107,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       notifications,
       sessionFile,
       registeredCommands,
+      registeredTools,
       sentUserMessages,
       fire(event: string, payload: any = {}) {
         for (const handler of eventHandlers.get(event) ?? []) handler(payload, ctx);
@@ -365,6 +370,26 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       errorMessage: "529 overloaded",
       stopReason: "error",
     });
+  });
+
+  it("does not overwrite an explicit completion sidecar when agent_settled follows", async () => {
+    for (const [name, params] of [
+      ["caller_ping", { message: "need help" }],
+      ["subagent_done", { report: "finished" }],
+    ] as const) {
+      const child = boot();
+      const tool = child.registeredTools.find((candidate: any) => candidate.name === name);
+      assert.ok(tool, `${name} must be registered`);
+
+      await tool.execute("call-1", params, new AbortController().signal, undefined, child.ctx);
+      const sidecarPath = `${child.sessionFile}.exit`;
+      const before = readFileSync(sidecarPath, "utf8");
+
+      child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+      child.fire("agent_settled", { type: "agent_settled" });
+
+      assert.equal(readFileSync(sidecarPath, "utf8"), before, `${name} sidecar must stay latched`);
+    }
   });
 
   it("non-auto-exit sessions never warn and ignore /auto-exit state changes", async () => {
