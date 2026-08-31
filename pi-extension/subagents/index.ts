@@ -15,20 +15,12 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { createHerdrSubagentSessionProvider } from "./herdr-provider.ts";
 import {
-  isTerminalAvailable,
-  terminalSetupHint,
-  createSubagentPane,
-  runScriptInPane,
-  closePane,
-  interruptPane,
   shellQuote,
-  readPane,
-  readPaneAsync,
-  inspectPane,
-  setPaneTask,
-} from "./terminal.ts";
-import { waitForCompletion } from "./completion.ts";
+  type SubagentProviderSession,
+  type SubagentSessionProvider,
+} from "./session-provider.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -101,6 +93,7 @@ import {
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+const sessionProvider = createHerdrSubagentSessionProvider();
 
 // Survive /reload: replace presentation timers while keeping active completion
 // watchers and their registry alive. Old module closures continue watching the
@@ -677,7 +670,7 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require herdr. ${terminalSetupHint()}`,
+        text: `Subagents require herdr. ${sessionProvider.setupHint()}`,
       },
     ],
     details: { error: "herdr not available" },
@@ -792,6 +785,8 @@ interface RunningSubagent {
   wrapupPending?: boolean;
   cli?: string;
   sentinelFile?: string;
+  provider?: SubagentSessionProvider;
+  providerSession?: SubagentProviderSession;
   /**
    * Optional legacy status snapshot retained only for hydrating pre-lifecycle
    * runtime entries after /reload. Live observation uses `lifecycle` only.
@@ -811,28 +806,34 @@ interface RunningSubagent {
   runtimePlan: ResolvedRuntimePlan | undefined;
 }
 
+function providerSessionFor(running: Pick<RunningSubagent, "surface" | "name" | "providerSession">): SubagentProviderSession {
+  return running.providerSession ?? { id: running.surface, name: running.name };
+}
+
+function providerFor(running: Pick<RunningSubagent, "provider">): SubagentSessionProvider {
+  return running.provider ?? sessionProvider;
+}
+
 interface RecoveryPaneOperations {
   interruptPane: (surface: string) => void;
   closePane: (surface: string) => void;
   abortWatcher: (controller: AbortController | undefined) => void;
 }
 
-const DEFAULT_RECOVERY_PANE_OPERATIONS: RecoveryPaneOperations = {
-  interruptPane,
-  closePane,
-  abortWatcher: (controller) => controller?.abort(),
-};
+function providerOperationsFor(running: RunningSubagent): RecoveryPaneOperations {
+  const provider = providerFor(running);
+  const session = providerSessionFor(running);
+  return {
+    interruptPane: () => provider.interrupt(session),
+    closePane: () => provider.close(session),
+    abortWatcher: (controller) => controller?.abort(),
+  };
+}
 
 interface TimeLimitPaneOperations extends RecoveryPaneOperations {
   writeWrapup: (sessionFile: string) => void;
   removeWrapup: (sessionFile: string) => void;
 }
-
-const DEFAULT_TIME_LIMIT_PANE_OPERATIONS: TimeLimitPaneOperations = {
-  ...DEFAULT_RECOVERY_PANE_OPERATIONS,
-  writeWrapup: writeWrapupDirective,
-  removeWrapup: cleanupWrapupDirective,
-};
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
@@ -1161,10 +1162,11 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
 
 function requestSubagentInterrupt(
   running: RunningSubagent,
-  interruptPaneKey: (surface: string) => void = interruptPane,
+  interruptPaneKey?: (surface: string) => void,
 ): { ok: true } | { error: string } {
   try {
-    interruptPaneKey(running.surface);
+    if (interruptPaneKey) interruptPaneKey(running.surface);
+    else providerFor(running).interrupt(providerSessionFor(running));
     return { ok: true };
   } catch (error: any) {
     return {
@@ -1182,7 +1184,7 @@ function isTerminalLifecycle(lifecycle: SubagentLifecycle): boolean {
 /** Stop and forget an autonomous child after its parent requests an interrupt. */
 function reapInterruptedSubagent(
   running: RunningSubagent,
-  closePaneKey: (surface: string) => void = closePane,
+  closePaneKey?: (surface: string) => void,
   abortWatcherKey: (controller: AbortController | undefined) => void = (controller) => controller?.abort(),
 ): boolean {
   const lifecycle = ensureLifecycle(running);
@@ -1192,7 +1194,8 @@ function reapInterruptedSubagent(
   // resumable, but a late sidecar/error must not recreate a widget row.
   running.lifecycle = markDelivery(lifecycle, "suppressed");
   try {
-    closePaneKey(running.surface);
+    if (closePaneKey) closePaneKey(running.surface);
+    else providerFor(running).close(providerSessionFor(running));
   } catch {}
   try {
     abortWatcherKey(running.abortController);
@@ -1206,19 +1209,20 @@ function failAndTeardownSubagent(
   running: RunningSubagent,
   error: string,
   now: number,
-  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+  operations?: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher">,
   beforeAbort?: () => void,
 ): boolean {
   const lifecycle = ensureLifecycle(running);
   if (isTerminalLifecycle(lifecycle)) return false;
 
+  const teardown = operations ?? providerOperationsFor(running);
   beforeAbort?.();
   running.lifecycle = markFailed(lifecycle, error, now, 1);
   try {
-    operations.closePane(running.surface);
+    teardown.closePane(running.surface);
   } catch {}
   try {
-    operations.abortWatcher(running.abortController);
+    teardown.abortWatcher(running.abortController);
   } catch {}
   return true;
 }
@@ -1228,8 +1232,9 @@ function advanceRunningRecovery(
   projection: LifecycleProjection,
   now: number,
   delays: RecoveryDelays,
-  operations: RecoveryPaneOperations = DEFAULT_RECOVERY_PANE_OPERATIONS,
+  operations?: RecoveryPaneOperations,
 ) {
+  const paneOperations = operations ?? providerOperationsFor(running);
   const advance = advanceRecoveryLadder(running.recovery, {
     now,
     stalled: projection.kind === "stalled",
@@ -1242,10 +1247,10 @@ function advanceRunningRecovery(
   running.recovery = advance.state;
 
   if (advance.action === "nudge") {
-    requestSubagentInterrupt(running, operations.interruptPane);
+    requestSubagentInterrupt(running, paneOperations.interruptPane);
   } else if (advance.action === "kill") {
     const error = formatRecoveryKillError(now - running.startTime);
-    failAndTeardownSubagent(running, error, now, operations, () => {
+    failAndTeardownSubagent(running, error, now, paneOperations, () => {
       // The watcher observes its abort asynchronously, so set this first.
       running.recoveryKilled = { errorMessage: error, killedAt: now };
     });
@@ -1272,7 +1277,7 @@ function buildRecoveryKilledResult(running: RunningSubagent, now: number): Subag
 function advanceRunningTimeLimit(
   running: RunningSubagent,
   now: number,
-  operations: TimeLimitPaneOperations = DEFAULT_TIME_LIMIT_PANE_OPERATIONS,
+  operations?: TimeLimitPaneOperations,
 ): { action: "warn" | "hard-stop" | null } {
   if (
     running.interactive ||
@@ -1283,6 +1288,11 @@ function advanceRunningTimeLimit(
     return { action: null };
   }
 
+  const paneOperations = operations ?? {
+    ...providerOperationsFor(running),
+    writeWrapup: writeWrapupDirective,
+    removeWrapup: cleanupWrapupDirective,
+  };
   const lastActivityAt = running.activity?.updatedAt;
   const action = running.timeLimitDeadlineAt != null
     ? now >= running.timeLimitDeadlineAt ? "hard-stop" : "none"
@@ -1296,14 +1306,14 @@ function advanceRunningTimeLimit(
 
   if (action === "warn") {
     try {
-      operations.writeWrapup(running.sessionFile);
+      paneOperations.writeWrapup(running.sessionFile);
     } catch {
       return { action: null };
     }
-    const interruption = requestSubagentInterrupt(running, operations.interruptPane);
+    const interruption = requestSubagentInterrupt(running, paneOperations.interruptPane);
     if ("error" in interruption) {
       try {
-        operations.removeWrapup(running.sessionFile);
+        paneOperations.removeWrapup(running.sessionFile);
       } catch {}
       return { action: null };
     }
@@ -1321,11 +1331,11 @@ function advanceRunningTimeLimit(
 
   if (action === "hard-stop") {
     const error = formatTimeLimitError(now - running.startTime);
-    const stopped = failAndTeardownSubagent(running, error, now, operations, () => {
+    const stopped = failAndTeardownSubagent(running, error, now, paneOperations, () => {
       running.timeLimitStopped = { errorMessage: error, stoppedAt: now };
       running.wrapupPending = false;
       try {
-        operations.removeWrapup(running.sessionFile);
+        paneOperations.removeWrapup(running.sessionFile);
       } catch {}
     });
     return { action: stopped ? "hard-stop" : null };
@@ -1359,8 +1369,8 @@ function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): Sub
 
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
-  interruptPaneKey: (surface: string) => void = interruptPane,
-  closePaneKey: (surface: string) => void = closePane,
+  interruptPaneKey?: (surface: string) => void,
+  closePaneKey?: (surface: string) => void,
   abortWatcherKey: (controller: AbortController | undefined) => void = (controller) => controller?.abort(),
 ) {
   const resolved = resolveInterruptTarget(params);
@@ -1578,8 +1588,8 @@ function startWidgetRefresh() {
 }
 
 /**
- * Launch a subagent: creates the herdr pane, builds the command, and
- * sends it. Returns a RunningSubagent — does NOT poll.
+ * Launch a subagent through the selected session provider. Returns a
+ * RunningSubagent — does NOT poll.
  *
  * Call watchSubagent() on the returned object to observe completion.
  */
@@ -1644,14 +1654,6 @@ async function launchSubagent(
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentPane(params.name);
-  if (params.task) {
-    setPaneTask(surface, params.task);
-  }
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
-
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
@@ -1690,35 +1692,6 @@ async function launchSubagent(
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const effectiveModel = driver.formatModel(runtimePlan);
 
-  const built = driver.buildCommand({
-    params: { ...params, id },
-    agentDefs,
-    runtimePlan,
-    effectiveModel,
-    effectiveThinking,
-    parentThinking,
-    surface,
-    artifactDir,
-    sessionDir,
-    subagentSessionFile,
-    effectiveCwd,
-    localAgentDir,
-    effectiveAutoExit,
-    effectiveInteractive,
-    inheritsConversationContext,
-    taskDelivery: launchBehavior.taskDelivery,
-    denySet,
-    childSpawnDepth: decrementSpawnDepth(launcherAllowance),
-    identity,
-    identityInSystemPrompt: Boolean(identityInSystemPrompt),
-    systemPromptMode,
-    roleBlock,
-    modeHint,
-    summaryInstruction,
-    subagentsDir: SUBAGENTS_DIR,
-    shellQuote,
-  });
-
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1726,15 +1699,56 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+  let built: ReturnType<typeof driver.buildCommand> | undefined;
+  const providerSession = await sessionProvider.spawn({
+    name: params.name,
+    task: params.task,
+    sessionId: options?.surface,
+    readyDelayMs: surfacePreCreated ? 0 : getShellReadyDelayMs(),
+    buildLaunch: (session) => {
+      const launch = driver.buildCommand({
+        params: { ...params, id },
+        agentDefs,
+        runtimePlan,
+        effectiveModel,
+        effectiveThinking,
+        parentThinking,
+        surface: session.id,
+        artifactDir,
+        sessionDir,
+        subagentSessionFile,
+        effectiveCwd,
+        localAgentDir,
+        effectiveAutoExit,
+        effectiveInteractive,
+        inheritsConversationContext,
+        taskDelivery: launchBehavior.taskDelivery,
+        denySet,
+        childSpawnDepth: decrementSpawnDepth(launcherAllowance),
+        identity,
+        identityInSystemPrompt: Boolean(identityInSystemPrompt),
+        systemPromptMode,
+        roleBlock,
+        modeHint,
+        summaryInstruction,
+        subagentsDir: SUBAGENTS_DIR,
+        shellQuote,
+      });
+      built = launch;
 
-  runScriptInPane(surface, built.command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
+      return {
+        command: launch.command,
+        scriptPath: launchScriptFile,
+        scriptPreamble: (launch.launchScriptPreamble ?? [
+          `# Subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${session.id}`,
+        ]).join("\n"),
+      };
+    },
   });
+  if (!built) throw new Error("Subagent provider returned without a launch command");
+  const surface = providerSession.id;
 
   const running: RunningSubagent = {
     id,
@@ -1746,6 +1760,8 @@ async function launchSubagent(
     sessionFile: built.sessionFile ?? subagentSessionFile,
     launchScriptFile,
     cli: built.cli,
+    provider: sessionProvider,
+    providerSession,
     sentinelFile: built.sentinelFile,
     interactive: effectiveInteractive,
     runtimePlan,
@@ -1773,27 +1789,30 @@ async function launchSubagent(
 }
 
 /**
- * Watch a launched subagent until it exits. Polls for completion, extracts
- * the summary from the session file, cleans up the surface,
- * and removes the entry from runningSubagents.
+ * Watch a launched subagent until it exits. The provider owns monitoring and
+ * result collection; this layer handles lifecycle bookkeeping and presentation.
  */
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
-  closePaneKey: (surface: string) => void = closePane,
+  closePaneKey?: (surface: string) => void,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const provider = providerFor(running);
+  const providerSession = providerSessionFor(running);
   const closeCompletedPane = (pane: string) => {
-    if (!running.interactive) closePaneKey(pane);
+    if (!running.interactive) {
+      if (closePaneKey) closePaneKey(pane);
+      else provider.close(providerSession);
+    }
   };
 
   try {
-    const result = await waitForCompletion(signal, {
+    const result = await provider.monitor(providerSession, {
+      signal,
       intervalMs: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
-      readTerminalTail: () => readPaneAsync(surface, 5),
-      inspectPane: async () => inspectPane(surface),
       onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
         ensureLifecycle(running);
         running.lifecycle = observePaneInspection(running.lifecycle, inspection, observedAt);
@@ -1820,6 +1839,9 @@ async function watchSubagent(
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
+    const collected = running.provider || running.providerSession
+      ? await provider.collectResult(providerSession, result)
+      : { output: "" };
 
     const driver = getHarnessDriver(running.cli);
     if (driver.extractResult) {
@@ -1827,7 +1849,7 @@ async function watchSubagent(
         running,
         completionResult: result,
         surface,
-        readPane,
+        readPane: () => collected.output,
         closePane: closeCompletedPane,
         artifactDir: dirname(running.launchScriptFile ?? running.sessionFile),
       });
@@ -1853,6 +1875,7 @@ async function watchSubagent(
 
     // Pi subagent result extraction
     let summary: string;
+    const providerOutput = collected.output.replace(/__SUBAGENT_DONE_\d+__/g, "").trim();
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
       const observed = findObservedSessionRuntime(allEntries);
@@ -1891,9 +1914,9 @@ async function watchSubagent(
     } else {
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
+        : providerOutput || (result.exitCode !== 0
           ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+          : "Sub-agent exited without output");
     }
 
     closeCompletedPane(surface);
@@ -2050,7 +2073,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Validate prerequisites
-        if (!isTerminalAvailable()) {
+        if (!sessionProvider.isAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2439,7 +2462,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
-        if (!isTerminalAvailable()) {
+        if (!sessionProvider.isAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -2466,12 +2489,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
-
-        const surface = createSubagentPane(name);
-        if (params.message !== undefined) {
-          setPaneTask(surface, params.message);
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
@@ -2531,16 +2548,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        runScriptInPane(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
+        const providerSession = await sessionProvider.spawn({
+          name,
+          task: params.message,
+          readyDelayMs: getShellReadyDelayMs(),
+          buildLaunch: (session) => ({
+            command,
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${params.sessionPath}`,
+              `# Surface: ${session.id}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          }),
         });
+        const surface = providerSession.id;
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2553,6 +2577,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
+          provider: sessionProvider,
+          providerSession,
           runtimePlan: undefined,
           lifecycle: createLifecycle(startTime),
         };

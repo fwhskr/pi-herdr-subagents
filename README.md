@@ -6,6 +6,15 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono) running exclusivel
 
 Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all tracked agents with their projected state — for example `starting`, `active`, `waiting`, `interrupted`, `stalled`, `running`, or `finalizing`. The header summarizes **active** (processing) vs **open** (not processing). When every tracked subagent is open, the border switches to amber. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
+### Session provider boundary
+
+Process/session lifecycle is routed through the UI-neutral `SubagentSessionProvider` contract in
+`pi-extension/subagents/session-provider.ts`: `spawn`, `monitor`, `interrupt`, `collectResult`,
+and `close`. The shipped `HerdrSubagentSessionProvider` in
+`pi-extension/subagents/herdr-provider.ts` is the reference terminal provider. It keeps the
+existing `HERDR_ENV=1` and `herdr` CLI requirement for terminal use, while a future desktop
+worker can implement the same contract without importing Herdr or TUI code.
+
 ```
 ╭─ Subagents ──────────────────── 1 active · 1 open ─╮
 │ 00:23  Scout: Auth (scout)        active · bash 7m │

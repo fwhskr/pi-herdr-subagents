@@ -15,6 +15,8 @@ import {
   sendHerdrCommand,
   sendHerdrEscape,
 } from "./herdr.ts";
+import { shellQuote } from "./session-provider.ts";
+export { shellQuote } from "./session-provider.ts";
 
 export type PaneId = string;
 export type SplitDirection = "right" | "down";
@@ -31,10 +33,6 @@ export function terminalSetupHint(): string {
 
 function assertTerminalAvailable(): void {
   if (!isTerminalAvailable()) throw new Error(`herdr is not available. ${SETUP_HINT}`);
-}
-
-export function shellQuote(value: string): string {
-  return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
 /** Create a new herdr tab and return its root pane ID. */
