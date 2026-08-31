@@ -2071,46 +2071,6 @@ describe("resume completion sidecar", () => {
   });
 });
 
-describe("child launch hardening", () => {
-  const testApi = (subagentsModule as any).__test__;
-
-  it("reports a missing child extension with the absolute path and swap cause", () => {
-    const missingRoot = createTestDir();
-    const missingPath = join(missingRoot, "subagent-done.ts");
-
-    assert.throws(
-      () => testApi.preflightSubagentDonePath(missingRoot),
-      (error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        assert.match(message, new RegExp(missingPath.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
-        assert.match(message, /live.*package.*swap/i);
-        return true;
-      },
-    );
-  });
-
-  it("includes a wider pane tail in non-zero no-session failures", () => {
-    const sessionFile = join(createTestDir(), "child.jsonl");
-    let requestedLines: number | undefined;
-    const paneTail = 'Error: Failed to load extension "/missing/subagent-done.ts"\n';
-
-    const result = testApi.enrichNoSessionFailure(
-      { exitCode: 1 },
-      { sessionFile, surface: "pane-1" },
-      "Sub-agent exited with code 1",
-      (_surface: string, lines?: number) => {
-        requestedLines = lines;
-        return paneTail;
-      },
-    );
-
-    assert.equal(requestedLines, 20);
-    assert.match(result.summary, /Sub-agent exited with code 1/);
-    assert.match(result.summary, /Failed to load extension/);
-    assert.equal(result.error, paneTail);
-  });
-});
-
 describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
@@ -2291,6 +2251,28 @@ describe("tool registration", () => {
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+    assert.match(resumeTool.description, /regardless of autoExit/);
+    assert.match(resumeTool.description, /pane\/process closes/);
+  });
+
+  it("marks message resumes for completion reporting but leaves handoffs unmarked", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.buildResumeEnvParts, "function");
+    const options = {
+      name: "Resume",
+      sessionPath: "/tmp/session.jsonl",
+      id: "resume-1",
+      activityFile: "/tmp/activity.json",
+      autoExit: false,
+      resumeSpawn: { maySpawn: true, childEnvDepth: null },
+    };
+    const shellQuote = (value: string) => `'${value}'`;
+
+    const withMessage = testApi.buildResumeEnvParts({ ...options, message: "continue" }, shellQuote).join(" ");
+    const withoutMessage = testApi.buildResumeEnvParts(options, shellQuote).join(" ");
+
+    assert.match(withMessage, /PI_SUBAGENT_REPORT=1/);
+    assert.doesNotMatch(withoutMessage, /PI_SUBAGENT_REPORT=/);
   });
 });
 
@@ -2352,6 +2334,41 @@ describe("subagent parent lifecycle", () => {
 
     assert.equal(selectCompletionApi(previous, current), current);
     assert.equal(selectCompletionApi(previous, undefined), previous);
+  });
+
+  it("closes only non-interactive panes after watcher completion", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.watchSubagent, "function");
+
+    for (const interactive of [true, false]) {
+      const dir = createTestDir();
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", id: "session-1", cwd: dir },
+        {
+          type: "message",
+          id: "message-1",
+          message: { role: "assistant", content: [{ type: "text", text: "completed" }] },
+        },
+      ]);
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      const running = {
+        id: `watch-${interactive}`,
+        name: "Worker",
+        task: "task",
+        surface: "pane-1",
+        startTime: 0,
+        sessionFile,
+        interactive,
+        lifecycle: createLifecycle(0),
+      };
+      let closes = 0;
+
+      await testApi.watchSubagent(running, new AbortController().signal, () => {
+        closes += 1;
+      });
+
+      assert.equal(closes, interactive ? 0 : 1);
+    }
   });
 });
 

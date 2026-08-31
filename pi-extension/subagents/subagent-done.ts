@@ -125,6 +125,7 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const report = process.env.PI_SUBAGENT_REPORT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -279,8 +280,9 @@ export default function (pi: ExtensionAPI) {
     // non-aborted turn: that partial report must reach the parent even if the
     // operator had disarmed auto-exit earlier. The one-shot re-arm is consumed
     // only when the auto-exit branch itself decided the exit (L-95 rule).
-    const autoExitShouldFire = autoExit
-      && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
+    const autoExitDecision = resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
+    const autoExitShouldFire = autoExit && autoExitDecision;
+    const reportShouldFire = report && autoExitDecision;
     const shouldExit = autoExitShouldFire
       || (wrapupInProgress && isTerminalAutoExitStopReason(stopReason));
     if (autoExitShouldFire && oneShotReArm) {
@@ -289,10 +291,9 @@ export default function (pi: ExtensionAPI) {
       oneShotReArm = false;
     }
 
-    if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
+    if (shouldExit || reportShouldFire) {
+      // Surface terminal turns to the parent via the .exit sidecar. Report-only
+      // children publish this evidence without shutting down their session.
       if (sessionFile) {
         try {
           writeExitSidecar(buildCompletionSidecar(latestAgentMessages, wrapupInProgress));
@@ -302,9 +303,10 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      recorder.agentEndDone();
-      ctx.shutdown();
-      return;
+      if (shouldExit) {
+        recorder.agentEndDone();
+        ctx.shutdown();
+      }
     }
   });
 

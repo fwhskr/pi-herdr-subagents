@@ -136,6 +136,9 @@ export class PiHarnessDriver implements HarnessDriver {
     if (effectiveAutoExit) {
       envParts.push("PI_SUBAGENT_AUTO_EXIT=1");
     }
+    if (!context.effectiveInteractive) {
+      envParts.push("PI_SUBAGENT_REPORT=1");
+    }
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
     const activityFile = getSubagentActivityFile(artifactDir, params.id);

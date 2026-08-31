@@ -140,6 +140,19 @@ describe("Pi Harness Driver", () => {
     );
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
   });
+
+  it("marks autonomous spawns for settled-turn reporting, not interactive spawns", () => {
+    const autonomous = driver.buildCommand(createMockLaunchContext({
+      effectiveAutoExit: false,
+      effectiveInteractive: false,
+    }));
+    const interactive = driver.buildCommand(createMockLaunchContext({
+      effectiveInteractive: true,
+    }));
+
+    assert.match(autonomous.command, /PI_SUBAGENT_REPORT=1/);
+    assert.doesNotMatch(interactive.command, /PI_SUBAGENT_REPORT=/);
+  });
 });
 
 describe("OpenCode Harness Driver", () => {

@@ -260,7 +260,7 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. Interactive subagent sessions stay alive for takeover. Autonomous one-shot sessions are reaped immediately after Escape: the pane/tab closes, the watcher stops, and late completion/error delivery is suppressed; the session file remains available for `subagent_resume`. Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt.
+This sends Escape to the child pane, cancelling the in-progress model turn. An interrupt is not a report: an `aborted` turn never writes a report sidecar or delivers a completion. Interactive sessions stay alive for takeover. Non-interactive autonomous sessions are reaped immediately after Escape: the pane/tab closes, the watcher stops, and late completion/error delivery is suppressed; the session file remains available for `subagent_resume`. A message-resume with `autoExit: false` remains open after delivery and follows the interactive reaping rule if interrupted. Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt.
 
 This remains a turn-level interrupt for interactive sessions; autonomous sessions are explicitly terminated and reaped.
 
@@ -279,7 +279,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `sessionPath` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
-- `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `autoExit` (optional): Whether the resumed pane/process closes after its response. Defaults to `true`; set `false` to keep the pane open after a message-resume result is delivered. A resume with `message` always delivers its terminal result regardless of `autoExit`; omit `message` for an interactive handoff.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
@@ -287,6 +287,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
 4. Parent resumes the child session via `subagent_resume` with the response
 5. Child picks up where it left off with the parent's guidance
+
+A delegated one-shot is either a spawn with an autonomous task or a resume with `message`; the parent marks it with `PI_SUBAGENT_REPORT=1`. On a settled terminal `stop` or `error`, its result is delivered automatically even when `autoExit: false`; `autoExit` controls only pane/process lifetime. Resumes without a message and explicitly interactive spawns do not publish report sidecars or wake the parent for status changes.
 
 **Example:**
 ```typescript
@@ -367,7 +369,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | **Spawn grant.** Subagent-spawning tools are denied for every child by default; set `true` to grant them (still bounded by `PI_SUBAGENT_SPAWN_DEPTH`, see below).                                                                                                              |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. Operator input or an Escape abort permanently disarms it for that session (with a one-time warning); the `/auto-exit` slash command re-arms it for exactly one completion. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. Operator input or an Escape abort permanently disarms it for that session (with a one-time warning); the `/auto-exit` slash command re-arms it for exactly one completion. For delegated one-shots, result delivery is independent of this setting; it controls pane/process lifetime. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `time-limit` | positive integer seconds | — | Whole-run deadline for a non-interactive agent. At the deadline the pane closes and the parent receives a timed-out failure with the session still resumable. |
 | `idle-timeout` | positive integer seconds | — | Deadline measured from the latest Pi activity snapshot; it is ignored when no activity snapshots are available. |

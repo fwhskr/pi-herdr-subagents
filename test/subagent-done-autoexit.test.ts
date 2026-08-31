@@ -51,6 +51,7 @@ function createExtensionApi() {
 }
 
 const origAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+const origReport = process.env.PI_SUBAGENT_REPORT;
 const origSession = process.env.PI_SUBAGENT_SESSION;
 
 function restoreEnv(name: string, value: string | undefined) {
@@ -67,15 +68,18 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
 
   afterEach(() => {
     restoreEnv("PI_SUBAGENT_AUTO_EXIT", origAutoExit);
+    restoreEnv("PI_SUBAGENT_REPORT", origReport);
     restoreEnv("PI_SUBAGENT_SESSION", origSession);
     if (dir) rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
 
-  function boot(opts: { autoExit?: boolean; withSessionFile?: boolean } = {}) {
+  function boot(opts: { autoExit?: boolean; report?: boolean; withSessionFile?: boolean } = {}) {
     const autoExit = opts.autoExit ?? true;
     if (autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
     else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+    if (opts.report) process.env.PI_SUBAGENT_REPORT = "1";
+    else delete process.env.PI_SUBAGENT_REPORT;
 
     let sessionFile: string | undefined;
     if (opts.withSessionFile !== false) {
@@ -169,6 +173,73 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     assert.equal(child.ctx.shutdowns, 1, "zero-real-input child still exits");
     assert.deepEqual(sidecarOf(child), { type: "done" });
     assert.equal(child.notifications.length, 0, "no warning for the injected task");
+  });
+
+  it("REPORT=1 writes a done sidecar on a settled stop without auto-exit", () => {
+    const child = boot({ autoExit: false, report: true });
+    child.settle([{ role: "assistant", stopReason: "stop" }]);
+
+    assert.equal(child.ctx.shutdowns, 0, "report-only completion must keep the child alive");
+    assert.deepEqual(sidecarOf(child), { type: "done" });
+  });
+
+  it("does not report after operator input disarms a reported child", () => {
+    const child = boot({ autoExit: false, report: true });
+    child.fire("agent_start", {});
+    child.fire("input", { type: "input", text: "take over" });
+    child.settle([{ role: "assistant", stopReason: "stop" }]);
+
+    assert.equal(child.ctx.shutdowns, 0);
+    assert.equal(sidecarOf(child), null);
+  });
+
+  it("REPORT=1 writes an error sidecar on a settled error without auto-exit", () => {
+    const child = boot({ autoExit: false, report: true });
+    child.settle([{ role: "assistant", stopReason: "error", errorMessage: "provider failed" }]);
+
+    assert.equal(child.ctx.shutdowns, 0, "report-only errors must keep the child alive");
+    assert.deepEqual(sidecarOf(child), {
+      type: "error",
+      errorMessage: "provider failed",
+      stopReason: "error",
+    });
+  });
+
+  it("REPORT=1 plus auto-exit writes once and shuts down", () => {
+    const child = boot({ autoExit: true, report: true });
+    child.settle([{ role: "assistant", stopReason: "stop" }]);
+
+    assert.equal(child.ctx.shutdowns, 1);
+    assert.deepEqual(sidecarOf(child), { type: "done" });
+  });
+
+  it("does not publish a settled sidecar when REPORT is unset", () => {
+    const child = boot({ autoExit: false });
+    child.settle([{ role: "assistant", stopReason: "stop" }]);
+
+    assert.equal(child.ctx.shutdowns, 0);
+    assert.equal(sidecarOf(child), null);
+  });
+
+  it("does not report a non-terminal settled turn", () => {
+    const child = boot({ autoExit: false, report: true });
+    child.settle([{ role: "assistant", stopReason: "toolUse" }]);
+
+    assert.equal(child.ctx.shutdowns, 0);
+    assert.equal(sidecarOf(child), null);
+  });
+
+  it("keeps the first report sidecar after a later operator takeover", () => {
+    const child = boot({ autoExit: false, report: true });
+    child.fire("agent_start", {});
+    child.settle([{ role: "assistant", stopReason: "stop" }]);
+    const first = readFileSync(`${child.sessionFile}.exit`, "utf8");
+
+    child.fire("input", { type: "input", text: "take over after delivery" });
+    child.settle([{ role: "assistant", stopReason: "error", errorMessage: "late failure" }]);
+
+    assert.equal(child.ctx.shutdowns, 0);
+    assert.equal(readFileSync(`${child.sessionFile}.exit`, "utf8"), first, "the report latch is first-write-wins");
   });
 
   it("keeps the child alive after a tool-use turn until the final report", () => {

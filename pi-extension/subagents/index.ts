@@ -1478,6 +1478,40 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
+interface ResumeEnvOptions {
+  codingAgentDir?: string;
+  name: string;
+  sessionPath: string;
+  id: string;
+  activityFile: string;
+  autoExit: boolean;
+  message?: string;
+  resumeSpawn: { maySpawn: boolean; childEnvDepth: number | null };
+}
+
+function buildResumeEnvParts(
+  options: ResumeEnvOptions,
+  shellQuote: (value: string) => string,
+): string[] {
+  const parts: string[] = [];
+  if (options.codingAgentDir) {
+    parts.push(`PI_CODING_AGENT_DIR=${shellQuote(options.codingAgentDir)}`);
+  }
+  parts.push(`PI_SUBAGENT_NAME=${shellQuote(options.name)}`);
+  parts.push(`PI_SUBAGENT_SESSION=${shellQuote(options.sessionPath)}`);
+  parts.push(`PI_SUBAGENT_ID=${shellQuote(options.id)}`);
+  parts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(options.activityFile)}`);
+  if (options.autoExit) parts.push("PI_SUBAGENT_AUTO_EXIT=1");
+  if (options.message !== undefined) parts.push("PI_SUBAGENT_REPORT=1");
+  if (!options.resumeSpawn.maySpawn) {
+    parts.push(`PI_DENY_TOOLS=${shellQuote([...SPAWNING_TOOLS].join(","))}`);
+  }
+  if (options.resumeSpawn.childEnvDepth !== null) {
+    parts.push(`PI_SUBAGENT_SPAWN_DEPTH=${options.resumeSpawn.childEnvDepth}`);
+  }
+  return parts;
+}
+
 function clearResumeExitSidecar(sessionFile: string): void {
   try {
     unlinkSync(`${sessionFile}.exit`);
@@ -1527,9 +1561,9 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  buildResumeEnvParts,
   clearResumeExitSidecar,
-  preflightSubagentDonePath,
-  enrichNoSessionFailure,
+  watchSubagent,
   runningSubagents,
   formatElapsed,
 };
@@ -1746,8 +1780,12 @@ async function launchSubagent(
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  closePaneKey: (surface: string) => void = closePane,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const closeCompletedPane = (pane: string) => {
+    if (!running.interactive) closePaneKey(pane);
+  };
 
   try {
     const result = await waitForCompletion(signal, {
@@ -1790,12 +1828,12 @@ async function watchSubagent(
         completionResult: result,
         surface,
         readPane,
-        closePane,
+        closePane: closeCompletedPane,
         artifactDir: dirname(running.launchScriptFile ?? running.sessionFile),
       });
 
       if (extracted) {
-        closePane(surface);
+        closeCompletedPane(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? extracted.summary, Date.now(), result.exitCode);
@@ -1858,7 +1896,7 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    closePane(surface);
+    closeCompletedPane(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? summary, Date.now(), result.exitCode);
@@ -1889,7 +1927,7 @@ async function watchSubagent(
     }
 
     try {
-      closePane(surface);
+      closeCompletedPane(surface);
     } catch {}
     running.lifecycle = markFailed(
       running.lifecycle,
@@ -2335,16 +2373,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Resume a previous sub-agent session in a new herdr pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
+        "A resume with a message is a delegated one-shot: its terminal result is AUTOMATICALLY delivered as a steer message regardless of autoExit; autoExit controls only whether the pane/process closes after delivery. " +
+        "A resume without a message is an interactive handoff and does not wake the parent on status changes. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
+        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when a message-resume result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
         "Resume a previous sub-agent session in a new herdr pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
+        "A resume with a message is a delegated one-shot: its terminal result is AUTOMATICALLY delivered as a steer message regardless of autoExit; autoExit controls only whether the pane/process closes after delivery. " +
+        "A resume without a message is an interactive handoff and does not wake the parent on status changes. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
+        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when a message-resume result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
@@ -2359,7 +2399,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         autoExit: Type.Optional(
           Type.Boolean({
             description:
-              "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+              "Whether the resumed pane/process should close after its response. Message resumes still deliver their terminal result when false; set false to keep the pane open. Defaults to true. Resumes without a message are interactive handoffs.",
           }),
         ),
       }),
@@ -2428,7 +2468,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSubagentPane(name);
-        if (params.message) {
+        if (params.message !== undefined) {
           setPaneTask(surface, params.message);
         }
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -2446,7 +2486,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         mkdirSync(dirname(activityFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
-        if (params.message) {
+        if (params.message !== undefined) {
           const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
           resumeMsgFile = join(
             artifactDir,
@@ -2463,30 +2503,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-        }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
-        // Spawn rights on resume are clamped to what the first launch recorded:
-        // missing metadata ⇒ 0 (deny); never larger than first launch.
+        // Build env prefix — propagate config, report, and clamped spawn rights.
         const resumeSpawn = clampResumeSpawn(
           readSpawnMetadata(params.sessionPath),
           parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH),
         );
-        if (!resumeSpawn.maySpawn) {
-          resumeEnvParts.push(`PI_DENY_TOOLS=${shellQuote([...SPAWNING_TOOLS].join(","))}`);
-        }
-        if (resumeSpawn.childEnvDepth !== null) {
-          resumeEnvParts.push(`PI_SUBAGENT_SPAWN_DEPTH=${resumeSpawn.childEnvDepth}`);
-        }
+        const resumeEnvParts = buildResumeEnvParts({
+          codingAgentDir: process.env.PI_CODING_AGENT_DIR,
+          name,
+          sessionPath: params.sessionPath,
+          id,
+          activityFile,
+          autoExit,
+          message: params.message,
+          resumeSpawn,
+        }, shellQuote);
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
