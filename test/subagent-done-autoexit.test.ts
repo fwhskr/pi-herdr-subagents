@@ -20,11 +20,13 @@ function createExtensionApi() {
   const registeredCommands: Array<{ name: string; handler: Function }> = [];
   const registeredTools: any[] = [];
   const sentUserMessages: string[] = [];
+  const registeredShortcuts: Array<{ key: string; options: any }> = [];
   return {
     eventHandlers,
     registeredCommands,
     registeredTools,
     sentUserMessages,
+    registeredShortcuts,
     api: {
       on(event: string, handler: Function) {
         const handlers = eventHandlers.get(event) ?? [];
@@ -38,7 +40,9 @@ function createExtensionApi() {
         registeredCommands.push({ name, ...command });
       },
       registerMessageRenderer() {},
-      registerShortcut() {},
+      registerShortcut(key: string, options: any) {
+        registeredShortcuts.push({ key, options });
+      },
       sendUserMessage(message: string) {
         sentUserMessages.push(message);
       },
@@ -85,7 +89,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       delete process.env.PI_SUBAGENT_SESSION;
     }
 
-    const { api, eventHandlers, registeredCommands, registeredTools, sentUserMessages } = createExtensionApi();
+    const { api, eventHandlers, registeredCommands, registeredTools, sentUserMessages, registeredShortcuts } = createExtensionApi();
     subagentDoneExtension(api);
 
     const notifications: Notification[] = [];
@@ -109,6 +113,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       registeredCommands,
       registeredTools,
       sentUserMessages,
+      registeredShortcuts,
       fire(event: string, payload: any = {}) {
         for (const handler of eventHandlers.get(event) ?? []) handler(payload, ctx);
       },
@@ -405,5 +410,33 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       0,
       "nothing to disarm, so no takeover warning",
     );
+  });
+  // F-90 — extension shortcuts must not shadow pi built-in default keys.
+  // ctrl+j is the built-in tui.input.newLine default; the widget toggle was
+  // rebinding it silently. Source: pi docs keybindings.md All Actions tables.
+  const PI_BUILTIN_DEFAULT_KEYS = new Set([
+    "alt+b", "alt+backspace", "alt+d", "alt+delete", "alt+down", "alt+enter",
+    "alt+f", "alt+left", "alt+right", "alt+up", "alt+y", "backspace",
+    "ctrl+]", "ctrl+alt+]", "ctrl+a", "ctrl+b", "ctrl+backspace", "ctrl+c",
+    "ctrl+d", "ctrl+e", "ctrl+end", "ctrl+f", "ctrl+g", "ctrl+home", "ctrl+j",
+    "ctrl+k", "ctrl+l", "ctrl+left", "ctrl+n", "ctrl+o", "ctrl+p",
+    "ctrl+pagedown", "ctrl+pageup", "ctrl+r", "ctrl+right", "ctrl+s",
+    "ctrl+shift+down", "ctrl+shift+g", "ctrl+shift+up", "ctrl+t", "ctrl+u",
+    "ctrl+w", "ctrl+x", "ctrl+y", "delete", "down", "end", "enter", "escape",
+    "home", "left", "pagedown", "pageup", "right", "shift+ctrl+o",
+    "shift+enter", "shift+l", "shift+t", "shift+tab", "tab", "up",
+  ]);
+
+  it("registers no shortcut on ctrl+j or any pi built-in default key (F-90)", () => {
+    const child = boot();
+    assert.equal(child.registeredShortcuts.length >= 1, true, "widget toggle shortcut must be registered");
+    for (const { key } of child.registeredShortcuts) {
+      assert.notEqual(key.toLowerCase(), "ctrl+j", "ctrl+j is pi built-in tui.input.newLine");
+      assert.equal(
+        PI_BUILTIN_DEFAULT_KEYS.has(key.toLowerCase()),
+        false,
+        `shortcut ${key} shadows a pi built-in default key`,
+      );
+    }
   });
 });
