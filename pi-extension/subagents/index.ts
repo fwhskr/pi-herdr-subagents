@@ -74,6 +74,8 @@ import {
   markCompletionDetected,
   markDelivery,
   markFailed,
+  MISSING_PANE_DEBOUNCE_MS,
+  MISSING_PANE_ERROR,
   markInterruptRequested,
   markProcessRunning,
   observeActivity,
@@ -1200,6 +1202,37 @@ function isTerminalLifecycle(lifecycle: SubagentLifecycle): boolean {
   return lifecycle.process.kind === "completed" || lifecycle.process.kind === "failed";
 }
 
+/** Ignore a race where the pane disappeared before normal cleanup ran. */
+function closePaneQuietly(
+  surface: string,
+  closePaneKey: (surface: string) => void = closePane,
+): void {
+  try {
+    closePaneKey(surface);
+  } catch {}
+}
+
+/** Persist a terminal projection so result delivery can remove its widget row. */
+function reconcileProjectedFailure(running: RunningSubagent, projection: LifecycleProjection): LifecycleProjection {
+  const lifecycle = ensureLifecycle(running);
+  if (
+    projection.kind !== "failed" ||
+    lifecycle.pane.kind !== "missing" ||
+    isTerminalLifecycle(lifecycle)
+  ) {
+    return projection;
+  }
+
+  const terminalAt = lifecycle.pane.detectedAt + MISSING_PANE_DEBOUNCE_MS;
+  running.lifecycle = markFailed(
+    lifecycle,
+    projection.label ?? MISSING_PANE_ERROR,
+    terminalAt,
+    1,
+  );
+  return projectLifecycle(running.lifecycle, terminalAt);
+}
+
 /** Idempotent failure teardown shared with future hard-stop paths. */
 function failAndTeardownSubagent(
   running: RunningSubagent,
@@ -1427,7 +1460,10 @@ function startStatusRefresh(pi: ExtensionAPI) {
     for (const running of runningSubagents.values()) {
       // Dual-writes lifecycle + statusState for reload hydration; steers use lifecycle only.
       observeRunningSubagent(running, now);
-      const projection = projectLifecycle(ensureLifecycle(running), now, { activeToolStallMs });
+      const projection = reconcileProjectedFailure(
+        running,
+        projectLifecycle(ensureLifecycle(running), now, { activeToolStallMs }),
+      );
       const recovery = advanceRunningRecovery(running, projection, now, recoveryDelays);
       if (recovery.action) shouldRefreshWidget = true;
       const transition = lifecycleTransition(running.lastProjectedKind, projection.kind);
@@ -1512,6 +1548,8 @@ export const __test__ = {
   SPAWNING_TOOLS,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  reconcileProjectedFailure,
+  closePaneQuietly,
   failAndTeardownSubagent,
   advanceRunningRecovery,
   buildRecoveryKilledResult,
@@ -1815,7 +1853,7 @@ async function watchSubagent(
 
       if (extracted) {
         const enriched = enrichNoSessionFailure(result, running, extracted.summary);
-        closePane(surface);
+        closePaneQuietly(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
@@ -1880,7 +1918,7 @@ async function watchSubagent(
     }
 
     const enriched = enrichNoSessionFailure(result, running, summary);
-    closePane(surface);
+    closePaneQuietly(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);

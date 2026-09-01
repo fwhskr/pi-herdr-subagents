@@ -47,7 +47,10 @@ export type PaneObservation =
   | { kind: "unknown" }
   | { kind: "present"; observedAt: number; agentStatus: HerdrAgentStatus }
   | { kind: "read-error"; firstFailedAt: number; lastFailedAt: number; consecutiveFailures: number; error?: string }
-  | { kind: "missing"; detectedAt: number; error?: string };
+  | { kind: "missing"; detectedAt: number; consecutiveMissing: number; error?: string };
+
+export const MISSING_PANE_DEBOUNCE_MS = 500;
+export const MISSING_PANE_ERROR = "Subagent pane disappeared before completion evidence was recorded.";
 
 export type CompletionDelivery = "pending" | "delivered" | "suppressed";
 
@@ -115,10 +118,18 @@ export function observePaneInspection(
   }
 
   if (inspection.kind === "missing") {
-    return {
-      ...lifecycle,
-      pane: { kind: "missing", detectedAt: observedAt, ...(inspection.error ? { error: inspection.error } : {}) },
+    const previous = lifecycle.pane.kind === "missing" ? lifecycle.pane : null;
+    const pane: PaneObservation = {
+      kind: "missing",
+      // Keep the first confirmed miss so repeated observations can debounce
+      // transient Herdr races instead of extending the deadline forever.
+      detectedAt: previous?.detectedAt ?? observedAt,
+      consecutiveMissing: (previous?.consecutiveMissing ?? 0) + 1,
+      ...(inspection.error ? { error: inspection.error } : {}),
     };
+    const next = { ...lifecycle, pane };
+    if (observedAt - pane.detectedAt < MISSING_PANE_DEBOUNCE_MS) return next;
+    return markFailed(next, MISSING_PANE_ERROR, observedAt, 1);
   }
 
   const agentStatus = inspection.agentStatus;
@@ -397,6 +408,21 @@ export function projectLifecycle(
   if (process.kind === "finalizing") return { kind: "finalizing", runtimeEndedAt: process.detectedAt };
   if (process.kind === "completed") return { kind: "completed", runtimeEndedAt: process.completedAt };
   if (process.kind === "failed") return { kind: "failed", label: process.error, runtimeEndedAt: process.completedAt };
+
+  // A pane can disappear between completion-artifact polls. Keep the
+  // projection terminal once the same missing observation survives the small
+  // debounce, even before the watcher records its failure state.
+  if (
+    lifecycle.pane.kind === "missing" &&
+    lifecycle.pane.consecutiveMissing > 1 &&
+    now - lifecycle.pane.detectedAt >= MISSING_PANE_DEBOUNCE_MS
+  ) {
+    return {
+      kind: "failed",
+      label: MISSING_PANE_ERROR,
+      runtimeEndedAt: lifecycle.pane.detectedAt + MISSING_PANE_DEBOUNCE_MS,
+    };
+  }
 
   // Pi activity is optional enrichment. Only authoritative Herdr inspection
   // unavailability may produce a stalled projection.

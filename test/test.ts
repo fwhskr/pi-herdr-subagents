@@ -56,6 +56,7 @@ import subagentDoneExtension, {
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
+  MISSING_PANE_DEBOUNCE_MS,
   createLifecycle,
   lifecycleTransition,
   markCompleted,
@@ -1912,6 +1913,58 @@ describe("lifecycle.ts", () => {
     assert.equal(lifecycle.process.kind, "running");
   });
 
+  it("fails a pane that remains missing after the debounce", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    const firstMissingAt = 3_000;
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt,
+    );
+    assert.equal(lifecycle.process.kind, "running", "one missing observation is a race, not failure");
+    assert.notEqual(
+      projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind,
+      "failed",
+      "one missing observation must not project failure",
+    );
+
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt + MISSING_PANE_DEBOUNCE_MS,
+    );
+    assert.equal(lifecycle.process.kind, "failed");
+    assert.match(lifecycle.process.error, /pane disappeared before completion evidence/i);
+    assert.equal(projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind, "failed");
+  });
+
+  it("persists a terminal missing projection for result delivery", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_001);
+    const running = {
+      id: "missing-child",
+      name: "Worker",
+      task: "task",
+      surface: "pane-1",
+      startTime: 1_000,
+      sessionFile: "worker.jsonl",
+      interactive: false,
+      lifecycle,
+    };
+
+    const projection = testApi.reconcileProjectedFailure(
+      running,
+      projectLifecycle(lifecycle, 3_000 + MISSING_PANE_DEBOUNCE_MS),
+    );
+    assert.equal(projection.kind, "failed");
+    assert.equal(running.lifecycle.process.kind, "failed");
+    assert.match(running.lifecycle.process.error, /pane disappeared before completion evidence/i);
+  });
+
   it("preserves local interrupt over stale herdr statuses", () => {
     for (const agentStatus of ["working", "blocked", "idle", "done"] as const) {
       let lifecycle = createLifecycle(1_000);
@@ -2094,6 +2147,26 @@ describe("completion.ts", () => {
       exitCode: 1,
       errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
     });
+  });
+
+  it("does not reap a single transient missing-pane observation", async () => {
+    let inspections = 0;
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1
+          ? { kind: "missing", error: "pane_not_found" }
+          : { kind: "present", observedAt: Date.now(), agentStatus: "working" };
+      },
+    });
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a transient miss must be followed by another inspection");
   });
 
   it("lets a sidecar win the pane-disappearance race", async () => {
@@ -2517,6 +2590,17 @@ describe("subagent parent lifecycle", () => {
 
     assert.equal(selectCompletionApi(previous, current), current);
     assert.equal(selectCompletionApi(previous, undefined), previous);
+  });
+
+  it("does not let pane cleanup throw after a missing-pane result", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let closeAttempts = 0;
+
+    assert.doesNotThrow(() => testApi.closePaneQuietly("pane-1", () => {
+      closeAttempts += 1;
+      throw new Error("pane_not_found");
+    }));
+    assert.equal(closeAttempts, 1);
   });
 });
 
