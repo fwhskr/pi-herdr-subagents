@@ -125,6 +125,8 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const resumedAutoExitRearm = autoExit && process.env.PI_SUBAGENT_AUTO_EXIT_REARM === "1";
+  let resumeInputPending = autoExit && process.env.PI_SUBAGENT_RESUME_INPUT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -181,8 +183,11 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  let disarmed = false;
-  let oneShotReArm = false;
+  // A delegated resume is a fresh autonomous run even when the JSONL's last
+  // turn was operator-aborted. Re-arm it explicitly, rather than deriving
+  // state from historical session contents.
+  let disarmed = resumedAutoExitRearm;
+  let oneShotReArm = resumedAutoExitRearm;
   let warnedOperatorTakeover = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
@@ -223,6 +228,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", (event, ctx) => {
     recorder.input();
+    // The resume command's positional message is machine input, even though
+    // Pi reports it as a normal input event. Consume that marker once so it
+    // cannot disarm the newly re-armed autonomous run.
+    if (resumeInputPending) {
+      resumeInputPending = false;
+      return;
+    }
     // Extension-injected report directives are not operator takeover. This keeps
     // the report-only continuation compatible with sticky auto-exit disarming.
     if ((event as any).source === "extension") return;

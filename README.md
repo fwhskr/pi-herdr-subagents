@@ -268,9 +268,11 @@ subagent_interrupt({ id: "abcd1234" });
 subagent_interrupt({ name: "Scout" });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+This sends Escape to the child pane, cancelling the in-progress model turn. Interactive subagents keep their pane and session open for operator takeover. Autonomous one-shot subagents keep the session JSONL but, after a bounded grace period, the parent marks the delegation failed, closes the pane, and delivers an interrupt result with a resume reference. Configure that grace with `PI_SUBAGENT_INTERRUPT_GRACE_MS` (default `5000`). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt.
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+A delegated resume is a fresh autonomous run when `autoExit` is enabled: it explicitly re-arms one completion, ignores its machine-delivered resume prompt as operator input, writes a fresh `.exit` sidecar, and lets the parent consume it. `clearResumeExitSidecar` still removes only stale evidence before launch.
+
+Startup does not sweep historical watcher-less panes. Herdr has no durable ownership marker for old panes, so guessing from agent/session labels could close persistent Nova, Halo, or Echo crew panes. Crash orphan discovery and recovery are reserved for the follow-up restore flow; this package never sweeps those orchestrator panes.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
 

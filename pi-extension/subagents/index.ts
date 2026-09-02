@@ -690,6 +690,22 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+export const DEFAULT_INTERRUPT_GRACE_MS = 5_000;
+const INTERRUPTED_EXIT_CODE = 130;
+const INTERRUPTED_ERROR = "Subagent interrupted by parent after the grace period.";
+
+/** Parse PI_SUBAGENT_INTERRUPT_GRACE_MS; invalid values use five seconds. */
+function parseInterruptGraceMs(raw: string | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return DEFAULT_INTERRUPT_GRACE_MS;
+  const value = Number(trimmed);
+  return Number.isSafeInteger(value) && value >= 0 ? value : DEFAULT_INTERRUPT_GRACE_MS;
+}
+
+function getInterruptGraceMs(): number {
+  return parseInterruptGraceMs(process.env.PI_SUBAGENT_INTERRUPT_GRACE_MS);
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -799,6 +815,10 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** Timer waiting for an interrupted autonomous child to become terminal. */
+  interruptGraceTimer?: ReturnType<typeof setTimeout>;
+  /** Synthetic terminal result after the parent-owned interrupt grace expires. */
+  interrupted?: { errorMessage: string; interruptedAt: number };
   recovery?: RecoveryState;
   recoveryKilled?: { errorMessage: string; killedAt: number };
   timeLimit?: TimeLimitConfig;
@@ -876,11 +896,15 @@ export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
 
 export function cleanupSubagentsForShutdown(
   reason: unknown,
-  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle">>,
+  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle" | "interruptGraceTimer">>,
 ): void {
   if (shouldPreserveSubagentsOnShutdown(reason)) return;
 
   for (const agent of agents.values()) {
+    if (agent.interruptGraceTimer != null) {
+      clearTimeout(agent.interruptGraceTimer);
+      agent.interruptGraceTimer = undefined;
+    }
     if (agent.lifecycle) {
       agent.lifecycle = markDelivery(agent.lifecycle, "suppressed");
     }
@@ -1233,6 +1257,66 @@ function reconcileProjectedFailure(running: RunningSubagent, projection: Lifecyc
   return projectLifecycle(running.lifecycle, terminalAt);
 }
 
+function clearInterruptGraceTimer(running: RunningSubagent): void {
+  if (running.interruptGraceTimer == null) return;
+  clearTimeout(running.interruptGraceTimer);
+  running.interruptGraceTimer = undefined;
+}
+
+/**
+ * Finish a parent-requested interrupt without asking the child to publish a
+ * completion sidecar. Escape intentionally disarms child auto-exit; the
+ * parent owns the bounded terminal transition and preserves the JSONL.
+ */
+function finalizeInterruptedSubagent(
+  running: RunningSubagent,
+  now: number,
+  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+): boolean {
+  const lifecycle = ensureLifecycle(running);
+  if (
+    lifecycle.process.kind === "finalizing" ||
+    isTerminalLifecycle(lifecycle) ||
+    lifecycle.delivery !== "pending"
+  ) {
+    return false;
+  }
+
+  running.interrupted = { errorMessage: INTERRUPTED_ERROR, interruptedAt: now };
+  running.lifecycle = markFailed(lifecycle, INTERRUPTED_ERROR, now, INTERRUPTED_EXIT_CODE);
+  try {
+    operations.closePane(running.surface);
+  } catch {}
+  try {
+    operations.abortWatcher(running.abortController);
+  } catch {}
+  return true;
+}
+
+function scheduleInterruptedFinalization(
+  running: RunningSubagent,
+  graceMs = getInterruptGraceMs(),
+  operations: Pick<RecoveryPaneOperations, "closePane" | "abortWatcher"> = DEFAULT_RECOVERY_PANE_OPERATIONS,
+): boolean {
+  if (
+    running.interactive ||
+    running.interruptGraceTimer != null ||
+    running.interrupted != null ||
+    isTerminalLifecycle(ensureLifecycle(running))
+  ) {
+    return false;
+  }
+
+  const delay = Math.max(0, Math.floor(graceMs));
+  const timer = setTimeout(() => {
+    running.interruptGraceTimer = undefined;
+    if (finalizeInterruptedSubagent(running, Date.now(), operations)) updateWidget();
+  }, delay);
+  timer.unref?.();
+  running.interruptGraceTimer = timer;
+  return true;
+}
+
 /** Idempotent failure teardown shared with future hard-stop paths. */
 function failAndTeardownSubagent(
   running: RunningSubagent,
@@ -1298,6 +1382,20 @@ function buildRecoveryKilledResult(running: RunningSubagent, now: number): Subag
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
     error: recoveryKilled.errorMessage,
     errorMessage: recoveryKilled.errorMessage,
+  };
+}
+
+function buildInterruptedResult(running: RunningSubagent, now: number): SubagentResult | null {
+  const interrupted = running.interrupted;
+  if (!interrupted) return null;
+  return {
+    name: running.name,
+    task: running.task,
+    summary: `${interrupted.errorMessage}\n\nThe session remains on disk and can be resumed with subagent_resume.`,
+    sessionFile: running.sessionFile,
+    exitCode: INTERRUPTED_EXIT_CODE,
+    elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
+    error: "interrupted",
   };
 }
 
@@ -1392,6 +1490,11 @@ function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): Sub
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
   interruptPaneKey: (surface: string) => void = interruptPane,
+  options: {
+    closePane?: (surface: string) => void;
+    abortWatcher?: (controller: AbortController | undefined) => void;
+    graceMs?: number;
+  } = {},
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -1430,6 +1533,16 @@ function handleSubagentInterrupt(
   }
 
   running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
+  if (!running.interactive && running.abortController) {
+    scheduleInterruptedFinalization(
+      running,
+      options.graceMs ?? getInterruptGraceMs(),
+      {
+        closePane: options.closePane ?? closePane,
+        abortWatcher: options.abortWatcher ?? DEFAULT_RECOVERY_PANE_OPERATIONS.abortWatcher,
+      },
+    );
+  }
   updateWidget();
 
   return {
@@ -1522,6 +1635,17 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function buildResumeAutoExitEnv(params: { autoExit: boolean; hasMessage: boolean }): string[] {
+  if (!params.autoExit) return [];
+  return [
+    "PI_SUBAGENT_AUTO_EXIT=1",
+    // A resumed session is a fresh autonomous run even when its JSONL ends in
+    // an operator Escape. The child consumes this one-shot re-arm on settle.
+    "PI_SUBAGENT_AUTO_EXIT_REARM=1",
+    ...(params.hasMessage ? ["PI_SUBAGENT_RESUME_INPUT=1"] : []),
+  ];
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1556,6 +1680,13 @@ export const __test__ = {
   advanceRunningTimeLimit,
   buildTimeLimitStoppedResult,
   buildResultTimeoutDetails,
+  buildInterruptedResult,
+  parseInterruptGraceMs,
+  getInterruptGraceMs,
+  DEFAULT_INTERRUPT_GRACE_MS,
+  scheduleInterruptedFinalization,
+  finalizeInterruptedSubagent,
+  buildResumeAutoExitEnv,
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
@@ -1826,6 +1957,11 @@ async function watchSubagent(
     });
 
     const detectedAt = Date.now();
+    const interruptedResult = buildInterruptedResult(running, detectedAt);
+    if (interruptedResult) {
+      updateWidget();
+      return interruptedResult;
+    }
     const timeLimitResult = buildTimeLimitStoppedResult(running, detectedAt);
     if (timeLimitResult) {
       updateWidget();
@@ -1948,6 +2084,11 @@ async function watchSubagent(
       updateWidget();
       return recoveryResult;
     }
+    const interruptedResult = buildInterruptedResult(running, now);
+    if (interruptedResult) {
+      updateWidget();
+      return interruptedResult;
+    }
 
     try {
       closePane(surface);
@@ -1980,6 +2121,7 @@ async function watchSubagent(
       error: err?.message ?? String(err),
     };
   } finally {
+    clearInterruptGraceTimer(running);
     cleanupWrapupDirective(sessionFile);
   }
 }
@@ -2286,13 +2428,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt the active turn of a running Pi-backed subagent. " +
+        "Interactive children remain open for operator takeover; autonomous one-shot children " +
+        "close after a bounded grace while their session stays resumable, and the parent delivers " +
+        "a terminal interrupt result.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt the active turn of a running Pi-backed subagent. " +
+        "Interactive children remain open for operator takeover; autonomous one-shot children " +
+        "close after a bounded grace while their session stays resumable, and the parent delivers " +
+        "a terminal interrupt result.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
@@ -2533,9 +2677,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
+        resumeEnvParts.push(...buildResumeAutoExitEnv({
+          autoExit,
+          hasMessage: Boolean(params.message),
+        }));
         // Spawn rights on resume are clamped to what the first launch recorded:
         // missing metadata ⇒ 0 (deny); never larger than first launch.
         const resumeSpawn = clampResumeSpawn(
