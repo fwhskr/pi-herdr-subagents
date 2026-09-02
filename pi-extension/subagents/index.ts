@@ -29,6 +29,7 @@ import {
   readPaneAsync,
   inspectPane,
   setPaneTask,
+  listPaneSessionReferences,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
@@ -103,6 +104,16 @@ import {
   writeWrapupDirective,
   type TimeLimitConfig,
 } from "./time-limits.ts";
+import {
+  discoverOrphanedSubagents,
+  formatOrphanRestoreReport,
+  isActionableOrphan,
+  isRestorableOrphan,
+  resumeOrphanedSubagents,
+  type DiscoveredOrphan,
+  type OrphanResumeOutcome,
+  type SpawnMetadataRecord,
+} from "./orphan-discovery.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -345,11 +356,30 @@ function clampResumeSpawn(
  * session file. Any failure (missing file, corrupt JSON) → null, which the
  * clamp treats as zero allowance.
  */
-function readSpawnMetadata(sessionFile: string): { allowance?: unknown } | null {
+function readSpawnMetadata(sessionFile: string): SpawnMetadataRecord | null {
   try {
     return JSON.parse(readFileSync(`${sessionFile}.spawn.json`, "utf8"));
   } catch {
     return null;
+  }
+}
+
+/** Write one complete spawn record without exposing a partially-written JSON. */
+function writeSpawnMetadata(sessionFile: string, metadata: SpawnMetadataRecord): void {
+  const target = `${sessionFile}.spawn.json`;
+  const temporary = join(
+    dirname(target),
+    `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(temporary, JSON.stringify(metadata), { flag: "wx", mode: 0o600 });
+    renameSync(temporary, target);
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The rename succeeded, or the temporary file was never created.
+    }
   }
 }
 
@@ -1693,6 +1723,12 @@ export const __test__ = {
   clearResumeExitSidecar,
   preflightSubagentDonePath,
   enrichNoSessionFailure,
+  writeSpawnMetadata,
+  discoverOrphanedSubagents,
+  formatOrphanRestoreReport,
+  isActionableOrphan,
+  isRestorableOrphan,
+  resumeOrphanedSubagents,
   runningSubagents,
   formatElapsed,
 };
@@ -1857,15 +1893,6 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  runScriptInPane(surface, built.command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
-  });
-
   const running: RunningSubagent = {
     id,
     name: params.name,
@@ -1886,17 +1913,33 @@ async function launchSubagent(
       : createLifecycle(startTime),
   };
 
-  // First-launch spawn metadata: authoritative cap for later subagent_resume.
-  // Non-granted agents record 0 so resume can never enlarge their rights.
+  // First-launch spawn metadata is durable lineage as well as the authoritative
+  // cap for later subagent_resume. Write it before the command enters the pane
+  // so a crash between pane creation and the first child message leaves a
+  // discoverable phantom rather than an invisible launch.
   try {
-    writeFileSync(
-      `${running.sessionFile}.spawn.json`,
-      JSON.stringify({ allowance: spawnGranted ? launcherAllowance ?? null : 0 }),
-      "utf8",
-    );
+    writeSpawnMetadata(running.sessionFile, {
+      allowance: spawnGranted ? launcherAllowance ?? null : 0,
+      parentSessionFile: sessionFile,
+      parentSessionId: sessionId,
+      childSessionFile: running.sessionFile,
+      name: params.name,
+      agent: params.agent ?? null,
+      task: params.task,
+      launchedAt: new Date(startTime).toISOString(),
+    });
   } catch {
-    // Unwritable sidecar ⇒ resume conservatively denies spawning.
+    // Unwritable sidecar ⇒ resume conservatively denies spawning, as before.
   }
+
+  runScriptInPane(surface, built.command, {
+    scriptPath: launchScriptFile,
+    scriptPreamble: (built.launchScriptPreamble ?? [
+      `# Subagent launch script for ${params.name}`,
+      `# Generated: ${new Date().toISOString()}`,
+      `# Surface: ${surface}`,
+    ]).join("\n"),
+  });
 
   runningSubagents.set(id, running);
   return running;
@@ -2126,8 +2169,182 @@ async function watchSubagent(
   }
 }
 
+type RegisteredToolExecutor = (...args: any[]) => Promise<any>;
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   runtime.pi = pi;
+  let spawnToolExecutor: RegisteredToolExecutor | undefined;
+  let resumeToolExecutor: RegisteredToolExecutor | undefined;
+  let restoreInFlight = false;
+
+  function currentSessionFile(ctx: any): string | null {
+    try {
+      const file = ctx?.sessionManager?.getSessionFile?.();
+      return typeof file === "string" && file.trim() ? file : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function discoverCurrentOrphans(ctx: any): DiscoveredOrphan[] {
+    const sessionFile = currentSessionFile(ctx);
+    if (!sessionFile) return [];
+    let sessionId: string | undefined;
+    try {
+      const id = ctx?.sessionManager?.getSessionId?.();
+      if (typeof id === "string" && id.trim()) sessionId = id;
+    } catch {
+      // A damaged/ephemeral session cannot provide an artifact namespace.
+    }
+
+    let paneSessions: ReturnType<typeof listPaneSessionReferences> = [];
+    try {
+      paneSessions = listPaneSessionReferences();
+    } catch {
+      // Herdr may be restarting during parent restore; disk discovery remains useful.
+    }
+    return discoverOrphanedSubagents(sessionFile, {
+      ...(sessionId ? { parentSessionId: sessionId } : {}),
+      paneSessions,
+    });
+  }
+
+  function appendRestoreHandled(child: DiscoveredOrphan, action: "resume" | "relaunch" | "report"): void {
+    const appendEntry = (pi as any).appendEntry;
+    if (typeof appendEntry !== "function") return;
+    try {
+      appendEntry("subagent_restore_handled", {
+        childSessionFile: child.sessionFile,
+        classification: child.classification,
+        action,
+        handledAt: new Date().toISOString(),
+      });
+    } catch {
+      // Completion delivery remains authoritative when the marker cannot be persisted.
+    }
+  }
+
+  function reportOrphansAtSessionStart(ctx: any): void {
+    // A child inherits the parent session directory and must not try to restore
+    // its parent's siblings when its own extension starts.
+    if (process.env.PI_SUBAGENT_ID) return;
+    const children = discoverCurrentOrphans(ctx);
+    const pending = children.filter(isActionableOrphan);
+    const content = formatOrphanRestoreReport(pending);
+    if (!content) return;
+
+    const reportedChildren = pending
+      .filter((child) => child.classification === "completed-undelivered")
+      .map((child) => ({ childSessionFile: child.sessionFile }));
+    try {
+      pi.sendMessage(
+        {
+          customType: "subagent_restore_report",
+          content,
+          display: true,
+          details: {
+            children: pending.map((child) => ({
+              childSessionFile: child.sessionFile,
+              name: child.name,
+              classification: child.classification,
+            })),
+            reportedChildren,
+          },
+        },
+        // Keep startup passive: the report is context for the next user turn,
+        // not an instruction to resume children before the user asks.
+        { triggerTurn: false, deliverAs: "steer" },
+      );
+      for (const child of pending) {
+        if (child.classification === "completed-undelivered") appendRestoreHandled(child, "report");
+      }
+    } catch {
+      // A session can be torn down while startup hooks are still draining.
+    }
+  }
+
+  function isStartedToolResult(result: any): boolean {
+    return result?.details?.status === "started";
+  }
+
+  async function restoreOnResume(ctx: any): Promise<boolean> {
+    if (restoreInFlight) return true;
+    const children = discoverCurrentOrphans(ctx);
+    const pending = children.filter(isRestorableOrphan);
+    if (pending.length === 0) return false;
+    if (!resumeToolExecutor && pending.some((child) => child.classification !== "phantom")) {
+      ctx?.ui?.notify?.("Cannot resume orphaned subagents: subagent_resume is unavailable.", "error");
+      return true;
+    }
+    if (!spawnToolExecutor && pending.some((child) => child.classification === "phantom")) {
+      ctx?.ui?.notify?.("Cannot relaunch phantom subagents: subagent is unavailable.", "error");
+      return true;
+    }
+
+    restoreInFlight = true;
+    try {
+      const outcomes: OrphanResumeOutcome[] = await resumeOrphanedSubagents(pending, {
+        closePane: (paneId) => closePane(paneId),
+        resume: async (child) => {
+          if (!resumeToolExecutor) throw new Error("subagent_resume is unavailable");
+          const result = await resumeToolExecutor(
+            `restore-resume-${child.name}`,
+            {
+              sessionPath: child.sessionFile,
+              name: `Resume ${child.name}`,
+              message: "Re-orient from your existing session, continue the interrupted task, and finish it. Return a concise final report when done.",
+              autoExit: true,
+            },
+            undefined,
+            undefined,
+            ctx,
+          );
+          if (!isStartedToolResult(result)) {
+            throw new Error(result?.content?.[0]?.text ?? "subagent_resume did not start");
+          }
+          // Persist the handled marker before moving to the next child so a
+          // shutdown during a multi-child restore cannot replay this resume.
+          appendRestoreHandled(child, "resume");
+          return result;
+        },
+        relaunch: async (child) => {
+          if (!spawnToolExecutor) throw new Error("subagent is unavailable");
+          const result = await spawnToolExecutor(
+            `restore-relaunch-${child.name}`,
+            {
+              name: child.name,
+              task: child.task,
+              ...(child.agent ? { agent: child.agent } : {}),
+              interactive: false,
+            },
+            undefined,
+            undefined,
+            ctx,
+          );
+          if (!isStartedToolResult(result)) {
+            throw new Error(result?.content?.[0]?.text ?? "subagent did not start");
+          }
+          appendRestoreHandled(child, "relaunch");
+          return result;
+        },
+      });
+      const failed = outcomes.filter((outcome) => !outcome.ok);
+      if (failed.length > 0) {
+        ctx?.ui?.notify?.(
+          `Restore started ${outcomes.length - failed.length} subagent${outcomes.length - failed.length === 1 ? "" : "s"}; ${failed.length} failed to start.`,
+          "warning",
+        );
+      } else {
+        ctx?.ui?.notify?.(
+          `Restore started ${outcomes.length} orphaned subagent${outcomes.length === 1 ? "" : "s"}.`,
+          "info",
+        );
+      }
+      return true;
+    } finally {
+      restoreInFlight = false;
+    }
+  }
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.
@@ -2147,6 +2364,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startStatusRefresh(pi);
       updateWidget();
     }
+    reportOrphansAtSessionStart(ctx);
   });
 
   // Clean up on session shutdown
@@ -2176,8 +2394,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
   // ── subagent tool ──
-  if (shouldRegister("subagent"))
-    pi.registerTool({
+  if (shouldRegister("subagent")) {
+    const subagentTool = {
       name: "subagent",
       label: "Subagent",
       description:
@@ -2420,7 +2638,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
-    });
+    };
+    spawnToolExecutor = subagentTool.execute;
+    pi.registerTool(subagentTool);
+  }
 
   // ── subagent_interrupt tool ──
   if (shouldRegister("subagent_interrupt"))
@@ -2533,8 +2754,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
   // ── subagent_resume tool ──
-  if (shouldRegister("subagent_resume"))
-    pi.registerTool({
+  if (shouldRegister("subagent_resume")) {
+    const subagentResumeTool = {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
@@ -2836,7 +3057,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
       },
-    });
+    };
+    resumeToolExecutor = subagentResumeTool.execute;
+    pi.registerTool(subagentResumeTool);
+  }
+
+  // "resume" is intentionally handled only when durable restore work exists;
+  // normal /resume session switching is dispatched before this input hook.
+  pi.on("input", async (event, ctx) => {
+    if (process.env.PI_SUBAGENT_ID) return { action: "continue" as const };
+    const text = typeof (event as any)?.text === "string" ? (event as any).text.trim() : "";
+    if ((event as any)?.source === "extension" || text.toLowerCase() !== "resume") {
+      return { action: "continue" as const };
+    }
+    const restored = await restoreOnResume(ctx);
+    return restored ? { action: "handled" as const } : { action: "continue" as const };
+  });
 
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
