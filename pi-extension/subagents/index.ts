@@ -103,6 +103,7 @@ import {
   writeWrapupDirective,
   type TimeLimitConfig,
 } from "./time-limits.ts";
+import type { SpawnMetadataRecord } from "./orphan-discovery.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -345,11 +346,30 @@ function clampResumeSpawn(
  * session file. Any failure (missing file, corrupt JSON) → null, which the
  * clamp treats as zero allowance.
  */
-function readSpawnMetadata(sessionFile: string): { allowance?: unknown } | null {
+function readSpawnMetadata(sessionFile: string): SpawnMetadataRecord | null {
   try {
     return JSON.parse(readFileSync(`${sessionFile}.spawn.json`, "utf8"));
   } catch {
     return null;
+  }
+}
+
+/** Write one complete spawn record without exposing a partially-written JSON. */
+function writeSpawnMetadata(sessionFile: string, metadata: SpawnMetadataRecord): void {
+  const target = `${sessionFile}.spawn.json`;
+  const temporary = join(
+    dirname(target),
+    `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(temporary, JSON.stringify(metadata), { flag: "wx", mode: 0o600 });
+    renameSync(temporary, target);
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The rename succeeded, or the temporary file was never created.
+    }
   }
 }
 
@@ -1693,6 +1713,7 @@ export const __test__ = {
   clearResumeExitSidecar,
   preflightSubagentDonePath,
   enrichNoSessionFailure,
+  writeSpawnMetadata,
   runningSubagents,
   formatElapsed,
 };
@@ -1857,15 +1878,6 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-  runScriptInPane(surface, built.command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: (built.launchScriptPreamble ?? [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Surface: ${surface}`,
-    ]).join("\n"),
-  });
-
   const running: RunningSubagent = {
     id,
     name: params.name,
@@ -1886,17 +1898,33 @@ async function launchSubagent(
       : createLifecycle(startTime),
   };
 
-  // First-launch spawn metadata: authoritative cap for later subagent_resume.
-  // Non-granted agents record 0 so resume can never enlarge their rights.
+  // First-launch spawn metadata is durable lineage as well as the authoritative
+  // cap for later subagent_resume. Write it before the command enters the pane
+  // so a crash between pane creation and the first child message leaves a
+  // discoverable phantom rather than an invisible launch.
   try {
-    writeFileSync(
-      `${running.sessionFile}.spawn.json`,
-      JSON.stringify({ allowance: spawnGranted ? launcherAllowance ?? null : 0 }),
-      "utf8",
-    );
+    writeSpawnMetadata(running.sessionFile, {
+      allowance: spawnGranted ? launcherAllowance ?? null : 0,
+      parentSessionFile: sessionFile,
+      parentSessionId: sessionId,
+      childSessionFile: running.sessionFile,
+      name: params.name,
+      ...(params.agent ? { agent: params.agent } : {}),
+      task: params.task,
+      launchedAt: new Date(startTime).toISOString(),
+    });
   } catch {
-    // Unwritable sidecar ⇒ resume conservatively denies spawning.
+    // Unwritable sidecar ⇒ resume conservatively denies spawning, as before.
   }
+
+  runScriptInPane(surface, built.command, {
+    scriptPath: launchScriptFile,
+    scriptPreamble: (built.launchScriptPreamble ?? [
+      `# Subagent launch script for ${params.name}`,
+      `# Generated: ${new Date().toISOString()}`,
+      `# Surface: ${surface}`,
+    ]).join("\n"),
+  });
 
   runningSubagents.set(id, running);
   return running;
