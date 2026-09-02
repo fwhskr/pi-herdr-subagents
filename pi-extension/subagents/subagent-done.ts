@@ -1,6 +1,6 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
+ * - Shows agent identity + available tools as a styled widget above the editor (toggle with Alt+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -14,28 +14,26 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
+function isTerminalAutoExitStopReason(stopReason: string | undefined): boolean {
+  return stopReason === "stop" || stopReason === "error";
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
+  // A tool-use response is an intermediate turn boundary. Keep the child
+  // alive so Pi can deliver the next assistant response or a tool failure.
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
+        return isTerminalAutoExitStopReason(msg.stopReason);
       }
     }
   }
 
-  return true;
+  return false;
 }
 
 export interface AutoExitDecisionState {
@@ -59,7 +57,7 @@ export function resolveAutoExit(
   stopReason: string | undefined,
 ): boolean {
   if (state.disarmed && !state.oneShotReArm) return false;
-  return stopReason !== "aborted";
+  return isTerminalAutoExitStopReason(stopReason);
 }
 
 function latestAssistantStopReason(messages: any[] | undefined): string | undefined {
@@ -127,6 +125,8 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const resumedAutoExitRearm = autoExit && process.env.PI_SUBAGENT_AUTO_EXIT_REARM === "1";
+  let resumeInputPending = autoExit && process.env.PI_SUBAGENT_RESUME_INPUT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -144,7 +144,7 @@ export default function (pi: ExtensionAPI) {
         if (expanded) {
           // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+          const hint = theme.fg("muted", "  (Alt+J to collapse)");
 
           const toolList = toolNames
             .map((name: string) => theme.fg("dim", name))
@@ -171,7 +171,7 @@ export default function (pi: ExtensionAPI) {
             denied.length > 0
               ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
               : "";
-          const hint = theme.fg("muted", "  (Ctrl+J to expand)");
+          const hint = theme.fg("muted", "  (Alt+J to expand)");
 
           const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
           box.addChild(content);
@@ -183,12 +183,24 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  let disarmed = false;
-  let oneShotReArm = false;
+  // A delegated resume is a fresh autonomous run even when the JSONL's last
+  // turn was operator-aborted. Re-arm it explicitly, rather than deriving
+  // state from historical session contents.
+  let disarmed = resumedAutoExitRearm;
+  let oneShotReArm = resumedAutoExitRearm;
   let warnedOperatorTakeover = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
   let wrapupInProgress = false;
+  let exitSidecarWritten = false;
+
+  function writeExitSidecar(data: object): void {
+    if (exitSidecarWritten) return;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!sessionFile) return;
+    writeFileSync(`${sessionFile}.exit`, JSON.stringify(data));
+    exitSidecarWritten = true;
+  }
 
   // Operator takeover (typed input or an Escape abort) permanently disarms
   // auto-exit for this session. The warning is latched so it is emitted
@@ -216,6 +228,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", (event, ctx) => {
     recorder.input();
+    // The resume command's positional message is machine input, even though
+    // Pi reports it as a normal input event. Consume that marker once so it
+    // cannot disarm the newly re-armed autonomous run.
+    if (resumeInputPending) {
+      resumeInputPending = false;
+      return;
+    }
     // Extension-injected report directives are not operator takeover. This keeps
     // the report-only continuation compatible with sticky auto-exit disarming.
     if ((event as any).source === "extension") return;
@@ -275,7 +294,7 @@ export default function (pi: ExtensionAPI) {
     const autoExitShouldFire = autoExit
       && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
     const shouldExit = autoExitShouldFire
-      || (wrapupInProgress && stopReason !== "aborted");
+      || (wrapupInProgress && isTerminalAutoExitStopReason(stopReason));
     if (autoExitShouldFire && oneShotReArm) {
       // Consume the one-shot re-arm: after this exit auto-exit is disarmed
       // again until the operator runs /auto-exit once more.
@@ -288,10 +307,7 @@ export default function (pi: ExtensionAPI) {
       // can report a clear failure with the underlying error message.
       if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages, wrapupInProgress)),
-          );
+          writeExitSidecar(buildCompletionSidecar(latestAgentMessages, wrapupInProgress));
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
           // after shutdown if the completion sidecar cannot be written.
@@ -348,7 +364,7 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionShutdown((event as any).reason);
   });
 
-  // Toggle expand/collapse with Ctrl+J
+  // Toggle expand/collapse with Alt+J (ctrl-J is pi's built-in tui.input.newLine)
   // Re-arm auto-exit for exactly one completion after operator takeover.
   pi.registerCommand("auto-exit", {
     description: "Close this session automatically after its next completed turn",
@@ -376,7 +392,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerShortcut("ctrl+j", {
+  pi.registerShortcut("alt+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {
       expanded = !expanded;
@@ -409,7 +425,7 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      writeExitSidecar(exitData);
 
       ctx.shutdown();
       return {
@@ -425,16 +441,25 @@ export default function (pi: ExtensionAPI) {
     description:
       "Call this tool when you have completed your task. " +
       "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
-    parameters: Type.Object({}),
+      "The final report must be written as text in the SAME assistant message as this tool call — " +
+      "include the report text alongside the tool call. " +
+      "Calling it without accompanying text returns no summary to the caller " +
+      "(\"Sub-agent exited without output\"). " +
+      "Profiles which cannot emit text alongside tool calls must pass the report via the `report` argument.",
+    parameters: Type.Object({
+      report: Type.Optional(
+        Type.String({
+          description:
+            "Final report summary for the parent session. Use this when your profile cannot emit text alongside the tool call; otherwise prefer same-message text.",
+          minLength: 1,
+        }),
+      ),
+    }),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(
-          `${sessionFile}.exit`,
-          JSON.stringify({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) }),
-        );
+        writeExitSidecar({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) });
       }
       ctx.shutdown();
       return {
