@@ -56,6 +56,7 @@ import subagentDoneExtension, {
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
+  MISSING_PANE_DEBOUNCE_MS,
   createLifecycle,
   lifecycleTransition,
   markCompleted,
@@ -395,6 +396,172 @@ describe("session.ts", () => {
         },
       };
       assert.equal(findLastAssistantMessage([msg] as any[]), null);
+    });
+
+    it("L-162: returns text when final assistant message carries text alongside subagent_done toolCall", () => {
+      // The fix requires the report text to be in the SAME message as the
+      // subagent_done tool call; extraction must not drop the text when a
+      // toolCall block is present in the same content array.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Task complete: updated docs." },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Task complete: updated docs.");
+    });
+
+    it("L-162: returns null when final assistant message has only a subagent_done toolCall, so caller falls back to 'Sub-agent exited without output'", () => {
+      // muse-spark calls subagent_done with a thinking+toolCall message and no
+      // text block; the extractor must return nothing so the parent at
+      // index.ts:1813 falls back to the no-output wording.
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "done" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done" },
+          ],
+        },
+      };
+      const extracted = findLastAssistantMessage([msg] as any[]);
+      assert.equal(extracted, null);
+      // Replicates the fallback branch in pi-extension/subagents/index.ts
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: same-message text wins over arguments.report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Preferred same-message report" },
+            { type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Fallback report param" } },
+          ],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Preferred same-message report");
+    });
+
+    it("L-162 phase2: toolCall-only with non-empty report returns the report", () => {
+      const msg = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report via arg" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([msg] as any[]), "Report via arg");
+    });
+
+    it("L-162 phase2: handles report via name field and stringified JSON arguments", () => {
+      const viaName = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "subagent_done", id: "tc-done", arguments: { report: "Via name field" } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaName] as any[]), "Via name field");
+
+      const viaJsonString = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: JSON.stringify({ report: "Via JSON string" }) }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([viaJsonString] as any[]), "Via JSON string");
+    });
+
+    it("L-162 phase2: toolCall-only without report falls back to earlier assistant text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier summary" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier summary");
+    });
+
+    it("L-162 phase2: whitespace-only report is treated as empty and falls back to earlier text", () => {
+      const earlier = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Earlier valid" }],
+        },
+      };
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "   " } }],
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlier, final] as any[]), "Earlier valid");
+    });
+
+    it("L-162 phase2: no report + no earlier text → null (fallback wording)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: {} }],
+        },
+      };
+      const extracted = findLastAssistantMessage([final] as any[]);
+      assert.equal(extracted, null);
+      const fallback = extracted ?? "Sub-agent exited without output";
+      assert.equal(fallback, "Sub-agent exited without output");
+    });
+
+    it("L-162 phase2: final error still beats stale earlier text (priority 3 > 4)", () => {
+      const earlierGood = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Stale earlier text" }],
+        },
+      };
+      const errorFinal = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "provider failed",
+        },
+      };
+      assert.equal(findLastAssistantMessage([earlierGood, errorFinal] as any[]), "Subagent error: provider failed");
+    });
+
+    it("L-162 phase2: final report beats final error (priority 2 > 3)", () => {
+      const final = {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolName: "subagent_done", toolCallId: "tc-done", arguments: { report: "Report wins over error" } }],
+          stopReason: "error",
+          errorMessage: "should be ignored",
+        },
+      };
+      assert.equal(findLastAssistantMessage([final] as any[]), "Report wins over error");
     });
   });
 
@@ -1494,6 +1661,11 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
     });
 
+    it("stays open after a tool-use turn", () => {
+      const messages = [{ role: "assistant", stopReason: "toolUse" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+    });
+
     it("still exits when the latest turn ended with stopReason=error", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
@@ -1555,6 +1727,50 @@ describe("subagent-done.ts", () => {
         assert.equal(shutdowns, 0);
       } finally {
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      }
+    });
+  });
+
+  it("publishes one crash sidecar across uncaughtException and exit hooks", () => {
+    withTempDir((dir) => {
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      const sessionFile = join(dir, "child.jsonl");
+      const exitFile = `${sessionFile}.exit`;
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+      try {
+        const { api } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        const exitHandlers = process.listeners("exit").filter(
+          (handler) => !priorExitHandlers.includes(handler),
+        );
+        const uncaughtHandlers = process.listeners("uncaughtException").filter(
+          (handler) => !priorUncaughtHandlers.includes(handler),
+        );
+        assert.equal(exitHandlers.length, 1);
+        assert.equal(uncaughtHandlers.length, 1);
+
+        (uncaughtHandlers[0] as (error: Error) => void)(new Error("read EIO"));
+        assert.deepEqual(JSON.parse(readFileSync(exitFile, "utf8")), {
+          type: "error",
+          errorMessage: "read EIO",
+        });
+
+        writeFileSync(exitFile, "latch-marker");
+        (exitHandlers[0] as () => void)();
+        assert.equal(readFileSync(exitFile, "utf8"), "latch-marker");
+
+        for (const handler of exitHandlers) process.off("exit", handler as () => void);
+        for (const handler of uncaughtHandlers) {
+          process.off("uncaughtException", handler as (error: Error) => void);
+        }
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
       }
     });
   });
@@ -1741,6 +1957,58 @@ describe("lifecycle.ts", () => {
     assert.equal(lifecycle.process.kind, "running");
   });
 
+  it("fails a pane that remains missing after the debounce", () => {
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    const firstMissingAt = 3_000;
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt,
+    );
+    assert.equal(lifecycle.process.kind, "running", "one missing observation is a race, not failure");
+    assert.notEqual(
+      projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind,
+      "failed",
+      "one missing observation must not project failure",
+    );
+
+    lifecycle = observePaneInspection(
+      lifecycle,
+      { kind: "missing", error: "pane_not_found" },
+      firstMissingAt + MISSING_PANE_DEBOUNCE_MS,
+    );
+    assert.equal(lifecycle.process.kind, "failed");
+    assert.match(lifecycle.process.error, /pane disappeared before completion evidence/i);
+    assert.equal(projectLifecycle(lifecycle, firstMissingAt + MISSING_PANE_DEBOUNCE_MS).kind, "failed");
+  });
+
+  it("persists a terminal missing projection for result delivery", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let lifecycle = createLifecycle(1_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "present", observedAt: 2_000, agentStatus: "working" }, 2_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_000);
+    lifecycle = observePaneInspection(lifecycle, { kind: "missing", error: "pane_not_found" }, 3_001);
+    const running = {
+      id: "missing-child",
+      name: "Worker",
+      task: "task",
+      surface: "pane-1",
+      startTime: 1_000,
+      sessionFile: "worker.jsonl",
+      interactive: false,
+      lifecycle,
+    };
+
+    const projection = testApi.reconcileProjectedFailure(
+      running,
+      projectLifecycle(lifecycle, 3_000 + MISSING_PANE_DEBOUNCE_MS),
+    );
+    assert.equal(projection.kind, "failed");
+    assert.equal(running.lifecycle.process.kind, "failed");
+    assert.match(running.lifecycle.process.error, /pane disappeared before completion evidence/i);
+  });
+
   it("preserves local interrupt over stale herdr statuses", () => {
     for (const agentStatus of ["working", "blocked", "idle", "done"] as const) {
       let lifecycle = createLifecycle(1_000);
@@ -1876,6 +2144,104 @@ describe("completion.ts", () => {
     assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
   });
 
+  it("reports a missing worker process while the pane is still present", async () => {
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      processExists: (pid) => pid === 42,
+      inspectPane: async () => {
+        inspections += 1;
+        return {
+          kind: "present",
+          observedAt: Date.now(),
+          agentStatus: "working",
+          workerPgid: inspections === 1 ? 42 : 43,
+        };
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.equal(inspections, 2, "the probe must fail without waiting for pane closure");
+  });
+
+  it("does not report a healthy worker as dead across multiple polls", async () => {
+    let reads = 0;
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      processExists: (pid) => pid === 42,
+      inspectPane: async () => {
+        inspections += 1;
+        return {
+          kind: "present",
+          observedAt: Date.now(),
+          agentStatus: "working",
+          workerPgid: 42,
+        };
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a healthy worker must survive repeated probes");
+  });
+
+  it("keeps polling when the pane has no worker identity", async () => {
+    let reads = 0;
+    let probes = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 2 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      processExists: () => {
+        probes += 1;
+        return false;
+      },
+      inspectPane: async () => ({
+        kind: "present",
+        observedAt: Date.now(),
+        agentStatus: "working",
+      }),
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.equal(probes, 0, "unknown worker identity must not probe or report death");
+  });
+
+  it("preserves a crash sidecar error without closing the pane", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-crash-sidecar-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({ type: "error", errorMessage: "read EIO" }));
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "",
+      });
+      assert.deepEqual(result, {
+        reason: "error",
+        exitCode: 1,
+        preservePane: true,
+        errorMessage: "read EIO",
+      });
+      assert.equal(existsSync(exitFile), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns when an external sentinel file appears", async () => {
     const dir = mkdtempSync(join(tmpdir(), "completion-sentinel-"));
     const sentinelFile = join(dir, "done");
@@ -1923,6 +2289,26 @@ describe("completion.ts", () => {
       exitCode: 1,
       errorMessage: "Subagent pane disappeared before completion evidence was recorded.",
     });
+  });
+
+  it("does not reap a single transient missing-pane observation", async () => {
+    let inspections = 0;
+    let reads = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1
+          ? { kind: "missing", error: "pane_not_found" }
+          : { kind: "present", observedAt: Date.now(), agentStatus: "working" };
+      },
+    });
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a transient miss must be followed by another inspection");
   });
 
   it("lets a sidecar win the pane-disappearance race", async () => {
@@ -2019,6 +2405,89 @@ describe("completion.ts", () => {
     });
     controller.abort();
     await assert.rejects(completion, /Aborted while waiting for subagent to finish/);
+  });
+});
+
+describe("resume completion sidecar", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("clears stale done or ping sidecars before the watcher can consume actual resumed output", async () => {
+    for (const [index, payload] of [
+      { type: "done" },
+      { type: "ping", name: "Worker", message: "needs help" },
+    ].entries()) {
+      const dir = createTestDir();
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", id: `session-${index}`, cwd: dir },
+      ]);
+      const entryCountBefore = getNewEntries(sessionFile, 0).length;
+      const exitFile = `${sessionFile}.exit`;
+      writeFileSync(exitFile, JSON.stringify(payload));
+
+      assert.equal(typeof testApi.clearResumeExitSidecar, "function");
+      testApi.clearResumeExitSidecar(sessionFile);
+      assert.equal(existsSync(exitFile), false, "resume must remove stale completion evidence");
+
+      writeFileSync(
+        sessionFile,
+        JSON.stringify({
+          type: "message",
+          id: `message-${index}`,
+          message: { role: "assistant", content: [{ type: "text", text: "actual resumed child output" }] },
+        }) + "\n",
+        { flag: "a" },
+      );
+      const completion = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "__SUBAGENT_DONE_0__",
+      });
+      assert.deepEqual(completion, { reason: "sentinel", exitCode: 0 });
+      assert.equal(
+        findLastAssistantMessage(getNewEntries(sessionFile, entryCountBefore)),
+        "actual resumed child output",
+      );
+    }
+  });
+});
+
+describe("child launch hardening", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("reports a missing child extension with the absolute path and swap cause", () => {
+    const missingRoot = createTestDir();
+    const missingPath = join(missingRoot, "subagent-done.ts");
+
+    assert.throws(
+      () => testApi.preflightSubagentDonePath(missingRoot),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, new RegExp(missingPath.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
+        assert.match(message, /live.*package.*swap/i);
+        return true;
+      },
+    );
+  });
+
+  it("includes a wider pane tail in non-zero no-session failures", () => {
+    const sessionFile = join(createTestDir(), "child.jsonl");
+    let requestedLines: number | undefined;
+    const paneTail = 'Error: Failed to load extension "/missing/subagent-done.ts"\n';
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { sessionFile, surface: "pane-1" },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => {
+        requestedLines = lines;
+        return paneTail;
+      },
+    );
+
+    assert.equal(requestedLines, 20);
+    assert.match(result.summary, /Sub-agent exited with code 1/);
+    assert.match(result.summary, /Failed to load extension/);
+    assert.equal(result.error, paneTail);
   });
 });
 
@@ -2263,6 +2732,17 @@ describe("subagent parent lifecycle", () => {
 
     assert.equal(selectCompletionApi(previous, current), current);
     assert.equal(selectCompletionApi(previous, undefined), previous);
+  });
+
+  it("does not let pane cleanup throw after a missing-pane result", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let closeAttempts = 0;
+
+    assert.doesNotThrow(() => testApi.closePaneQuietly("pane-1", () => {
+      closeAttempts += 1;
+      throw new Error("pane_not_found");
+    }));
+    assert.equal(closeAttempts, 1);
   });
 });
 
@@ -3251,5 +3731,391 @@ describe("herdr.ts", () => {
       }), "w1:p1");
       assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
     });
+
+    it("parses the worker pgid exposed by a pane record", () => {
+      const result = __herdrTest__.parsePaneGetOutput(JSON.stringify({
+        result: {
+          pane: {
+            pane_id: "w1:p1",
+            agent: "pi",
+            agent_status: "working",
+            process: "pi",
+            pgid: "Some(42)",
+          },
+        },
+      }), "w1:p1");
+      assert.deepEqual(result, {
+        kind: "present",
+        agent: "pi",
+        agentStatus: "working",
+        workerPgid: 42,
+      });
+    });
+
+    it("parses a Herdr process-info response and its process-group id", () => {
+      const result = __herdrTest__.parsePaneProcessInfoOutput(JSON.stringify({
+        result: {
+          process_info: {
+            pane_id: "w1:p1",
+            foreground_process_group_id: "Some(42)",
+            foreground_processes: [
+              { name: "bash", pid: 41, argv: ["bash"] },
+              { name: "pi", pid: 42, argv: ["pi"] },
+            ],
+          },
+        },
+      }), "w1:p1");
+      assert.deepEqual(result, {
+        workerPid: 42,
+        workerPgid: 42,
+      });
+    });
+  });
+});
+
+// --- F-209 continuation regressions (new bounded-test grant; existing suites untouched) ---
+describe("F-209 completion crash steering", () => {
+  const activity = (overrides: Record<string, unknown> = {}) => ({
+    version: 1 as const,
+    runningChildId: "f209-child",
+    createdAt: 1_000,
+    updatedAt: 1_000,
+    sequence: 1,
+    latestEvent: "agent_start" as const,
+    phase: "active" as const,
+    agentActive: true,
+    turnActive: true,
+    providerActive: false,
+    toolActive: false,
+    workerPid: 4_101,
+    workerStartTime: 9_001,
+    ...overrides,
+  });
+
+  const activityRead = (overrides: Record<string, unknown> = {}) => ({
+    ok: true as const,
+    activity: activity(overrides),
+  });
+
+  const presentPane = (overrides: Record<string, unknown> = {}) => ({
+    kind: "present" as const,
+    observedAt: Date.now(),
+    agentStatus: "working" as const,
+    ...overrides,
+  });
+
+  it("publishes the exact worker PID/start-time identity before activity is observed", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "f209-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "f209-child",
+        activityFile,
+        now: () => 1_000,
+      });
+
+      recorder.sessionStart();
+      const read = readSubagentActivityFile(activityFile, "f209-child");
+      assert.ok(read.ok);
+      assert.equal(read.activity.workerPid, process.pid);
+      assert.equal(typeof read.activity.workerStartTime, "number");
+      assert.ok(read.activity.workerStartTime! > 0);
+    });
+  });
+
+  it("turns an exit-137 sentinel into a detailed error while preserving the pane", async () => {
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "__SUBAGENT_DONE_137__",
+      inspectPane: async () => {
+        inspections += 1;
+        return presentPane();
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 137,
+      preservePane: true,
+      errorMessage: "subagent worker process terminated with observed exit status 137 (no exit sidecar)",
+    });
+    assert.equal(inspections, 0, "the terminal sentinel is terminal before pane cleanup");
+  });
+
+  it("keeps sidecar precedence and F-47 pane policy over an exit-137 sentinel", async () => {
+    for (const [index, payload] of [
+      { type: "error", errorMessage: "provider failure", stopReason: "error" },
+      { type: "error", errorMessage: "crash failure" },
+    ].entries()) {
+      const dir = createTestDir();
+      const sessionFile = join(dir, `child-${index}.jsonl`);
+      const exitFile = `${sessionFile}.exit`;
+      writeFileSync(exitFile, JSON.stringify(payload));
+      let terminalReads = 0;
+      let inspections = 0;
+      try {
+        const result = await waitForCompletion(new AbortController().signal, {
+          intervalMs: 1,
+          sessionFile,
+          readTerminalTail: async () => {
+            terminalReads += 1;
+            return "__SUBAGENT_DONE_137__";
+          },
+          inspectPane: async () => {
+            inspections += 1;
+            return presentPane();
+          },
+        });
+        const expected = {
+          reason: "error" as const,
+          exitCode: 1,
+          ...(payload.stopReason === "error" ? {} : { preservePane: true }),
+          errorMessage: payload.errorMessage,
+        };
+        assert.deepEqual(result, expected);
+        assert.equal(terminalReads, 0, "sidecar must win before terminal sentinel parsing");
+        assert.equal(inspections, 0, "sidecar must win before pane inspection");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("uses the published identity after Herdr drops worker metadata", async () => {
+    let inspections = 0;
+    let probes = 0;
+    const identities: Array<{ pid: number; startTime: number }> = [];
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => activityRead(),
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1
+          ? presentPane({ workerPid: 4_101, workerPgid: 4_101 })
+          : presentPane();
+      },
+      probeWorkerProcess: (identity) => {
+        probes += 1;
+        identities.push(identity);
+        return inspections === 1 ? "alive" : "dead";
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.equal(inspections, 2);
+    assert.equal(probes, 2);
+    assert.deepEqual(identities, [
+      { pid: 4_101, startTime: 9_001 },
+      { pid: 4_101, startTime: 9_001 },
+    ]);
+  });
+
+  it("detects death before Herdr's first identity-bearing poll", async () => {
+    const events: string[] = [];
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => {
+        events.push("activity");
+        return activityRead({ workerPid: 4_102, workerStartTime: 9_002 });
+      },
+      inspectPane: async () => {
+        events.push("pane");
+        return presentPane();
+      },
+      probeWorkerProcess: (identity) => {
+        events.push(`probe:${identity.pid}:${identity.startTime}`);
+        return "dead";
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.deepEqual(events, ["activity", "pane", "probe:4102:9002"]);
+  });
+
+  it("treats a zombie worker as dead even when the launch shell survives", async () => {
+    const { probeWorkerProcess } = await import("../pi-extension/subagents/completion.ts");
+    const identity = { pid: 4_103, startTime: 9_003 };
+    const readZombie = (pid: number) => ({
+      kind: "present" as const,
+      identity: { pid, startTime: 9_003 },
+      state: "Z",
+    });
+    assert.equal(probeWorkerProcess(identity, readZombie), "dead");
+
+    const probedPids: number[] = [];
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => activityRead({ workerPid: identity.pid, workerStartTime: identity.startTime }),
+      inspectPane: async () => presentPane({ workerPgid: 4_104 }),
+      probeWorkerProcess: (current) => probeWorkerProcess(current, (pid) => {
+        probedPids.push(pid);
+        return readZombie(pid);
+      }),
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.deepEqual(probedPids, [identity.pid], "probe the worker PID, not the surviving shell PGID");
+  });
+
+  it("treats PID reuse with a changed start time as worker death", async () => {
+    const { probeWorkerProcess } = await import("../pi-extension/subagents/completion.ts");
+    const identity = { pid: 4_105, startTime: 9_005 };
+    const reused = (pid: number) => ({
+      kind: "present" as const,
+      identity: { pid, startTime: 9_006 },
+      state: "S",
+    });
+    assert.equal(probeWorkerProcess(identity, reused), "dead");
+
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      readWorkerActivity: () => activityRead({ workerPid: identity.pid, workerStartTime: identity.startTime }),
+      inspectPane: async () => presentPane(),
+      probeWorkerProcess: (current) => probeWorkerProcess(current, reused),
+    });
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+  });
+
+  it("keeps polling when process reads are unavailable", async () => {
+    const { probeWorkerProcess } = await import("../pi-extension/subagents/completion.ts");
+    const identity = { pid: 4_106, startTime: 9_007 };
+    const unavailable = () => ({ kind: "unknown" as const, error: "EACCES" });
+    assert.equal(probeWorkerProcess(identity, unavailable), "unknown");
+
+    let reads = 0;
+    let probes = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 4 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      readWorkerActivity: () => activityRead({ workerPid: identity.pid, workerStartTime: identity.startTime }),
+      inspectPane: async () => presentPane(),
+      probeWorkerProcess: (current) => {
+        probes += 1;
+        return probeWorkerProcess(current, unavailable);
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(reads >= 4);
+    assert.ok(probes >= 3, "unknown process reads must remain retryable");
+  });
+
+  it("does not declare healthy activity dead after more than two polling intervals", async () => {
+    let polls = 0;
+    let probes = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        polls += 1;
+        return polls >= 5 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      readWorkerActivity: () => activityRead({
+        sequence: polls,
+        updatedAt: 1_000 + polls,
+      }),
+      inspectPane: async () => presentPane(),
+      probeWorkerProcess: () => {
+        probes += 1;
+        return "alive";
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(polls >= 5);
+    assert.ok(probes >= 4, "healthy activity must survive repeated probes");
+  });
+
+  it("does not reuse stale activity identity after a resume reset", async () => {
+    const { resetSubagentActivityFile } = await import("../pi-extension/subagents/activity.ts");
+    const dir = createTestDir();
+    const activityFile = getSubagentActivityFile(dir, "f209-child");
+    mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+    writeFileSync(activityFile, `${JSON.stringify(activity({ workerPid: 4_107, workerStartTime: 9_008 }))}\n`);
+    resetSubagentActivityFile(activityFile);
+    assert.equal(existsSync(activityFile), false);
+
+    let reads = 0;
+    const identities: Array<{ pid: number; startTime: number }> = [];
+    const currentIdentity = { workerPid: 4_108, workerStartTime: 9_009 };
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        readTerminalTail: async () => "",
+        readWorkerActivity: () => {
+          reads += 1;
+          if (reads === 2) {
+            writeFileSync(activityFile, `${JSON.stringify(activity({ ...currentIdentity, sequence: 2 }))}\n`);
+          }
+          return readSubagentActivityFile(activityFile, "f209-child");
+        },
+        inspectPane: async () => presentPane(),
+        probeWorkerProcess: (identity) => {
+          identities.push(identity);
+          return "dead";
+        },
+      });
+
+      assert.deepEqual(result, {
+        reason: "error",
+        exitCode: 1,
+        preservePane: true,
+        errorMessage: "subagent worker process died (no exit sidecar)",
+      });
+      assert.deepEqual(identities, [{ pid: 4_108, startTime: 9_009 }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains normal completion and missing-pane debounce behavior", async () => {
+    const normal = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "__SUBAGENT_DONE_0__",
+      inspectPane: async () => presentPane(),
+    });
+    assert.deepEqual(normal, { reason: "sentinel", exitCode: 0 });
+
+    let reads = 0;
+    let inspections = 0;
+    const debounced = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      inspectPane: async () => {
+        inspections += 1;
+        return inspections === 1 ? { kind: "missing", error: "pane_not_found" } : presentPane();
+      },
+    });
+    assert.deepEqual(debounced, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a single missing pane observation must not fail the run");
   });
 });
