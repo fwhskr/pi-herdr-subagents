@@ -15,6 +15,9 @@ export type PaneInspection =
       agent?: string;
       agentStatus: HerdrAgentStatus;
       observedAt: number;
+      /** Optional worker identity from Herdr's process probe. */
+      workerPid?: number;
+      workerPgid?: number;
     }
   | { kind: "missing"; error?: string }
   | { kind: "unavailable"; error?: string };

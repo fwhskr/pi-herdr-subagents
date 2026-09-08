@@ -60,6 +60,12 @@ export function resolveAutoExit(
   return isTerminalAutoExitStopReason(stopReason);
 }
 
+function uncaughtExceptionMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return "Subagent exited after an uncaught exception.";
+}
+
 function latestAssistantStopReason(messages: any[] | undefined): string | undefined {
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -193,14 +199,55 @@ export default function (pi: ExtensionAPI) {
   let latestAgentMessages: any[] | undefined;
   let wrapupInProgress = false;
   let exitSidecarWritten = false;
+  let processExitHandler: (() => void) | undefined;
+  let uncaughtExceptionHandler: ((error: Error) => void) | undefined;
 
-  function writeExitSidecar(data: object): void {
+  function writeExitSidecar(
+    data: object,
+    targetSessionFile = process.env.PI_SUBAGENT_SESSION,
+  ): void {
     if (exitSidecarWritten) return;
-    const sessionFile = process.env.PI_SUBAGENT_SESSION;
-    if (!sessionFile) return;
-    writeFileSync(`${sessionFile}.exit`, JSON.stringify(data));
+    if (!targetSessionFile) return;
+    writeFileSync(`${targetSessionFile}.exit`, JSON.stringify(data));
     exitSidecarWritten = true;
   }
+
+  function registerCrashHooks(): void {
+    const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!targetSessionFile) return;
+
+    processExitHandler = () => {
+      try {
+        writeExitSidecar({
+          type: "error",
+          errorMessage: "Subagent process exited unexpectedly.",
+        }, targetSessionFile);
+      } catch {
+        // Process exit is already in progress; sidecar publication is best effort.
+      }
+    };
+    uncaughtExceptionHandler = (error) => {
+      try {
+        writeExitSidecar({
+          type: "error",
+          errorMessage: uncaughtExceptionMessage(error),
+        }, targetSessionFile);
+      } catch {
+        // Pi's own uncaughtException handler still owns process termination.
+      }
+    };
+    process.on("exit", processExitHandler);
+    process.on("uncaughtException", uncaughtExceptionHandler);
+  }
+
+  function unregisterCrashHooks(): void {
+    if (processExitHandler) process.off("exit", processExitHandler);
+    if (uncaughtExceptionHandler) process.off("uncaughtException", uncaughtExceptionHandler);
+    processExitHandler = undefined;
+    uncaughtExceptionHandler = undefined;
+  }
+
+  registerCrashHooks();
 
   // Operator takeover (typed input or an Escape abort) permanently disarms
   // auto-exit for this session. The warning is latched so it is emitted
@@ -313,6 +360,7 @@ export default function (pi: ExtensionAPI) {
           // after shutdown if the completion sidecar cannot be written.
         }
       }
+      unregisterCrashHooks();
 
       recorder.agentEndDone();
       ctx.shutdown();
@@ -426,6 +474,7 @@ export default function (pi: ExtensionAPI) {
         message: params.message,
       };
       writeExitSidecar(exitData);
+      unregisterCrashHooks();
 
       ctx.shutdown();
       return {
@@ -461,6 +510,7 @@ export default function (pi: ExtensionAPI) {
       if (sessionFile) {
         writeExitSidecar({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) });
       }
+      unregisterCrashHooks();
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],

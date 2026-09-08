@@ -1731,6 +1731,50 @@ describe("subagent-done.ts", () => {
     });
   });
 
+  it("publishes one crash sidecar across uncaughtException and exit hooks", () => {
+    withTempDir((dir) => {
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      const sessionFile = join(dir, "child.jsonl");
+      const exitFile = `${sessionFile}.exit`;
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+      try {
+        const { api } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        const exitHandlers = process.listeners("exit").filter(
+          (handler) => !priorExitHandlers.includes(handler),
+        );
+        const uncaughtHandlers = process.listeners("uncaughtException").filter(
+          (handler) => !priorUncaughtHandlers.includes(handler),
+        );
+        assert.equal(exitHandlers.length, 1);
+        assert.equal(uncaughtHandlers.length, 1);
+
+        (uncaughtHandlers[0] as (error: Error) => void)(new Error("read EIO"));
+        assert.deepEqual(JSON.parse(readFileSync(exitFile, "utf8")), {
+          type: "error",
+          errorMessage: "read EIO",
+        });
+
+        writeFileSync(exitFile, "latch-marker");
+        (exitHandlers[0] as () => void)();
+        assert.equal(readFileSync(exitFile, "utf8"), "latch-marker");
+
+        for (const handler of exitHandlers) process.off("exit", handler as () => void);
+        for (const handler of uncaughtHandlers) {
+          process.off("uncaughtException", handler as (error: Error) => void);
+        }
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      }
+    });
+  });
+
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {
       const messages = [
@@ -2098,6 +2142,104 @@ describe("completion.ts", () => {
       readTerminalTail: async () => "output\n__SUBAGENT_DONE_17__\n",
     });
     assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
+  });
+
+  it("reports a missing worker process while the pane is still present", async () => {
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => "",
+      processExists: (pid) => pid === 42,
+      inspectPane: async () => {
+        inspections += 1;
+        return {
+          kind: "present",
+          observedAt: Date.now(),
+          agentStatus: "working",
+          workerPgid: inspections === 1 ? 42 : 43,
+        };
+      },
+    });
+
+    assert.deepEqual(result, {
+      reason: "error",
+      exitCode: 1,
+      preservePane: true,
+      errorMessage: "subagent worker process died (no exit sidecar)",
+    });
+    assert.equal(inspections, 2, "the probe must fail without waiting for pane closure");
+  });
+
+  it("does not report a healthy worker as dead across multiple polls", async () => {
+    let reads = 0;
+    let inspections = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 3 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      processExists: (pid) => pid === 42,
+      inspectPane: async () => {
+        inspections += 1;
+        return {
+          kind: "present",
+          observedAt: Date.now(),
+          agentStatus: "working",
+          workerPgid: 42,
+        };
+      },
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.ok(inspections >= 2, "a healthy worker must survive repeated probes");
+  });
+
+  it("keeps polling when the pane has no worker identity", async () => {
+    let reads = 0;
+    let probes = 0;
+    const result = await waitForCompletion(new AbortController().signal, {
+      intervalMs: 1,
+      readTerminalTail: async () => {
+        reads += 1;
+        return reads >= 2 ? "__SUBAGENT_DONE_0__" : "";
+      },
+      processExists: () => {
+        probes += 1;
+        return false;
+      },
+      inspectPane: async () => ({
+        kind: "present",
+        observedAt: Date.now(),
+        agentStatus: "working",
+      }),
+    });
+
+    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    assert.equal(probes, 0, "unknown worker identity must not probe or report death");
+  });
+
+  it("preserves a crash sidecar error without closing the pane", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-crash-sidecar-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({ type: "error", errorMessage: "read EIO" }));
+    try {
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => "",
+      });
+      assert.deepEqual(result, {
+        reason: "error",
+        exitCode: 1,
+        preservePane: true,
+        errorMessage: "read EIO",
+      });
+      assert.equal(existsSync(exitFile), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("returns when an external sentinel file appears", async () => {
@@ -3588,6 +3730,45 @@ describe("herdr.ts", () => {
         result: { pane: { pane_id: "w1:p1", agent: "pi", agent_status: "paused" } },
       }), "w1:p1");
       assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
+    });
+
+    it("parses the worker pgid exposed by a pane record", () => {
+      const result = __herdrTest__.parsePaneGetOutput(JSON.stringify({
+        result: {
+          pane: {
+            pane_id: "w1:p1",
+            agent: "pi",
+            agent_status: "working",
+            process: "pi",
+            pgid: "Some(42)",
+          },
+        },
+      }), "w1:p1");
+      assert.deepEqual(result, {
+        kind: "present",
+        agent: "pi",
+        agentStatus: "working",
+        workerPgid: 42,
+      });
+    });
+
+    it("parses a Herdr process-info response and its process-group id", () => {
+      const result = __herdrTest__.parsePaneProcessInfoOutput(JSON.stringify({
+        result: {
+          process_info: {
+            pane_id: "w1:p1",
+            foreground_process_group_id: "Some(42)",
+            foreground_processes: [
+              { name: "bash", pid: 41, argv: ["bash"] },
+              { name: "pi", pid: 42, argv: ["pi"] },
+            ],
+          },
+        },
+      }), "w1:p1");
+      assert.deepEqual(result, {
+        workerPid: 42,
+        workerPgid: 42,
+      });
     });
   });
 });

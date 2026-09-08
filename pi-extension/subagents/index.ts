@@ -2032,7 +2032,7 @@ async function watchSubagent(
 
       if (extracted) {
         const enriched = enrichNoSessionFailure(result, running, extracted.summary);
-        closePaneQuietly(surface);
+        if (!result.preservePane) closePaneQuietly(surface);
         running.lifecycle = result.exitCode === 0
           ? markCompleted(running.lifecycle, Date.now())
           : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
@@ -2097,7 +2097,7 @@ async function watchSubagent(
     }
 
     const enriched = enrichNoSessionFailure(result, running, summary);
-    closePaneQuietly(surface);
+    if (!result.preservePane) closePaneQuietly(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
       : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
