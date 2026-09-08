@@ -1,54 +1,91 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import {
+  readProcessStat,
+  type ActivityReadResult,
+  type ProcessStatReadResult,
+  type SubagentProcessIdentity,
+} from "./activity.ts";
 import { MISSING_PANE_DEBOUNCE_MS, MISSING_PANE_ERROR } from "./lifecycle.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
 export const WORKER_PROCESS_DIED_ERROR = "subagent worker process died (no exit sidecar)";
+export const WORKER_EXIT_STATUS_137_ERROR =
+  "subagent worker process terminated with observed exit status 137 (no exit sidecar)";
 
-function parseProcessId(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
-  if (typeof value !== "string") return undefined;
-  const match = value.trim().match(/^(?:Some\(\s*(\d+)\s*\)|(\d+))$/);
-  if (!match) return undefined;
-  const parsed = Number(match[1] ?? match[2]);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+type WorkerProcessProbeResult = "alive" | "dead" | "unknown";
+
+function validProcessIdentity(identity: SubagentProcessIdentity): boolean {
+  return Number.isSafeInteger(identity.pid) && identity.pid > 0 &&
+    Number.isSafeInteger(identity.startTime) && identity.startTime > 0;
+}
+
+export function probeWorkerProcess(
+  identity: SubagentProcessIdentity,
+  readStat: (pid: number) => ProcessStatReadResult = readProcessStat,
+): WorkerProcessProbeResult {
+  if (!validProcessIdentity(identity)) return "unknown";
+
+  let observed: ProcessStatReadResult;
+  try {
+    observed = readStat(identity.pid);
+  } catch {
+    return "unknown";
+  }
+  if (observed.kind === "missing") return "dead";
+  if (observed.kind !== "present") return "unknown";
+  if (
+    observed.identity.pid !== identity.pid ||
+    observed.identity.startTime !== identity.startTime
+  ) {
+    return "dead";
+  }
+  return observed.state === "Z" || observed.state === "X" || observed.state === "x"
+    ? "dead"
+    : "alive";
 }
 
 export function isProcessAliveInProc(pid: number): boolean {
-  // The worker probe is Linux-specific. On another host, do not turn an
-  // unavailable /proc filesystem into a false worker-death report.
-  return process.platform !== "linux" || existsSync(`/proc/${pid}`);
+  const result = readProcessStat(pid);
+  return result.kind === "present" && result.state !== "Z" && result.state !== "X" && result.state !== "x";
 }
 
-function workerIdentity(inspection: import("./lifecycle.ts").PaneInspection): {
-  pid?: number;
-  pgid?: number;
-} {
-  if (inspection.kind !== "present") return {};
-  const raw = inspection as unknown as Record<string, unknown>;
-  return {
-    pid: parseProcessId(raw.workerPid) ?? parseProcessId(raw.worker_pid),
-    pgid: parseProcessId(raw.workerPgid) ??
-      parseProcessId(raw.worker_pgid) ??
-      parseProcessId(raw.pgid),
+function activityWorkerIdentity(read: ActivityReadResult): SubagentProcessIdentity | undefined {
+  if (!read.ok) return undefined;
+  const identity = {
+    pid: read.activity.workerPid,
+    startTime: read.activity.workerStartTime,
   };
+  return identity.pid != null && identity.startTime != null && validProcessIdentity(identity)
+    ? identity
+    : undefined;
 }
 
-function workerProcessDied(
+/** Compatibility for pre-F-209 callers; live Pi launches use activity identity. */
+function legacyWorkerProcessDied(
   inspection: import("./lifecycle.ts").PaneInspection,
   processExists: (pid: number) => boolean,
 ): boolean {
-  const { pgid, pid } = workerIdentity(inspection);
-  // Prefer Herdr's foreground process group: it identifies the pi worker even
-  // when the launch shell remains alive after pi exits.
-  const workerId = pgid ?? pid;
+  if (inspection.kind !== "present") return false;
+  const workerId = inspection.workerPgid ?? inspection.workerPid;
   if (workerId == null) return false;
   try {
     return !processExists(workerId);
   } catch {
-    // A failed /proc read is unknown, not evidence of worker death.
     return false;
   }
+}
+
+function terminalCompletion(exitCode: number): CompletionResult {
+  if (exitCode === 137) {
+    return {
+      reason: "error",
+      exitCode,
+      preservePane: true,
+      errorMessage: WORKER_EXIT_STATUS_137_ERROR,
+    };
+  }
+  return { reason: "sentinel", exitCode };
 }
 
 export interface CompletionResult {
@@ -66,8 +103,13 @@ export interface CompletionOptions {
   intervalMs: number;
   readTerminalTail: () => Promise<string>;
   inspectPane?: () => Promise<import("./lifecycle.ts").PaneInspection>;
-  /** Injectable for unit tests; production uses the host /proc probe. */
+  /** Current-launch identity from the worker-written activity snapshot. */
+  readWorkerActivity?: () => ActivityReadResult;
+  /** Reports alive/dead/unknown; unknown never becomes a failure. */
+  probeWorkerProcess?: (identity: SubagentProcessIdentity) => WorkerProcessProbeResult;
+  /** @deprecated Pre-F-209 injection retained for existing callers/tests. */
   processExists?: (pid: number) => boolean;
+  onWorkerActivity?: (read: ActivityReadResult, observedAt: number) => void;
   /** Bounded artifact grace after explicit pane disappearance. Default: 500ms. */
   paneDisappearanceGraceMs?: number;
   onPaneInspection?: (
@@ -194,6 +236,7 @@ export async function waitForCompletion(
 ): Promise<CompletionResult> {
   const startedAt = Date.now();
   let missingPaneDetectedAt: number | undefined;
+  let knownWorkerIdentity: SubagentProcessIdentity | undefined;
 
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
@@ -207,10 +250,31 @@ export async function waitForCompletion(
 
     try {
       const exitCode = terminalExitCode(await options.readTerminalTail());
-      if (exitCode !== null) return { reason: "sentinel", exitCode };
+      if (exitCode !== null) return terminalCompletion(exitCode);
     } catch {
       // Terminal reads are only sentinel/output probes; Herdr status is polled
       // independently below, even when terminal reads succeed.
+    }
+
+    // Read the worker-authored snapshot before inspecting Herdr. This closes
+    // the startup gap where Pi can publish activity and die before Herdr's
+    // first foreground-process observation.
+    if (options.readWorkerActivity) {
+      let read: ActivityReadResult | undefined;
+      try {
+        read = options.readWorkerActivity();
+      } catch {
+        // Activity is optional; an unavailable or malformed read is unknown.
+      }
+      if (read) {
+        const candidate = activityWorkerIdentity(read);
+        if (candidate && !knownWorkerIdentity) knownWorkerIdentity = candidate;
+        try {
+          options.onWorkerActivity?.(read, Date.now());
+        } catch {
+          // Status enrichment must never prevent completion detection.
+        }
+      }
     }
 
     if (options.inspectPane) {
@@ -222,10 +286,28 @@ export async function waitForCompletion(
       }
       const observedAt = Date.now();
       options.onPaneInspection?.(inspection, observedAt);
-      if (inspection.kind === "present" && workerProcessDied(
-        inspection,
-        options.processExists ?? isProcessAliveInProc,
-      )) {
+      if (inspection.kind === "present" && knownWorkerIdentity) {
+        let probeResult: WorkerProcessProbeResult = "unknown";
+        try {
+          probeResult = options.probeWorkerProcess?.(knownWorkerIdentity) ??
+            probeWorkerProcess(knownWorkerIdentity);
+        } catch {
+          // A permission/read/parse failure is unknown, never worker death.
+        }
+        if (probeResult === "dead") {
+          return {
+            reason: "error",
+            exitCode: 1,
+            preservePane: true,
+            errorMessage: WORKER_PROCESS_DIED_ERROR,
+          };
+        }
+      } else if (
+        inspection.kind === "present" &&
+        !options.readWorkerActivity &&
+        options.processExists &&
+        legacyWorkerProcessDied(inspection, options.processExists)
+      ) {
         return {
           reason: "error",
           exitCode: 1,
@@ -256,6 +338,22 @@ export async function waitForCompletion(
         };
       }
       missingPaneDetectedAt = undefined;
+    } else if (knownWorkerIdentity) {
+      let probeResult: WorkerProcessProbeResult = "unknown";
+      try {
+        probeResult = options.probeWorkerProcess?.(knownWorkerIdentity) ??
+          probeWorkerProcess(knownWorkerIdentity);
+      } catch {
+        // A permission/read/parse failure is unknown, never worker death.
+      }
+      if (probeResult === "dead") {
+        return {
+          reason: "error",
+          exitCode: 1,
+          preservePane: true,
+          errorMessage: WORKER_PROCESS_DIED_ERROR,
+        };
+      }
     }
 
     options.onTick?.(Math.floor((Date.now() - startedAt) / 1000));

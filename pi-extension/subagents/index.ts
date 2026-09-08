@@ -64,6 +64,7 @@ import {
 import {
   getSubagentActivityFile,
   readSubagentActivityFile,
+  resetSubagentActivityFile,
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
@@ -1194,15 +1195,19 @@ function ensureLifecycle(running: RunningSubagent): SubagentLifecycle {
   return lifecycle;
 }
 
-function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
+function observeRunningSubagent(
+  running: RunningSubagent,
+  observedAt = Date.now(),
+  suppliedRead?: ActivityReadResult,
+) {
   ensureLifecycle(running);
   const driver = getHarnessDriver(running.cli);
   if (!driver.hasActivitySnapshots) return;
 
   const activityFile = running.activityFile;
-  const read: ActivityReadResult = activityFile
+  const read: ActivityReadResult = suppliedRead ?? (activityFile
     ? readSubagentActivityFile(activityFile, running.id)
-    : { ok: false, reason: "missing" };
+    : { ok: false, reason: "missing" });
 
   running.activityRead = read.ok
     ? { ok: true }
@@ -1832,6 +1837,7 @@ async function launchSubagent(
   const activityFile = getSubagentActivityFile(artifactDir, id);
   if (driver.hasActivitySnapshots) {
     mkdirSync(dirname(activityFile), { recursive: true });
+    resetSubagentActivityFile(activityFile);
   }
   const { inheritsConversationContext } = launchBehavior;
 
@@ -1987,6 +1993,12 @@ async function watchSubagent(
       sentinelFile: running.sentinelFile,
       readTerminalTail: () => readPaneAsync(surface, 5),
       inspectPane: async () => inspectPane(surface),
+      readWorkerActivity: running.activityFile
+        ? () => readSubagentActivityFile(running.activityFile!, running.id)
+        : undefined,
+      onWorkerActivity: (read: ActivityReadResult, observedAt: number) => {
+        observeRunningSubagent(running, observedAt, read);
+      },
       onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
         ensureLifecycle(running);
         running.lifecycle = observePaneInspection(running.lifecycle, inspection, observedAt);
@@ -2870,6 +2882,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        resetSubagentActivityFile(activityFile);
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
