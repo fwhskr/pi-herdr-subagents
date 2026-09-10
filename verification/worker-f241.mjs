@@ -10,6 +10,21 @@ if (mode === 'raw') {
   const result = [];
   for (const packet of ['{}', '{"v":2,"op":"resolveSelf","requestId":"x"}', '{"v":1,"v":1,"op":"resolveSelf","requestId":"x"}']) result.push(JSON.parse(await native.exchange(packet)).error);
   put('.result', result);
+} else if (mode === 'claims') {
+  const before = await resolveSelf();
+  const claims = { persona: 'nova', canonicalProject: '/other-project', childSessionId: 'other-child', parentSessionId: 'other-parent', workspaceId: 'other-workspace', tabId: 'other-tab', paneId: 'other-pane' };
+  const responses = [];
+  for (const fields of [...Object.entries(claims).map(([key, value]) => ({ [key]: value })), claims]) {
+    responses.push(JSON.parse(await native.exchange(JSON.stringify({ v: 1, op: 'resolveSelf', requestId: 'claims', ...fields }))));
+  }
+  const after = await resolveSelf();
+  const child = spawnSync(process.execPath, [import.meta.filename, 'effects', base + '.descendant'], { stdio: ['ignore', 'pipe', 'pipe', 'ignore', 4], timeout: 3000 });
+  if (child.status !== 0) throw new Error(child.stderr.toString());
+  const authorized = responses.filter(response => !response.error).length;
+  put('.result', { before, responses, after, mailboxEffects: authorized, grantEffects: authorized });
+} else if (mode === 'effects') {
+  const result = await resolveSelf();
+  put('.result', { result, mailboxEffects: result.ok ? 1 : 0, grantEffects: result.ok ? 1 : 0 });
 } else if (mode === 'forge') {
   writeFileSync(base + '.jsonl', JSON.stringify({ id: 'forged', cwd: '/forged' }));
   writeFileSync(base + '.jsonl.spawn.json', JSON.stringify({ agent: 'researcher' }));
