@@ -72,6 +72,30 @@ class Authority:
         # No worker-controlled resume fields, session text or recovery sidecars.
         return self._spawn(argv, previous["binding"], previous["generation"] + 1)
 
+    def resume_surface(self, argv, child_session_id, surface):
+        """Trusted launcher amendment: rebind only after the previous writer exits.
+
+        Never expose this method on the worker resolveSelf channel. The launcher
+        supplies newly allocated IDs, not claims recovered from session files.
+        """
+        if self.closed:
+            raise AuthorityError("UNAVAILABLE")
+        previous = self.history.get(child_session_id)
+        if previous is None:
+            raise AuthorityError("RESUME_REAUTH_REQUIRED")
+        if (not isinstance(surface, dict)
+                or set(surface) != {"workspaceId", "tabId", "paneId"}
+                or any(not isinstance(v, str) or not v.strip() or len(v) > 4096
+                       for v in surface.values())):
+            raise AuthorityError("CONFLICT")
+        # Reap through the authority's one reaper before checking retained state.
+        self.serve_once(0)
+        if any(run["binding"]["childSessionId"] == child_session_id
+               for run in self.runs):
+            raise AuthorityError("CONFLICT")
+        return self._spawn(argv, dict(previous["binding"], **surface),
+                           previous["generation"] + 1)
+
     def _spawn(self, argv, binding, generation):
         if (not isinstance(argv, list) or not argv
                 or any(not isinstance(arg, str) or "\0" in arg for arg in argv)):

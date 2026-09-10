@@ -122,6 +122,22 @@ all channels. **Cold adoption after authority loss is unsupported pending truste
 reauthorization.** Starting a new authority and reading old session/sidecar files
 is not reauthorization. There is no persistence/import/recovery API.
 
+## F-246 trusted surface-resume amendment (partial)
+
+`resume_surface(argv, childSessionId, surface)` accepts exactly the actual newly
+allocated workspaceId/tabId/paneId from a trusted launcher. It services the sole
+reaper and rejects CONFLICT until the previous session writer has exited and
+been reaped; stable identity and original lineage remain unchanged, generation
+advances, and absent retained history refuses RESUME_REAUTH_REQUIRED. Worker
+resolveSelf cannot invoke it. The old `resume` primitive remains for F-241
+stale-channel verification and must not be used by the production session-writer
+adapter. This amendment is not yet wired to Herdr or the provider caller.
+
+The build script now accepts an optional build-time staging directory. The native
+artifact must be packaged beside the consumer module at its fixed relative
+location; no runtime compilation or environment-selected module path is added.
+See `docs/f246-evidence.md` for passing isolated probes and remaining work.
+
 ## Migration and remaining integration gap
 
 Investigated legacy revision: 88837a8a7c95c38cb86e7f40125bf6bfd894edcf.
