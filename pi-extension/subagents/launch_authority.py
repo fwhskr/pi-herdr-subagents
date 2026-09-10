@@ -1,5 +1,7 @@
 """Linux inherited-channel authority. Embed only in a trusted launch supervisor."""
 import ctypes
+import fcntl
+import termios
 import json
 import os
 import re
@@ -43,7 +45,7 @@ class Authority:
         self.runs = []
         self.closed = False
 
-    def launch(self, argv, binding):
+    def launch(self, argv, binding, *, cwd=None, env=None, tty_fd=None):
         if self.closed:
             raise AuthorityError("UNAVAILABLE")
         if (not isinstance(binding, dict) or set(binding) != FIELDS
@@ -61,7 +63,7 @@ class Authority:
         if not os.path.isabs(project) or not os.path.isdir(project):
             raise AuthorityError("CONFLICT")
         binding = dict(binding, canonicalProject=os.path.realpath(project))
-        return self._spawn(argv, binding, 1)
+        return self._spawn(argv, binding, 1, cwd=cwd, env=env, tty_fd=tty_fd)
 
     def resume(self, argv, child_session_id):
         if self.closed:
@@ -72,7 +74,7 @@ class Authority:
         # No worker-controlled resume fields, session text or recovery sidecars.
         return self._spawn(argv, previous["binding"], previous["generation"] + 1)
 
-    def resume_surface(self, argv, child_session_id, surface):
+    def resume_surface(self, argv, child_session_id, surface, *, cwd=None, env=None, tty_fd=None):
         """Trusted launcher amendment: rebind only after the previous writer exits.
 
         Never expose this method on the worker resolveSelf channel. The launcher
@@ -94,11 +96,20 @@ class Authority:
                for run in self.runs):
             raise AuthorityError("CONFLICT")
         return self._spawn(argv, dict(previous["binding"], **surface),
-                           previous["generation"] + 1)
+                           previous["generation"] + 1, cwd=cwd, env=env, tty_fd=tty_fd)
 
-    def _spawn(self, argv, binding, generation):
+    def _spawn(self, argv, binding, generation, *, cwd=None, env=None, tty_fd=None):
         if (not isinstance(argv, list) or not argv
                 or any(not isinstance(arg, str) or "\0" in arg for arg in argv)):
+            raise AuthorityError("CONFLICT")
+        if cwd is not None and (not isinstance(cwd, str) or not os.path.isabs(cwd)
+                                or not os.path.isdir(cwd)):
+            raise AuthorityError("CONFLICT")
+        if env is not None and (not isinstance(env, dict)
+                or any(not isinstance(k, str) or not k or "=" in k or "\0" in k
+                       or not isinstance(v, str) or "\0" in v for k, v in env.items())):
+            raise AuthorityError("CONFLICT")
+        if tty_fd is not None and not os.isatty(tty_fd):
             raise AuthorityError("CONFLICT")
         server, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
@@ -115,11 +126,21 @@ class Authority:
                     if os.read(gate_read, 1) != b"1":
                         os._exit(126)
                     os.close(gate_read)
+                    if tty_fd is not None:
+                        # Preserve the terminal even if recvmsg allocated it at FD 4.
+                        terminal = fcntl.fcntl(tty_fd, fcntl.F_DUPFD_CLOEXEC, 5)
+                        os.setsid()
+                        fcntl.ioctl(terminal, termios.TIOCSCTTY, 0)
+                        for descriptor in (0, 1, 2):
+                            os.dup2(terminal, descriptor)
+                        os.close(terminal)
+                    if cwd is not None:
+                        os.chdir(cwd)
                     os.dup2(child.fileno(), WORKER_FD, inheritable=True)
                     # dup2(fd, fd) is a no-op: explicitly clear CLOEXEC as well.
                     os.set_inheritable(WORKER_FD, True)
                     # All other authority descriptors are CLOEXEC by Python default.
-                    os.execvpe(argv[0], argv, os.environ.copy())
+                    os.execvpe(argv[0], argv, os.environ.copy() if env is None else env)
                 except BaseException:
                     os._exit(127)
             child.close()
@@ -208,7 +229,8 @@ class Authority:
                 run["status"] = "REVOKED"
                 run["socket"].close()
                 os.close(run["pidfd"])
-                os.waitpid(run["pid"], 0)
+                _, wait_status = os.waitpid(run["pid"], 0)
+                run["exitCode"] = os.waitstatus_to_exitcode(wait_status)
                 self.runs.remove(run)
             elif run["socket"] in ready:
                 try:
