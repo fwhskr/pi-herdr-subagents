@@ -77,7 +77,8 @@ API result: `{ok:true, identity: <successful response>}` or
   deadline exceeded or invalid response. No sidecar fallback.
 * UNREGISTERED: packet sender is not the launched process.
 * STALE_GENERATION: a trusted resume superseded this channel's generation.
-* REVOKED: trusted revocation or exited registration.
+* REVOKED: trusted revocation on a still-open channel. Exit closes the channel,
+  so subsequent client calls normally see UNAVAILABLE instead.
 * CONFLICT: duplicate fresh registration or conflicting trusted launch data.
 * UNSUPPORTED_VERSION: incompatible wire version.
 * RESUME_REAUTH_REQUIRED: resume without this authority's retained trusted record.
@@ -103,7 +104,14 @@ childSessionId)` uses retained trusted fields and creates a new generation;
 packets and pidfds; `close()` revokes, kills only its still-pinned children and
 reaps them. `AuthorityError.code` uses the error vocabulary above. argv must exec
 the actual worker, not an intermediary shell spawning a different process.
-The supervisor must keep servicing requests while workers run.
+The supervisor must keep servicing requests while workers run. FD 4 is explicitly
+marked inheritable even when dup2 is a same-descriptor no-op (R3b regression).
+
+Bounded probes and ordered failure/repair evidence live in
+`verification/run-f241-launch-authority.py` and `docs/f241-r2-evidence.md`.
+They exercise real Node processes and the native client, not full Pi or Herdr
+integration. Inherited-descriptor rejection and authority-death fail-closed
+behavior pass; independent Echo and durable test-suite registration remain pending.
 
 Duplicate fresh child IDs refuse. Resume retains persona/project/child ID/parent
 lineage/tuple and invalidates the previous channel. Original worker exit leaves

@@ -92,6 +92,8 @@ class Authority:
                         os._exit(126)
                     os.close(gate_read)
                     os.dup2(child.fileno(), WORKER_FD, inheritable=True)
+                    # dup2(fd, fd) is a no-op: explicitly clear CLOEXEC as well.
+                    os.set_inheritable(WORKER_FD, True)
                     # All other authority descriptors are CLOEXEC by Python default.
                     os.execvpe(argv[0], argv, os.environ.copy())
                 except BaseException:
