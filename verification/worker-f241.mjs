@@ -6,7 +6,33 @@ import { resolveSelf } from '../pi-extension/subagents/launch-identity.ts';
 const [mode, base] = process.argv.slice(2);
 const put = (suffix, value) => writeFileSync(base + suffix, JSON.stringify(value));
 const native = createRequire(import.meta.url)('../pi-extension/subagents/launch-identity-native.node');
-if (mode === 'raw') {
+if (mode === 'replay' || mode === 'response-replay' || mode === 'packet') {
+  // ASCII request and UTF-8 response strings are retained verbatim, not reserialized.
+  const packet = process.argv[4] ?? '{ "v":1, "op":"resolveSelf", "requestId":"captured-replay" }';
+  const exchange = async (bytes) => ({ sent: bytes, received: await native.exchange(bytes) });
+  const effects = (attempts) => {
+    const count = attempts.filter(attempt => !JSON.parse(attempt.received).error).length;
+    return { mailboxEffects: count, grantEffects: count };
+  };
+  if (mode === 'packet') {
+    const attempts = [await exchange(packet)];
+    put('.result', { attempts, ...effects(attempts) });
+  } else {
+    const captured = await exchange(packet);
+    put('.ready', captured);
+    const deadline = Date.now() + 5000;
+    while (!existsSync(base + '.go')) {
+      if (Date.now() >= deadline) throw new Error('replay deadline');
+      await delay(10);
+    }
+    const attempts = [await exchange(mode === 'replay' ? captured.sent : captured.received)];
+    const reused = mode === 'response-replay' ? [await exchange(packet), await exchange(packet)] : [];
+    const child = spawnSync(process.execPath, [import.meta.filename, 'packet', base + '.descendant', packet], { stdio: ['ignore', 'pipe', 'pipe', 'ignore', 4], timeout: 3000 });
+    if (child.status !== 0) throw new Error(child.stderr.toString());
+    // Provider probes cannot enforce single-transaction response scope at a consumer.
+    put('.result', { captured, attempts, reused, ...effects(attempts) });
+  }
+} else if (mode === 'raw') {
   const result = [];
   for (const packet of ['{}', '{"v":2,"op":"resolveSelf","requestId":"x"}', '{"v":1,"v":1,"op":"resolveSelf","requestId":"x"}']) result.push(JSON.parse(await native.exchange(packet)).error);
   put('.result', result);

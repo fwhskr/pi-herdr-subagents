@@ -220,7 +220,66 @@ with tempfile.TemporaryDirectory(prefix='f241-', dir='/tmp') as directory:
                 assert not Path(base + '.cold.result').exists()
                 no_channel(base + '.unregistered')
                 print('PASS case 13 delegator exit + writer reaped: trusted surface resume generation 1 -> 2, stable lineage/project; cold authority RESUME_REAUTH_REQUIRED; no unregistered identity/channel; refused DM/grants=0')
+        elif case in (14, 15):
+            def denied(attempt, code):
+                response = json.loads(attempt['received'])
+                assert response == dict(v=1, requestId=None if code in ('UNREGISTERED', 'MALFORMED_REQUEST') else 'captured-replay', error=code), response
+
+            for variant in (('superseded', 'revoked') if case == 14 else ('response',)):
+                dest = base + '.' + variant
+                mode = 'replay' if case == 14 else 'response-replay'
+                authority.launch([node, worker, mode, dest], binding)
+                captured = await_file(authority, dest + '.ready')
+                identity = json.loads(captured['received'])
+                assert 'error' not in identity and identity['launchGeneration'] == 1, identity
+                for key, value in binding.items():
+                    assert identity[key] == value
+                assert captured['sent'] == '{ "v":1, "op":"resolveSelf", "requestId":"captured-replay" }'
+                if variant == 'superseded':
+                    # Legacy resume intentionally retains a live stale channel. Production uses resume_surface.
+                    authority.resume([node, worker, 'wait', dest + '.new'], 'child')
+                    fresh = await_file(authority, dest + '.new.ready')['identity']
+                    assert fresh['launchGeneration'] == 2
+                    code = 'STALE_GENERATION'
+                elif variant == 'revoked':
+                    authority.revoke('child')
+                    code = 'REVOKED'
+                else:
+                    code = 'MALFORMED_REQUEST'
+                Path(dest + '.go').write_text('go')
+                result = await_file(authority, dest + '.result')
+                assert result['captured'] == captured
+                attempt, = result['attempts']
+                assert attempt['sent'] == captured['sent' if case == 14 else 'received']
+                denied(attempt, code)
+                assert result['mailboxEffects'] == result['grantEffects'] == 0
+                descendant = load(dest + '.descendant.result')
+                other, = descendant['attempts']
+                assert other['sent'] == captured['sent']
+                denied(other, 'UNREGISTERED')
+                assert descendant['mailboxEffects'] == descendant['grantEffects'] == 0
+                # Sensitivity control: the exact valid response MUST fail every refusal assertion.
+                for refusal in (code, 'UNREGISTERED'):
+                    try:
+                        denied(captured, refusal)
+                    except AssertionError:
+                        pass
+                    else:
+                        raise AssertionError('refusal check accepted captured valid identity')
+                if case == 15:
+                    assert len(result['reused']) == 2
+                    for reused in result['reused']:
+                        assert reused['sent'] == captured['sent']
+                        assert json.loads(reused['received']) == identity
+                    assert len(authority.history) == 1
+                    assert authority.history['child']['generation'] == 1
+                    print('PASS case 15 captured response -> MALFORMED_REQUEST; requestId reused twice: same pinned identity/generation=1; descendant UNREGISTERED; replay DM/grants=0; refusal sensitivity PASS; transaction scope consumer-side')
+                else:
+                    assert not result['reused']
+                    print('PASS case 14', variant, 'verbatim captured request ->', code, '; descendant UNREGISTERED; no replay identity/usable authorization; DM/grants=0; refusal sensitivity PASS')
+                authority.close()
+                authority = module.Authority()
         else:
-            raise ValueError('case must be 1..13')
+            raise ValueError('case must be 1..15')
     finally:
         authority.close()
