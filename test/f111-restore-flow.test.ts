@@ -214,6 +214,60 @@ function contextFor(parent: string, root: string, entries: object[]) {
   return built;
 }
 
+for (const toolName of ["subagent", "subagent_resume"]) {
+  it(`${toolName} contains a throwing queued error continuation`, { timeout: 10_000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), "f255-continuation-"));
+    tempRoots.add(root);
+    const parent = join(root, "parent.jsonl");
+    const entries = [header("parent-id", root)];
+    writeJsonl(parent, entries);
+    const child = join(root, "child.jsonl");
+    writeJsonl(child, [header("child-id", root)]);
+    fakeHerdr(root, []);
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "parent-pane";
+    process.env.HERDR_TAB_ID = "parent-tab";
+    process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    __herdrTest__.clearCommandAvailability();
+    const built = contextFor(parent, root, entries);
+    subagentsExtension(built.api);
+    const start = built.handlers.get("session_start")![0];
+    const shutdown = built.handlers.get("session_shutdown")![0];
+    let failures = 0;
+    try {
+      start({}, built.ctx);
+      built.ctx.ui.setWidget = () => {
+        // Completion removes the row before rendering; launch renders a live row.
+        if (subagentsTest.runningSubagents.size !== 0 || failures >= 2) return;
+        failures += 1;
+        if (failures === 1) shutdown({ reason: "reload" }, built.ctx);
+        throw new Error(`F-255 widget continuation failure ${failures}`);
+      };
+      const tool = built.tools.find(tool => tool.name === toolName);
+      const result = await tool.execute("f255", toolName === "subagent"
+        ? { name: "worker", task: "report", interactive: false }
+        : { name: "worker", sessionPath: child, message: "report", autoExit: true },
+      undefined, undefined, built.ctx);
+      assert.equal(result.details.status, "started");
+      const deadline = performance.now() + 5_000;
+      while (failures === 0 && performance.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal(failures, 1, "normal completion failed and detached for reload");
+      await Promise.resolve(); // let the rejected completion enqueue its error continuation
+      start({}, built.ctx);
+      assert.equal(failures, 2, "rebind ran the queued error continuation");
+      // Cross an event-loop boundary so Node observes any unhandled rejection.
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(subagentsTest.runningSubagents.size, 0);
+    } finally {
+      shutdown({ reason: "exit" }, built.ctx);
+    }
+  });
+}
+
 describe("F-111.2 restore flow", () => {
   it("injects the startup report, closes only the matching stale pane, resumes children, and is idempotent", async () => {
     const root = mkdtempSync(join(tmpdir(), "f111-flow-"));

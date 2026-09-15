@@ -2570,7 +2570,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          }));
+          }))
+          .catch(() => { /* Error delivery is best-effort; never reject a detached watcher. */ });
 
         // Return immediately
         return {
@@ -3062,7 +3063,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          }));
+          }))
+          .catch(() => { /* Error delivery is best-effort; never reject a detached watcher. */ });
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
