@@ -2381,6 +2381,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    // Watchers survive reload, but the old context does not. Poll callbacks can
+    // run between teardown and session_start; skip UI until the new ctx binds.
+    runtime.latestCtx = undefined;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
