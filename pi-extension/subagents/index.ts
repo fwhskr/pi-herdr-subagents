@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
+import { CompletionDelivery } from "./completion-delivery.ts";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, join } from "node:path";
@@ -905,7 +906,7 @@ const DEFAULT_TIME_LIMIT_PANE_OPERATIONS: TimeLimitPaneOperations = {
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
-  pi?: ExtensionAPI;
+  delivery?: CompletionDelivery<ExtensionAPI>;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
   agentCatalog?: string;
@@ -920,6 +921,7 @@ const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
+const completionDelivery = runtime.delivery ??= new CompletionDelivery<ExtensionAPI>();
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
   return reason === "reload";
@@ -2184,7 +2186,7 @@ async function watchSubagent(
 type RegisteredToolExecutor = (...args: any[]) => Promise<any>;
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  runtime.pi = pi;
+  // Bind delivery only after session_start, never to factory-time API stubs.
   let spawnToolExecutor: RegisteredToolExecutor | undefined;
   let resumeToolExecutor: RegisteredToolExecutor | undefined;
   let restoreInFlight = false;
@@ -2376,6 +2378,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startStatusRefresh(pi);
       updateWidget();
     }
+    completionDelivery.bind(pi);
     reportOrphansAtSessionStart(ctx);
   });
 
@@ -2384,6 +2387,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     // Watchers survive reload, but the old context does not. Poll callbacks can
     // run between teardown and session_start; skip UI until the new ctx binds.
     runtime.latestCtx = undefined;
+    completionDelivery.detach(shouldPreserveSubagentsOnShutdown((event as any).reason));
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -2490,7 +2494,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
+          .then((result) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -2500,7 +2504,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -2547,8 +2550,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          })
-          .catch((err) => {
+          }))
+          .catch((err) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -2558,7 +2561,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            selectCompletionApi(pi, runtime.pi).sendMessage(
+            completionApi.sendMessage(
               {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -2567,7 +2570,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+          }));
 
         // Return immediately
         return {
@@ -2977,7 +2980,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         running.abortController = watcherAbort;
 
         watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
+          .then((result) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -2987,7 +2990,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
@@ -3040,8 +3042,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          })
-          .catch((err) => {
+          }))
+          .catch((err) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -3051,7 +3053,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
             runningSubagents.delete(running.id);
             updateWidget();
-            selectCompletionApi(pi, runtime.pi).sendMessage(
+            completionApi.sendMessage(
               {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
@@ -3060,7 +3062,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+          }));
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
