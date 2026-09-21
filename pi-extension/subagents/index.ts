@@ -1760,6 +1760,7 @@ async function launchSubagent(
   ctx: {
     sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
     cwd: string;
+    isProjectTrusted?: () => boolean;
     model?: { provider: string; id: string };
     modelRegistry: {
       find(provider: string, modelId: string): any;
@@ -1876,6 +1877,8 @@ async function launchSubagent(
     sessionDir,
     subagentSessionFile,
     effectiveCwd,
+    parentCwd: ctx.cwd,
+    parentTrusted: typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined,
     localAgentDir,
     effectiveAutoExit,
     effectiveInteractive,

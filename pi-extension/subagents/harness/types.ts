@@ -42,6 +42,10 @@ export interface SubagentLaunchContext {
   sessionDir: string;
   subagentSessionFile: string;
   effectiveCwd: string;
+  /** Parent session cwd, used to inherit its trust decision for same-folder children. */
+  parentCwd?: string;
+  /** Parent's own project-trust decision (`ctx.isProjectTrusted()`), when known. */
+  parentTrusted?: boolean;
   localAgentDir?: string;
   effectiveAutoExit: boolean;
   effectiveInteractive: boolean;

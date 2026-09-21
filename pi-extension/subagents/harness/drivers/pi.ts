@@ -7,6 +7,7 @@ import type {
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
+import { resolveSpawnTrustFlag } from "../../spawn-trust.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -67,6 +68,8 @@ export class PiHarnessDriver implements HarnessDriver {
       artifactDir,
       subagentSessionFile,
       effectiveCwd,
+      parentCwd,
+      parentTrusted,
       localAgentDir,
       effectiveAutoExit,
       taskDelivery,
@@ -94,6 +97,16 @@ export class PiHarnessDriver implements HarnessDriver {
     if (effectiveThinking) {
       parts.push("--thinking", shellQuote(effectiveThinking));
     }
+
+    // A one-shot child must never fall through to pi's interactive
+    // project-trust selector: pass the resolved decision explicitly. Without
+    // this, a child in a folder with project-local pi resources and no
+    // trust-store entry blocks at startup forever (B12).
+    parts.push(resolveSpawnTrustFlag({
+      childCwd: effectiveCwd,
+      parentCwd,
+      parentTrusted,
+    }));
 
     if (identityInSystemPrompt && identity) {
       const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
