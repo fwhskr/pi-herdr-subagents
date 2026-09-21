@@ -6,7 +6,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { consumeWrapupDirective } from "./time-limits.ts";
 
@@ -58,6 +60,119 @@ export function resolveAutoExit(
 ): boolean {
   if (state.disarmed && !state.oneShotReArm) return false;
   return isTerminalAutoExitStopReason(stopReason);
+}
+
+/** Fallback recovery state derived from the agent-fallback-chain session contract. */
+export type FallbackRecoveryState = "none" | "pending" | "exhausted";
+
+export type FallbackExitDecision = "exit" | "defer" | "grace";
+
+/**
+ * Derive fallback recovery state from session entries.
+ *
+ * Contract owned by the live agent-fallback-chain extension: it appends
+ * `agent-fallback` / `agent-fallback-deferred` once a recovery continuation is
+ * queued, and `agent-fallback-terminal` once recovery is exhausted. Only
+ * entries appended AFTER the last assistant message belong to the attempt that
+ * just settled; once a recovered turn produces a new assistant message, its
+ * fallback entry is superseded.
+ */
+export function deriveFallbackRecovery(
+  entries: Array<{ type?: string; customType?: string; message?: { role?: string } }> | undefined,
+): FallbackRecoveryState {
+  if (!entries || entries.length === 0) return "none";
+  let lastAssistant = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry: any = entries[i];
+    if (entry?.type === "message" && entry.message?.role === "assistant") {
+      lastAssistant = i;
+      break;
+    }
+  }
+  if (lastAssistant === -1) return "none";
+  for (let i = entries.length - 1; i > lastAssistant; i--) {
+    const entry: any = entries[i];
+    if (entry?.type !== "custom") continue;
+    if (entry.customType === "agent-fallback-terminal") return "exhausted";
+    if (entry.customType === "agent-fallback" || entry.customType === "agent-fallback-deferred") {
+      return "pending";
+    }
+  }
+  return "none";
+}
+
+/**
+ * Pure fallback-aware decision for an `error` stop reason (B12).
+ *
+ * - "pending": a recovery continuation is queued -> defer the exit and let the
+ *   recovered turn run (the caller keeps it bounded).
+ * - "exhausted": the chain already gave up -> exit with the original error.
+ * - "none": grace only when the failure is failover-eligible AND the profile
+ *   declares a fallback chain, covering the async setModel race; otherwise
+ *   exit exactly as before.
+ */
+export function resolveFallbackAwareExit(params: {
+  recovery: FallbackRecoveryState;
+  failoverEligible: boolean;
+  hasDeclaredFallback: boolean;
+}): FallbackExitDecision {
+  if (params.recovery === "pending") return "defer";
+  if (params.recovery === "exhausted") return "exit";
+  return params.failoverEligible && params.hasDeclaredFallback ? "grace" : "exit";
+}
+
+// Failover-eligibility mirrors the live agent-fallback-chain classifier
+// (~/.pi/agent/extensions/agent-fallback-chain.ts). Kept in sync by contract:
+// a drift only changes whether the bounded grace runs, never whether recovery
+// succeeds, because a non-eligible error gets an `agent-fallback-terminal`
+// entry from that extension and exits on the next guard tick.
+const FALLBACK_LIMIT_ERROR_RE =
+  /\b429\b|rate[ _-]?limit|too many requests|quota|usage[ _-]?limit|usage_limit_reached|usage_not_included|insufficient_quota|out of budget|available balance|billing hard limit|monthly usage limit|freeusagelimiterror|gousagelimiterror/i;
+const FALLBACK_TRANSPORT_ERROR_RE =
+  /upstream request failed|bad gateway|service unavailable|internal server error|gateway time-?out|connection (?:error|reset|refused|closed)|socket hang ?up|fetch failed|network error|temporarily unavailable|\b(?:404|500|502|503|504)\b|<!doctype html|<html\b/i;
+const FALLBACK_REASONING_STATE_RE =
+  /encrypted_content|was not issued to this caller|thinking_?signature|reasoning (?:content |state )?(?:is )?not (?:issued|found|present)|invalid_request_error.*reasoning/i;
+
+export function isFailoverEligibleError(errorMessage: string | undefined): boolean {
+  if (!errorMessage) return false;
+  if (FALLBACK_REASONING_STATE_RE.test(errorMessage)) return false;
+  return FALLBACK_LIMIT_ERROR_RE.test(errorMessage) || FALLBACK_TRANSPORT_ERROR_RE.test(errorMessage);
+}
+
+/**
+ * Mirrors `profileHasFallbackDeclaration` from the live agent-profile-runtime
+ * helper: the effective profile is the first existing project-local/global
+ * candidate; a `fallbacks:` key anywhere in it declares a chain.
+ */
+export function agentDeclaresFallbackChain(cwd: string): boolean {
+  const name = process.env.PI_SUBAGENT_AGENT?.trim() || process.env.SULA_DESKTOP_AGENT?.trim();
+  if (!name) return false;
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  const candidates = [
+    join(cwd, ".pi", "agents", `${name}.md`),
+    join(agentDir, "agents", `${name}.md`),
+  ];
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    let content: string;
+    try {
+      content = readFileSync(path, "utf8");
+    } catch {
+      return false;
+    }
+    if (/^fallbacks[ \t]*:/m.test(content)) return true;
+    if (/^---\r?\n[\s\S]*?\r?\n---/.test(content)) return false;
+  }
+  return false;
+}
+
+const DEFAULT_FALLBACK_GUARD_MS = 5000;
+const FALLBACK_GUARD_POLL_MS = 200;
+
+function fallbackGuardMs(): number {
+  const raw = Number(process.env.PI_SUBAGENT_FALLBACK_GUARD_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_FALLBACK_GUARD_MS;
+  return Math.min(raw, 10_000);
 }
 
 function uncaughtExceptionMessage(error: unknown): string {
@@ -203,7 +318,7 @@ export default function (pi: ExtensionAPI) {
   let uncaughtExceptionHandler: ((error: Error) => void) | undefined;
 
   function writeExitSidecar(
-    data: object,
+    data: Record<string, unknown>,
     targetSessionFile = process.env.PI_SUBAGENT_SESSION,
   ): void {
     if (exitSidecarWritten) return;
@@ -245,6 +360,60 @@ export default function (pi: ExtensionAPI) {
     if (uncaughtExceptionHandler) process.off("uncaughtException", uncaughtExceptionHandler);
     processExitHandler = undefined;
     uncaughtExceptionHandler = undefined;
+  }
+
+  let fallbackGuardTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function clearFallbackGuard(): void {
+    if (fallbackGuardTimer) {
+      clearTimeout(fallbackGuardTimer);
+      fallbackGuardTimer = undefined;
+    }
+  }
+
+  function sessionEntries(ctx: any): any[] | undefined {
+    try {
+      return ctx?.sessionManager?.getEntries?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  function performExit(ctx: any): void {
+    clearFallbackGuard();
+    const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (targetSessionFile) {
+      try {
+        writeExitSidecar(buildCompletionSidecar(latestAgentMessages, wrapupInProgress));
+      } catch {
+        // Best effort — the watcher can still detect the terminal sentinel
+        // after shutdown if the completion sidecar cannot be written.
+      }
+    }
+    unregisterCrashHooks();
+    recorder.agentEndDone();
+    ctx.shutdown();
+  }
+
+  /**
+   * Bounded guard for an error turn whose fallback recovery is queued
+   * ("pending") or racing the async setModel ("none"). It never waits
+   * unbounded: on the deadline it exits with the original provider error
+   * exactly as before. `turn_start` cancels it once the recovered turn starts.
+   */
+  function armFallbackGuard(ctx: any): void {
+    clearFallbackGuard();
+    const deadline = Date.now() + fallbackGuardMs();
+    const tick = () => {
+      fallbackGuardTimer = undefined;
+      const recovery = deriveFallbackRecovery(sessionEntries(ctx));
+      if (recovery === "exhausted" || Date.now() >= deadline) {
+        performExit(ctx);
+        return;
+      }
+      fallbackGuardTimer = setTimeout(tick, FALLBACK_GUARD_POLL_MS);
+    };
+    fallbackGuardTimer = setTimeout(tick, FALLBACK_GUARD_POLL_MS);
   }
 
   registerCrashHooks();
@@ -342,33 +511,45 @@ export default function (pi: ExtensionAPI) {
       && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
     const shouldExit = autoExitShouldFire
       || (wrapupInProgress && isTerminalAutoExitStopReason(stopReason));
-    if (autoExitShouldFire && oneShotReArm) {
-      // Consume the one-shot re-arm: after this exit auto-exit is disarmed
-      // again until the operator runs /auto-exit once more.
-      oneShotReArm = false;
+
+    // Fallback-aware one-shot exit (B12): an error turn may already have a
+    // queued recovery continuation ("pending") or be racing the fallback
+    // extension's async setModel ("none" with a declared chain). Defer/grace
+    // instead of killing a recovered turn; the guard stays bounded and
+    // re-evaluates before any exit, so a missed recovery still reports the
+    // original provider error.
+    if (shouldExit && stopReason === "error") {
+      const decision = resolveFallbackAwareExit({
+        recovery: deriveFallbackRecovery(sessionEntries(ctx)),
+        failoverEligible: isFailoverEligibleError(
+          findLatestAssistantError(latestAgentMessages)?.errorMessage,
+        ),
+        hasDeclaredFallback: agentDeclaresFallbackChain(ctx?.cwd ?? process.cwd()),
+      });
+      if (decision === "defer" || decision === "grace") {
+        armFallbackGuard(ctx);
+        return;
+      }
     }
 
     if (shouldExit) {
+      if (autoExitShouldFire && oneShotReArm) {
+        // Consume the one-shot re-arm: after this exit auto-exit is disarmed
+        // again until the operator runs /auto-exit once more.
+        oneShotReArm = false;
+      }
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
-      if (sessionFile) {
-        try {
-          writeExitSidecar(buildCompletionSidecar(latestAgentMessages, wrapupInProgress));
-        } catch {
-          // Best effort — the watcher can still detect the terminal sentinel
-          // after shutdown if the completion sidecar cannot be written.
-        }
-      }
-      unregisterCrashHooks();
-
-      recorder.agentEndDone();
-      ctx.shutdown();
+      performExit(ctx);
       return;
     }
   });
 
   pi.on("turn_start", (event) => {
+    // A recovered fallback turn actually started: cancel the bounded guard so
+    // the normal lifecycle owns the session again.
+    clearFallbackGuard();
     recorder.turnStart((event as any).turnIndex);
   });
 
@@ -409,6 +590,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    clearFallbackGuard();
     recorder.sessionShutdown((event as any).reason);
   });
 

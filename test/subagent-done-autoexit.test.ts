@@ -1,10 +1,11 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import subagentDoneExtension, {
   resolveAutoExit,
+  resolveFallbackAwareExit,
 } from "../pi-extension/subagents/subagent-done.ts";
 
 // L-95 — auto-exit hardening: operator input / Escape permanently disarms,
@@ -56,6 +57,9 @@ function createExtensionApi() {
 
 const origAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
 const origSession = process.env.PI_SUBAGENT_SESSION;
+const origAgent = process.env.PI_SUBAGENT_AGENT;
+const origAgentDir = process.env.PI_CODING_AGENT_DIR;
+const origGuardMs = process.env.PI_SUBAGENT_FALLBACK_GUARD_MS;
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name];
@@ -72,11 +76,21 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
   afterEach(() => {
     restoreEnv("PI_SUBAGENT_AUTO_EXIT", origAutoExit);
     restoreEnv("PI_SUBAGENT_SESSION", origSession);
+    restoreEnv("PI_SUBAGENT_AGENT", origAgent);
+    restoreEnv("PI_CODING_AGENT_DIR", origAgentDir);
+    restoreEnv("PI_SUBAGENT_FALLBACK_GUARD_MS", origGuardMs);
     if (dir) rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
 
-  function boot(opts: { autoExit?: boolean; withSessionFile?: boolean } = {}) {
+  function boot(
+    opts: {
+      autoExit?: boolean;
+      withSessionFile?: boolean;
+      entries?: any[];
+      cwd?: string;
+    } = {},
+  ) {
     const autoExit = opts.autoExit ?? true;
     if (autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
     else delete process.env.PI_SUBAGENT_AUTO_EXIT;
@@ -93,8 +107,11 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     subagentDoneExtension(api);
 
     const notifications: Notification[] = [];
+    const entries = opts.entries ?? [];
     const ctx: any = {
       shutdowns: 0,
+      cwd: opts.cwd ?? dir!,
+      sessionManager: { getEntries: () => entries },
       ui: {
         notify(message: string, type?: string) {
           notifications.push({ message, type });
@@ -438,5 +455,120 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
         `shortcut ${key} shadows a pi built-in default key`,
       );
     }
+  });
+
+  // B12 — one-shot auto-exit must not kill a fallback recovery. The decision is
+  // pure and takes recovery state as data; the handler's timer stays bounded
+  // and is cancelled by turn_start.
+  describe("B12 fallback-aware auto-exit", () => {
+    beforeEach(() => {
+      process.env.PI_SUBAGENT_FALLBACK_GUARD_MS = "60";
+      process.env.PI_CODING_AGENT_DIR = dir!;
+      delete process.env.PI_SUBAGENT_AGENT;
+    });
+
+    function declareChain(): void {
+      const agentsDir = join(dir!, "agents");
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        join(agentsDir, "deep.md"),
+        "---\nmodel: openai-codex/gpt-6-astra\nthinking: high\n" +
+          "fallbacks:\n  - provider: deepseek\n    model: deepseek-flash\n    thinking: high\n---\nbody\n",
+      );
+      process.env.PI_SUBAGENT_AGENT = "deep";
+    }
+
+    function delay(ms: number): Promise<void> {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    const errorMessage = "Codex error: The usage limit has been reached";
+    const errorAssistant = { role: "assistant", stopReason: "error", errorMessage };
+    const assistantEntry = (errorMsg: string) => ({
+      type: "message",
+      message: { role: "assistant", stopReason: "error", errorMessage: errorMsg },
+    });
+
+    it("error + pending fallback defers the exit (no shutdown)", () => {
+      const entries = [
+        assistantEntry(errorMessage),
+        { type: "custom", customType: "agent-fallback", data: { status: "continuation-requested" } },
+      ];
+      const child = boot({ entries });
+      child.settle([errorAssistant]);
+      assert.equal(child.ctx.shutdowns, 0, "queued recovery must defer auto-exit");
+      assert.equal(sidecarOf(child), null, "no failure sidecar while recovery is pending");
+      child.fire("turn_start", { turnIndex: 1 }); // cancel the bounded guard
+    });
+
+    it("error + terminal fallback exits with the original provider error", () => {
+      const entries = [
+        assistantEntry(errorMessage),
+        { type: "custom", customType: "agent-fallback", data: {} },
+        { type: "custom", customType: "agent-fallback-terminal", data: { reason: "chain exhausted" } },
+      ];
+      const child = boot({ entries });
+      child.settle([errorAssistant]);
+      assert.equal(child.ctx.shutdowns, 1, "exhausted recovery still wakes the parent");
+      assert.deepEqual(sidecarOf(child), { type: "error", errorMessage, stopReason: "error" });
+    });
+
+    it("error + no declared fallback chain exits immediately", () => {
+      const child = boot({ entries: [] });
+      child.settle([errorAssistant]);
+      assert.equal(child.ctx.shutdowns, 1, "no chain means no grace");
+      assert.deepEqual(sidecarOf(child), { type: "error", errorMessage, stopReason: "error" });
+    });
+
+    it("a recovered turn_start cancels the bounded deferral guard", async () => {
+      declareChain();
+      const entries = [
+        assistantEntry(errorMessage),
+        { type: "custom", customType: "agent-fallback", data: {} },
+      ];
+      const child = boot({ entries, cwd: dir! });
+      child.settle([errorAssistant]);
+      assert.equal(child.ctx.shutdowns, 0);
+      child.fire("turn_start", { turnIndex: 1 });
+      await delay(260);
+      assert.equal(child.ctx.shutdowns, 0, "turn_start cancels the guard");
+      assert.equal(sidecarOf(child), null);
+    });
+
+    it("grace expiry is bounded and exits with the original error", async () => {
+      declareChain();
+      const child = boot({ entries: [], cwd: dir! });
+      child.settle([errorAssistant]);
+      assert.equal(child.ctx.shutdowns, 0, "grace defers while the async switch races");
+      await delay(300);
+      assert.equal(child.ctx.shutdowns, 1, "bounded grace expires to the original failure");
+      assert.deepEqual(sidecarOf(child), { type: "error", errorMessage, stopReason: "error" });
+    });
+
+    it("grace recovers when the fallback entry lands before the guard expires", async () => {
+      declareChain();
+      const entries: any[] = [];
+      const child = boot({ entries, cwd: dir! });
+      child.settle([errorAssistant]);
+      assert.equal(child.ctx.shutdowns, 0);
+      entries.push({ type: "custom", customType: "agent-fallback", data: {} });
+      child.fire("turn_start", { turnIndex: 1 });
+      await delay(260);
+      assert.equal(child.ctx.shutdowns, 0, "recovered turn keeps the session alive");
+      assert.equal(sidecarOf(child), null);
+    });
+
+    it("pure fallback-aware decision table", () => {
+      const decide = (
+        recovery: "none" | "pending" | "exhausted",
+        failoverEligible: boolean,
+        hasDeclaredFallback: boolean,
+      ) => resolveFallbackAwareExit({ recovery, failoverEligible, hasDeclaredFallback });
+      assert.equal(decide("pending", false, false), "defer");
+      assert.equal(decide("exhausted", true, true), "exit");
+      assert.equal(decide("none", true, true), "grace");
+      assert.equal(decide("none", true, false), "exit");
+      assert.equal(decide("none", false, true), "exit");
+    });
   });
 });
