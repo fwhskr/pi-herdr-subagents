@@ -254,6 +254,105 @@ export function classifyRuntimeObservation(
   return observation;
 }
 
+/**
+ * The `subagent_done` report argument extracted from one block list. Only the
+ * `subagent_done` tool is considered; a non-empty trimmed string wins.
+ */
+function extractSubagentDoneReport(blocks: any[]): string | null {
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    const type = (block as any).type;
+    const toolName = (block as any).name ?? (block as any).toolName ?? (block as any).tool ?? "";
+    // Only consider subagent_done tool calls; skip other tools even if they happen to have a report field.
+    if (toolName !== "subagent_done") {
+      if (type === "toolCall" || type === "tool_call" || type === "functionCall" || type === "function_call") continue;
+      continue;
+    }
+    let report: unknown;
+    const candidates = [
+      (block as any).arguments,
+      (block as any).args,
+      (block as any).input,
+      (block as any).parameters,
+      (block as any).params,
+    ];
+    for (const cand of candidates) {
+      if (cand == null) continue;
+      if (typeof cand === "object" && typeof (cand as any).report === "string") {
+        report = (cand as any).report;
+        break;
+      }
+      if (typeof cand === "string") {
+        try {
+          const parsed = JSON.parse(cand);
+          if (typeof parsed.report === "string") {
+            report = parsed.report;
+            break;
+          }
+        } catch {
+          // ignore malformed JSON in report argument; treat as no report
+          void 0;
+        }
+      }
+    }
+    if (report === undefined && typeof (block as any).report === "string") report = (block as any).report;
+    if (typeof report === "string" && report.trim() !== "") return report.trim();
+  }
+  return null;
+}
+
+/**
+ * TASK-337: extract the *terminal report* from a single final assistant
+ * message — the same-message text or a non-empty `subagent_done` `report`
+ * argument. This is the substantive-evidence admission check: a completion
+ * whose final assistant turn carries neither is reportless, and an exit code
+ * alone must never admit it. Earlier assistant text is deliberately excluded
+ * (the tool contract requires the report in the same message as the call).
+ */
+export function extractTerminalReportFromMessage(lastMsg: any): string | null {
+  const lastContent: any[] = Array.isArray(lastMsg.content) ? lastMsg.content : [];
+
+  // (1) final same-message text
+  const lastTexts = lastContent
+    .filter((block: any) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
+    .map((block: any) => block.text as string);
+  if (lastTexts.length > 0 && lastTexts.join("").trim()) return lastTexts.join("\n");
+
+  // (2) final subagent_done toolCall arguments.report (non-empty string)
+  const reportFromContent = extractSubagentDoneReport(lastContent);
+  if (reportFromContent !== null) return reportFromContent;
+
+  // Also check alternative message-level tool-call arrays (defensive: some Pi builds store tool calls outside content).
+  const altArrays: any[] = [];
+  if (Array.isArray(lastMsg.toolCalls)) altArrays.push(...lastMsg.toolCalls);
+  if (Array.isArray(lastMsg.tool_calls)) altArrays.push(...lastMsg.tool_calls);
+  if (Array.isArray(lastMsg.toolCall)) altArrays.push(...lastMsg.toolCall);
+  if (altArrays.length > 0) {
+    const altReport = extractSubagentDoneReport(altArrays);
+    if (altReport !== null) return altReport;
+  }
+  return null;
+}
+
+/**
+ * TASK-337: the terminal report of the last assistant turn, or null. Used by
+ * the completion-admission check so a reportless exit-0 run is classified as
+ * an explicit failure instead of being admitted as `completed`.
+ */
+export function findTerminalReport(entries: SessionEntry[]): string | null {
+  let lastIdx = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+    const msg = entry as MessageEntry;
+    if (msg.message.role !== "assistant") continue;
+    lastIdx = i;
+    break;
+  }
+  if (lastIdx === -1) return null;
+  return extractTerminalReportFromMessage((entries[lastIdx] as MessageEntry).message as any);
+}
+
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
   // Deep's L-162 phase 2 priority chain:
   // (1) final same-message text; (2) final subagent_done arguments.report (non-empty);
@@ -273,70 +372,10 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
 
   const lastEntry = entries[lastIdx] as MessageEntry;
   const lastMsg: any = lastEntry.message as any;
-  const lastContent: any[] = Array.isArray(lastMsg.content) ? lastMsg.content : [];
 
-  // (1) final same-message text
-  const lastTexts = lastContent
-    .filter((block: any) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
-    .map((block: any) => block.text as string);
-  if (lastTexts.length > 0 && lastTexts.join("").trim()) return lastTexts.join("\n");
-
-  // (2) final subagent_done toolCall arguments.report (non-empty string)
-  const extractReport = (blocks: any[]): string | null => {
-    for (const block of blocks) {
-      if (!block || typeof block !== "object") continue;
-      const type = (block as any).type;
-      const toolName = (block as any).name ?? (block as any).toolName ?? (block as any).tool ?? "";
-      // Only consider subagent_done tool calls; skip other tools even if they happen to have a report field.
-      if (toolName !== "subagent_done") {
-        if (type === "toolCall" || type === "tool_call" || type === "functionCall" || type === "function_call") continue;
-        continue;
-      }
-      let report: unknown;
-      const candidates = [
-        (block as any).arguments,
-        (block as any).args,
-        (block as any).input,
-        (block as any).parameters,
-        (block as any).params,
-      ];
-      for (const cand of candidates) {
-        if (cand == null) continue;
-        if (typeof cand === "object" && typeof (cand as any).report === "string") {
-          report = (cand as any).report;
-          break;
-        }
-        if (typeof cand === "string") {
-          try {
-            const parsed = JSON.parse(cand);
-            if (typeof parsed.report === "string") {
-              report = parsed.report;
-              break;
-            }
-          } catch {
-            // ignore malformed JSON in report argument; treat as no report
-            void 0;
-          }
-        }
-      }
-      if (report === undefined && typeof (block as any).report === "string") report = (block as any).report;
-      if (typeof report === "string" && report.trim() !== "") return report.trim();
-    }
-    return null;
-  };
-
-  const reportFromContent = extractReport(lastContent);
-  if (reportFromContent !== null) return reportFromContent;
-
-  // Also check alternative message-level tool-call arrays (defensive: some Pi builds store tool calls outside content).
-  const altArrays: any[] = [];
-  if (Array.isArray(lastMsg.toolCalls)) altArrays.push(...lastMsg.toolCalls);
-  if (Array.isArray(lastMsg.tool_calls)) altArrays.push(...lastMsg.tool_calls);
-  if (Array.isArray(lastMsg.toolCall)) altArrays.push(...lastMsg.toolCall);
-  if (altArrays.length > 0) {
-    const altReport = extractReport(altArrays);
-    if (altReport !== null) return altReport;
-  }
+  // (1)+(2) terminal report in the final assistant message.
+  const terminalReport = extractTerminalReportFromMessage(lastMsg);
+  if (terminalReport !== null) return terminalReport;
 
   // (3) final provider error (stopReason: "error" with errorMessage)
   const stopReason = (lastMsg as { stopReason?: unknown }).stopReason;

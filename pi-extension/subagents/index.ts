@@ -57,6 +57,7 @@ import {
   classifyRuntimeObservation,
   classifySessionFailure,
   findLastAssistantMessage,
+  findTerminalReport,
   getNewEntries,
   seedSubagentSessionFile,
 } from "./session.ts";
@@ -818,6 +819,18 @@ function resolveResultPresentationCore(
     );
   }
 
+  // TASK-337: an exit-0 completion with no terminal report is not a success.
+  // Name the absence and point at recovery instead of the generic
+  // "exited without output" fallback, which is no longer admitted as completed.
+  if (result.failureKind === "reportless") {
+    return (
+      `Sub-agent "${name}" exited without a terminal report after ${formatElapsed(result.elapsed)}.\n\n` +
+      `${result.summary}\n\n` +
+      `The subagent exited successfully but reported nothing. You can retry by ` +
+      `spawning a new subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
+
   // TASK-326: classify what actually happened. Only genuine
   // provider/transport failures keep the provider wording verbatim;
   // operator interrupts/closes and no-result exits render distinctly so the
@@ -890,8 +903,18 @@ export type SubagentFailureKind =
   | "operator"
   | "interrupted"
   | "no-result"
+  | "reportless"
   | "watchdog"
   | "time-limit";
+
+/**
+ * TASK-337: the absence-naming summary for a completion that exited 0 but
+ * carried no terminal report (no assistant final text and no `subagent_done`
+ * report argument). Exit code alone never admits a completion.
+ */
+export const REPORTLESS_COMPLETION_SUMMARY =
+  "Sub-agent exited successfully but produced no terminal report " +
+  "(no assistant final text and no subagent_done report argument).";
 
 /**
  * Bounded child-stderr evidence attached to process-start / no-result
@@ -2423,9 +2446,14 @@ async function watchSubagent(
     // outcome that carries stopReason "error"; an aborted or mid-turn cut-off
     // is an interrupt/close; no assistant turn at all produced no result.
     let failureKind: SubagentFailureKind;
+    // TASK-337: the terminal report (final-message text or subagent_done report
+    // argument). Null means the completion carries no substantive evidence and
+    // must not be admitted as completed on exit code alone.
+    let terminalReport: string | null = null;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
       failureKind = classifySessionFailure(allEntries);
+      terminalReport = findTerminalReport(allEntries);
       if (running.runtimePlan) {
         const observation = classifyRuntimeObservation(allEntries, running.runtimePlan.model);
         const observedThinking =
@@ -2476,26 +2504,47 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
+    // TASK-337: a clean exit (0) with no terminal report is NOT a completion,
+    // whether or not the child session file survives. Pings are not
+    // completions and are delivered separately, so they keep their own path.
+    const reportless =
+      result.exitCode === 0 &&
+      !result.errorMessage &&
+      !result.ping &&
+      terminalReport === null;
+    if (reportless) {
+      failureKind = "reportless";
+      summary = REPORTLESS_COMPLETION_SUMMARY;
+    }
+
     const enriched = enrichNoSessionFailure(result, running, summary);
-    const stderr = !existsSync(sessionFile) || failureKind === "no-result"
+    // TASK-337: a reportless failure should be as diagnosable as the no-result
+    // family — attach the captured stderr tail and, before the pane closes, a
+    // durable pane-scrollback reference when available.
+    if (reportless) persistPaneTailBeforeClose(running);
+    const finalSummary = reportless ? withPaneScrollbackRef(enriched.summary, running) : enriched.summary;
+    const stderr = !existsSync(sessionFile) || failureKind === "no-result" || failureKind === "reportless"
       ? captureStderrTail(running.stderrFile)
       : undefined;
     if (!result.preservePane) closePaneQuietly(surface);
-    running.lifecycle = result.exitCode === 0
-      ? markCompleted(running.lifecycle, Date.now())
-      : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
+    running.lifecycle = reportless
+      ? markFailed(running.lifecycle, finalSummary, Date.now(), result.exitCode)
+      : result.exitCode === 0
+        ? markCompleted(running.lifecycle, Date.now())
+        : markFailed(running.lifecycle, result.errorMessage ?? finalSummary, Date.now(), result.exitCode);
 
     return {
       name,
       task,
-      summary: enriched.summary,
+      summary: finalSummary,
       sessionFile,
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
       ...(enriched.error ? { error: enriched.error } : {}),
       ...(stderr ? { stderr } : {}),
-      ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
+      ...(reportless ? { failureKind } : {}),
+      ...(!reportless && result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
       ...(result.errorMessage
         ? { errorMessage: result.errorMessage, failureKind }
         : {}),
@@ -3587,7 +3636,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const exitCode = details.exitCode ?? 0;
         const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
         const failureKind = typeof details.failureKind === "string" ? details.failureKind : "";
-        const failed = exitCode !== 0 || !!errorMessage;
+        // TASK-337: a reportless exit-0 completion is a failure, not a success.
+        const failed = exitCode !== 0 || !!errorMessage || failureKind === "reportless";
         const partial = !failed && (details.partial === true || details.timeout === "warned-wrapup");
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
         const bgFn = failed
@@ -3608,6 +3658,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           failureKind === "operator" ||
           failureKind === "interrupted" ||
           failureKind === "no-result" ||
+          failureKind === "reportless" ||
           failureKind === "watchdog" ||
           failureKind === "time-limit";
         const kindStatus =
@@ -3617,11 +3668,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               ? "interrupted"
               : failureKind === "no-result"
                 ? "failed (no result)"
-                : failureKind === "watchdog"
-                  ? "killed (recovery watchdog)"
-                  : failureKind === "time-limit"
-                    ? "stopped (time limit)"
-                    : "failed (provider/agent error)";
+                : failureKind === "reportless"
+                  ? "failed (no report)"
+                  : failureKind === "watchdog"
+                    ? "killed (recovery watchdog)"
+                    : failureKind === "time-limit"
+                      ? "stopped (time limit)"
+                      : "failed (provider/agent error)";
         const status = errorMessage || knownKind
           ? kindStatus
           : failed
