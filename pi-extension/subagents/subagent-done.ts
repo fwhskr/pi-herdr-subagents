@@ -9,11 +9,44 @@ import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import { createSubagentActivityRecorder, readCurrentProcessIdentity } from "./activity.ts";
 import { consumeWrapupDirective } from "./time-limits.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
+}
+
+export const CRASH_EXIT_MESSAGE = "Subagent process exited unexpectedly.";
+
+export function isSubagentSessionHost(sessionFile: string, argv: readonly string[]): boolean {
+  if (!sessionFile) return false;
+  const flagIndex = argv.indexOf("--session");
+  if (flagIndex < 0 || flagIndex + 1 >= argv.length) return false;
+  return argv[flagIndex + 1] === sessionFile;
+}
+
+export function shouldRegisterCrashHooks(
+  sessionFile: string | undefined,
+  argv: readonly string[] = process.argv,
+): boolean {
+  return typeof sessionFile === "string" && sessionFile.length > 0 &&
+    isSubagentSessionHost(sessionFile, argv);
+}
+
+export interface ExitSidecarWriterIdentity {
+  pid: number;
+  startTime: number;
+}
+
+export function buildCrashSidecar(
+  errorMessage: string,
+  writer: ExitSidecarWriterIdentity | undefined,
+): Record<string, unknown> {
+  return {
+    type: "error",
+    errorMessage,
+    ...(writer ? { workerPid: writer.pid, workerStartTime: writer.startTime } : {}),
+  };
 }
 
 function isTerminalAutoExitStopReason(stopReason: string | undefined): boolean {
@@ -236,7 +269,15 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI) {
+export interface SubagentDoneTestHooks {
+  registerCrashHooks: (argv?: readonly string[]) => void;
+  unregisterCrashHooks: () => void;
+}
+
+export default function (
+  pi: ExtensionAPI,
+  testHooks?: { onReady?: (hooks: SubagentDoneTestHooks) => void },
+) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -327,26 +368,28 @@ export default function (pi: ExtensionAPI) {
     exitSidecarWritten = true;
   }
 
-  function registerCrashHooks(): void {
+  function registerCrashHooks(argv: readonly string[] = process.argv): void {
     const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
-    if (!targetSessionFile) return;
+    if (!shouldRegisterCrashHooks(targetSessionFile, argv)) return;
+
+    // The child's own process identity rides in the crash sidecar so the
+    // parent can ignore foreign writes (a stale watcher for a recycled pid
+    // would otherwise still reject a mismatched payload).
+    const writerIdentity = readCurrentProcessIdentity();
 
     processExitHandler = () => {
       try {
-        writeExitSidecar({
-          type: "error",
-          errorMessage: "Subagent process exited unexpectedly.",
-        }, targetSessionFile);
+        writeExitSidecar(buildCrashSidecar(CRASH_EXIT_MESSAGE, writerIdentity), targetSessionFile);
       } catch {
         // Process exit is already in progress; sidecar publication is best effort.
       }
     };
     uncaughtExceptionHandler = (error) => {
       try {
-        writeExitSidecar({
-          type: "error",
-          errorMessage: uncaughtExceptionMessage(error),
-        }, targetSessionFile);
+        writeExitSidecar(
+          buildCrashSidecar(uncaughtExceptionMessage(error), writerIdentity),
+          targetSessionFile,
+        );
       } catch {
         // Pi's own uncaughtException handler still owns process termination.
       }
@@ -417,6 +460,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   registerCrashHooks();
+  testHooks?.onReady?.({ registerCrashHooks, unregisterCrashHooks });
 
   // Operator takeover (typed input or an Escape abort) permanently disarms
   // auto-exit for this session. The warning is latched so it is emitted

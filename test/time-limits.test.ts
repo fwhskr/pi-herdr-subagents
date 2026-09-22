@@ -346,6 +346,10 @@ describe("wrap-up directive and completion delivery", () => {
       writeWrapupDirective(sessionFile);
       const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
       const previousSession = process.env.PI_SUBAGENT_SESSION;
+      // TASK-327 hygiene: the real extension must not leak process "exit"
+      // listeners into the runner; restore any it adds.
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       try {
@@ -381,6 +385,14 @@ describe("wrap-up directive and completion delivery", () => {
           "cleanup leaves no stray wrap-up directives in the artifact directory",
         );
       } finally {
+        for (const handler of process.listeners("exit")) {
+          if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+        }
+        for (const handler of process.listeners("uncaughtException")) {
+          if (!priorUncaughtHandlers.includes(handler)) {
+            process.off("uncaughtException", handler as (error: Error) => void);
+          }
+        }
         if (previousAutoExit == null) delete process.env.PI_SUBAGENT_AUTO_EXIT;
         else process.env.PI_SUBAGENT_AUTO_EXIT = previousAutoExit;
         if (previousSession == null) delete process.env.PI_SUBAGENT_SESSION;
@@ -438,6 +450,10 @@ describe("wrap-up × auto-exit disarm interaction guard (L-95 × L-96 merge)", (
   function bootAutoExitChild(sessionFile: string) {
     const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
     const previousSession = process.env.PI_SUBAGENT_SESSION;
+    // TASK-327 hygiene: snapshot process listeners; the real extension must
+    // not leak an "exit" hook into the runner.
+    const priorExitHandlers = process.listeners("exit");
+    const priorUncaughtHandlers = process.listeners("uncaughtException");
     process.env.PI_SUBAGENT_AUTO_EXIT = "1";
     process.env.PI_SUBAGENT_SESSION = sessionFile;
     const { api, eventHandlers, sentUserMessages } = createMockExtensionApi();
@@ -456,6 +472,14 @@ describe("wrap-up × auto-exit disarm interaction guard (L-95 × L-96 merge)", (
       },
     };
     const restore = () => {
+      for (const handler of process.listeners("exit")) {
+        if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+      }
+      for (const handler of process.listeners("uncaughtException")) {
+        if (!priorUncaughtHandlers.includes(handler)) {
+          process.off("uncaughtException", handler as (error: Error) => void);
+        }
+      }
       if (previousAutoExit == null) delete process.env.PI_SUBAGENT_AUTO_EXIT;
       else process.env.PI_SUBAGENT_AUTO_EXIT = previousAutoExit;
       if (previousSession == null) delete process.env.PI_SUBAGENT_SESSION;

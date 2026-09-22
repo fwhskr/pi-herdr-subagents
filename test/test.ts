@@ -53,8 +53,12 @@ import subagentDoneExtension, {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
+  isSubagentSessionHost,
+  shouldRegisterCrashHooks,
+  buildCrashSidecar,
+  CRASH_EXIT_MESSAGE,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
+import { interpretExitSidecar, waitForCompletion, isForeignSidecarIdentity } from "../pi-extension/subagents/completion.ts";
 import {
   MISSING_PANE_DEBOUNCE_MS,
   createLifecycle,
@@ -1680,6 +1684,8 @@ describe("subagent-done.ts", () => {
       withTempDir((dir) => {
         const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
         const previousSession = process.env.PI_SUBAGENT_SESSION;
+        const priorExitHandlers = process.listeners("exit");
+        const priorUncaughtHandlers = process.listeners("uncaughtException");
         const sessionFile = join(dir, "child.jsonl");
         process.env.PI_SUBAGENT_AUTO_EXIT = "1";
         process.env.PI_SUBAGENT_SESSION = sessionFile;
@@ -1706,6 +1712,14 @@ describe("subagent-done.ts", () => {
             stopReason: "error",
           });
         } finally {
+          for (const handler of process.listeners("exit")) {
+            if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+          }
+          for (const handler of process.listeners("uncaughtException")) {
+            if (!priorUncaughtHandlers.includes(handler)) {
+              process.off("uncaughtException", handler as (error: Error) => void);
+            }
+          }
           restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
           restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
         }
@@ -1714,6 +1728,8 @@ describe("subagent-done.ts", () => {
 
     it("preserves an aborted worker after agent_settled", () => {
       const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
       try {
         const { api, eventHandlers } = createMockExtensionApi();
@@ -1726,8 +1742,90 @@ describe("subagent-done.ts", () => {
         eventHandlers.get("agent_settled")![0]({ type: "agent_settled" }, ctx);
         assert.equal(shutdowns, 0);
       } finally {
+        for (const handler of process.listeners("exit")) {
+          if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+        }
+        for (const handler of process.listeners("uncaughtException")) {
+          if (!priorUncaughtHandlers.includes(handler)) {
+            process.off("uncaughtException", handler as (error: Error) => void);
+          }
+        }
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
       }
+    });
+  });
+
+  // TASK-327: a test-process argv (no --session) must register NO crash
+  // hooks — a test that instantiates the real extension must never arm the
+  // exit sidecar path that writes into the inherited PI_SUBAGENT_SESSION.
+  it("registers no crash hooks from a test-process argv", () => {
+    withTempDir((dir) => {
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      const sessionFile = join(dir, "child.jsonl");
+      const priorExitHandlers = process.listeners("exit");
+      const priorUncaughtHandlers = process.listeners("uncaughtException");
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+
+      try {
+        const { api } = createMockExtensionApi();
+        subagentDoneExtension(api);
+        assert.equal(
+          process.listeners("exit").filter((h) => !priorExitHandlers.includes(h)).length,
+          0,
+          "test-process argv must not register an exit hook",
+        );
+        assert.equal(
+          process.listeners("uncaughtException").filter((h) => !priorUncaughtHandlers.includes(h)).length,
+          0,
+          "test-process argv must not register an uncaughtException hook",
+        );
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      }
+    });
+  });
+
+  describe("crash-hook session guard (TASK-327)", () => {
+    function childArgvFor(sessionFile: string): string[] {
+      // Real child launch form (harness/drivers/pi.ts): --session <file>.
+      return ["node", "pi", "--session", sessionFile];
+    }
+
+    it("treats only the exact --session host as the session host", () => {
+      const sf = "/tmp/a.jsonl";
+      assert.equal(
+        isSubagentSessionHost(sf, ["node", "pi", "--session", "/tmp/a.jsonl", "-e", "subagent-done.ts"]),
+        true,
+      );
+      assert.equal(isSubagentSessionHost(sf, ["node", "--test", "test/test.ts"]), false);
+      assert.equal(isSubagentSessionHost(sf, ["node", "pi"]), false);
+      assert.equal(isSubagentSessionHost(sf, ["node", "pi", "--session", "/tmp/other.jsonl"]), false);
+      assert.equal(isSubagentSessionHost(sf, ["node", "pi", "--session"]), false);
+      assert.equal(isSubagentSessionHost("", childArgvFor(sf)), false);
+    });
+
+    it("registers crash hooks only for the session host", () => {
+      const sf = "/tmp/a.jsonl";
+      assert.equal(shouldRegisterCrashHooks(sf, childArgvFor(sf)), true);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "--test", "test/test.ts"]), false);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "pi"]), false);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "pi", "--session", "/tmp/other.jsonl"]), false);
+      assert.equal(shouldRegisterCrashHooks(sf, ["node", "pi", "--session"]), false);
+      assert.equal(shouldRegisterCrashHooks(undefined, childArgvFor(sf)), false);
+    });
+
+    it("stamps the crash sidecar with the writer identity", () => {
+      assert.deepEqual(buildCrashSidecar(CRASH_EXIT_MESSAGE, { pid: 1, startTime: 2 }), {
+        type: "error",
+        errorMessage: CRASH_EXIT_MESSAGE,
+        workerPid: 1,
+        workerStartTime: 2,
+      });
+      assert.deepEqual(buildCrashSidecar("boom", undefined), { type: "error", errorMessage: "boom" });
     });
   });
 
@@ -1737,14 +1835,22 @@ describe("subagent-done.ts", () => {
       const previousSession = process.env.PI_SUBAGENT_SESSION;
       const sessionFile = join(dir, "child.jsonl");
       const exitFile = `${sessionFile}.exit`;
+      // The real child launch form (harness/drivers/pi.ts) passes
+      // --session <file>; only that argv may arm the sidecar path.
+      const childArgv = ["node", "pi", "--session", sessionFile];
       const priorExitHandlers = process.listeners("exit");
       const priorUncaughtHandlers = process.listeners("uncaughtException");
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
       process.env.PI_SUBAGENT_SESSION = sessionFile;
 
       try {
+        let hooks: { registerCrashHooks: (argv?: readonly string[]) => void } | undefined;
         const { api } = createMockExtensionApi();
-        subagentDoneExtension(api);
+        subagentDoneExtension(api, { onReady: (h) => { hooks = h; } });
+        // Inject the real child argv so the guarded registration path arms
+        // exactly as it does in a live child; the default process.argv of
+        // this test runner must keep registering nothing (previous test).
+        hooks!.registerCrashHooks(childArgv);
         const exitHandlers = process.listeners("exit").filter(
           (handler) => !priorExitHandlers.includes(handler),
         );
@@ -1755,10 +1861,9 @@ describe("subagent-done.ts", () => {
         assert.equal(uncaughtHandlers.length, 1);
 
         (uncaughtHandlers[0] as (error: Error) => void)(new Error("read EIO"));
-        assert.deepEqual(JSON.parse(readFileSync(exitFile, "utf8")), {
-          type: "error",
-          errorMessage: "read EIO",
-        });
+        const written = JSON.parse(readFileSync(exitFile, "utf8")) as Record<string, unknown>;
+        assert.equal(written.type, "error");
+        assert.equal(written.errorMessage, "read EIO");
 
         writeFileSync(exitFile, "latch-marker");
         (exitHandlers[0] as () => void)();
@@ -2111,6 +2216,52 @@ describe("completion.ts", () => {
       assert.equal(result.reason, "error");
       assert.equal(result.exitCode, 1);
       assert.match(result.errorMessage ?? "", /Invalid subagent completion sidecar/);
+    }
+  });
+
+  // TASK-327: a stamped foreign crash sidecar must never resolve as a
+  // failure — the watcher ignores it and keeps waiting; unstamped payloads
+  // (done/ping/provider errors) always pass through.
+  it("ignores a foreign stamped sidecar and keeps waiting", async () => {
+    // Unit shape of the guard itself.
+    const expected = { pid: 100, startTime: 200 };
+    assert.equal(isForeignSidecarIdentity({ workerPid: 100, workerStartTime: 200 }, expected), false);
+    assert.equal(isForeignSidecarIdentity({ workerPid: 999, workerStartTime: 200 }, expected), true);
+    assert.equal(isForeignSidecarIdentity({ workerPid: 100, workerStartTime: 201 }, expected), true);
+    assert.equal(isForeignSidecarIdentity({ type: "done" }, expected), false);
+    assert.equal(isForeignSidecarIdentity({ type: "error", errorMessage: "x" }, expected), false);
+    assert.equal(
+      isForeignSidecarIdentity({ workerPid: 999, workerStartTime: 200 }, undefined),
+      false,
+      "without an expected writer every payload passes through",
+    );
+
+    // Integration: a foreign stamped error sidecar is deleted and ignored —
+    // waitForCompletion keeps polling until the sentinel resolves.
+    const dir = mkdtempSync(join(tmpdir(), "completion-foreign-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({
+      type: "error",
+      errorMessage: "foreign crash",
+      workerPid: 999_999,
+      workerStartTime: 1,
+    }));
+    try {
+      let reads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        expectedSidecarWriter: expected,
+        readTerminalTail: async () => {
+          reads += 1;
+          return reads >= 2 ? "__SUBAGENT_DONE_0__" : "";
+        },
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+      assert.equal(existsSync(exitFile), false, "foreign sidecar must be deleted, not left to poison");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -3230,6 +3381,65 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+
+  // TASK-326: failureKind classifies what actually happened. A genuine
+  // provider failure keeps the original provider message verbatim; an
+  // operator close and a no-result exit render distinctly.
+  it("keeps a genuine provider failure message verbatim", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 14,
+        summary: "ignored when errorMessage is present",
+        sessionFile: "/tmp/subagent.jsonl",
+        errorMessage: "Anthropic 529 Overloaded after 3 retries",
+        failureKind: "provider",
+      },
+      "Worker",
+    );
+    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+    assert.match(presentation, /subagent_resume/);
+  });
+
+  it("renders an operator close as closed by the operator", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 9,
+        summary: "ignored when errorMessage is present",
+        sessionFile: "/tmp/subagent.jsonl",
+        errorMessage: "pane closed by operator",
+        failureKind: "operator",
+      },
+      "Worker",
+    );
+    assert.match(presentation, /closed by the operator/i);
+    assert.match(presentation, /Error: pane closed by operator/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.match(presentation, /remains on disk|resum/i);
+  });
+
+  it("renders a no-result exit distinctly from a provider failure", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 3,
+        summary: "ignored when errorMessage is present",
+        sessionFile: "/tmp/subagent.jsonl",
+        errorMessage: "Subagent process exited unexpectedly.",
+        failureKind: "no-result",
+      },
+      "Worker",
+    );
+    assert.match(presentation, /without producing a result/i);
+    assert.match(presentation, /Error: Subagent process exited unexpectedly/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /closed by the operator/i);
   });
 });
 

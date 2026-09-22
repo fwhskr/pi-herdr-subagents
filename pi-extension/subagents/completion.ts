@@ -105,6 +105,8 @@ export interface CompletionOptions {
   inspectPane?: () => Promise<import("./lifecycle.ts").PaneInspection>;
   /** Current-launch identity from the worker-written activity snapshot. */
   readWorkerActivity?: () => ActivityReadResult;
+  /** Expected writer of the exit sidecar; mismatched stamped payloads are ignored. */
+  expectedSidecarWriter?: SidecarWriterIdentity;
   /** Reports alive/dead/unknown; unknown never becomes a failure. */
   probeWorkerProcess?: (identity: SubagentProcessIdentity) => WorkerProcessProbeResult;
   /** @deprecated Pre-F-209 injection retained for existing callers/tests. */
@@ -119,6 +121,31 @@ export interface CompletionOptions {
   sessionFile?: string;
   sentinelFile?: string;
   onTick?: (elapsedSeconds: number) => void;
+}
+
+export interface SidecarWriterIdentity {
+  pid: number;
+  startTime: number;
+}
+
+/**
+ * Identity guard for foreign crash-sidecar writes (TASK-327 defense in
+ * depth). A crash payload stamped with a worker identity that does not
+ * match the lane the watcher is tracking is ignored, so a stray process
+ * inheriting PI_SUBAGENT_SESSION can never publish a failure for a real
+ * lane. Unstamped payloads (done, ping, provider errors, and crash
+ * writes from a platform where /proc identity is unavailable) pass through
+ * unchanged so every legitimate path keeps working.
+ */
+export function isForeignSidecarIdentity(
+  payload: { workerPid?: unknown; workerStartTime?: unknown },
+  expected: SidecarWriterIdentity | undefined,
+): boolean {
+  const pid = payload.workerPid;
+  const startTime = payload.workerStartTime;
+  if (pid == null && startTime == null) return false;
+  if (!expected) return false;
+  return pid !== expected.pid || startTime !== expected.startTime;
 }
 
 export function interpretExitSidecar(data: unknown): CompletionResult {
@@ -160,7 +187,10 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
   };
 }
 
-function consumeExitSidecar(sessionFile: string | undefined): CompletionResult | null {
+function consumeExitSidecar(
+  sessionFile: string | undefined,
+  expectedWriter?: SidecarWriterIdentity,
+): CompletionResult | null {
   if (!sessionFile) return null;
 
   const exitFile = `${sessionFile}.exit`;
@@ -170,7 +200,17 @@ function consumeExitSidecar(sessionFile: string | undefined): CompletionResult |
     const payload = JSON.parse(readFileSync(exitFile, "utf8")) as {
       type?: unknown;
       stopReason?: unknown;
+      workerPid?: unknown;
+      workerStartTime?: unknown;
     };
+    if (isForeignSidecarIdentity(payload, expectedWriter)) {
+      // A foreign process (e.g. an in-test extension instantiation that
+      // inherited PI_SUBAGENT_SESSION) wrote this sidecar. Delete it so it
+      // cannot sit around and poison a later read, then keep waiting for
+      // the real lane's own completion evidence.
+      rmSync(exitFile, { force: true });
+      return null;
+    }
     const result = interpretExitSidecar(payload);
     rmSync(exitFile, { force: true });
     return payload.type === "error" && payload.stopReason !== "error"
@@ -188,7 +228,7 @@ function terminalExitCode(screen: string): number | null {
 }
 
 function completionArtifact(options: CompletionOptions): CompletionResult | null {
-  const sidecar = consumeExitSidecar(options.sessionFile);
+  const sidecar = consumeExitSidecar(options.sessionFile, options.expectedSidecarWriter);
   if (sidecar) return sidecar;
   if (options.sentinelFile && existsSync(options.sentinelFile)) {
     return { reason: "sentinel", exitCode: 0 };
@@ -241,7 +281,7 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile);
+    const sidecarResult = consumeExitSidecar(options.sessionFile, options.expectedSidecarWriter);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {

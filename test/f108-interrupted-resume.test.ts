@@ -147,8 +147,22 @@ describe("F-108 resumed auto-exit", () => {
     const sessionFile = join(dir, "child.jsonl");
     writeFileSync(sessionFile, "session header\n");
     process.env.PI_SUBAGENT_SESSION = sessionFile;
+    // TASK-327 hygiene: snapshot process listeners; boot() instantiates the
+    // real extension, which must not leak an "exit" hook into the runner.
+    const priorExitHandlers = process.listeners("exit");
+    const priorUncaughtHandlers = process.listeners("uncaughtException");
     const { api, eventHandlers } = createChildApi();
     subagentDoneExtension(api);
+    const releaseCrashHooks = () => {
+      for (const handler of process.listeners("exit")) {
+        if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+      }
+      for (const handler of process.listeners("uncaughtException")) {
+        if (!priorUncaughtHandlers.includes(handler)) {
+          process.off("uncaughtException", handler as (error: Error) => void);
+        }
+      }
+    };
     const ctx: any = {
       shutdowns: 0,
       ui: { notify() {}, setWidget() {} },
@@ -157,6 +171,7 @@ describe("F-108 resumed auto-exit", () => {
     return {
       sessionFile,
       ctx,
+      releaseCrashHooks,
       fire(event: string, payload: any = {}) {
         for (const handler of eventHandlers.get(event) ?? []) handler(payload, ctx);
       },
@@ -165,38 +180,46 @@ describe("F-108 resumed auto-exit", () => {
 
   it("keeps the normal one-shot close path unchanged", async () => {
     const child = boot();
-    child.fire("agent_start");
-    child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
-    child.fire("agent_settled");
+    try {
+      child.fire("agent_start");
+      child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+      child.fire("agent_settled");
 
-    assert.equal(child.ctx.shutdowns, 1);
-    assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), { type: "done" });
-    const result = await waitForCompletion(new AbortController().signal, {
-      intervalMs: 1,
-      sessionFile: child.sessionFile,
-      readTerminalTail: async () => "",
-    });
-    assert.deepEqual(result, { reason: "done", exitCode: 0 });
-    assert.equal(existsSync(`${child.sessionFile}.exit`), false);
+      assert.equal(child.ctx.shutdowns, 1);
+      assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), { type: "done" });
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile: child.sessionFile,
+        readTerminalTail: async () => "",
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+      assert.equal(existsSync(`${child.sessionFile}.exit`), false);
+    } finally {
+      child.releaseCrashHooks();
+    }
   });
 
   it("treats the resumed prompt as machine input and writes a fresh sidecar", async () => {
     const child = boot({ rearm: true, resumeInput: true });
-    child.fire("agent_start");
-    child.fire("input", { type: "input", text: "continue after the interrupt" });
-    child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
-    child.fire("agent_settled");
+    try {
+      child.fire("agent_start");
+      child.fire("input", { type: "input", text: "continue after the interrupt" });
+      child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+      child.fire("agent_settled");
 
-    assert.equal(child.ctx.shutdowns, 1, "resume re-arms one-shot completion");
-    assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), { type: "done" });
+      assert.equal(child.ctx.shutdowns, 1, "resume re-arms one-shot completion");
+      assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), { type: "done" });
 
-    const result = await waitForCompletion(new AbortController().signal, {
-      intervalMs: 1,
-      sessionFile: child.sessionFile,
-      readTerminalTail: async () => "",
-    });
-    assert.deepEqual(result, { reason: "done", exitCode: 0 });
-    assert.equal(existsSync(`${child.sessionFile}.exit`), false, "the fresh sidecar is consumed");
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile: child.sessionFile,
+        readTerminalTail: async () => "",
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+      assert.equal(existsSync(`${child.sessionFile}.exit`), false, "the fresh sidecar is consumed");
+    } finally {
+      child.releaseCrashHooks();
+    }
   });
 });
 

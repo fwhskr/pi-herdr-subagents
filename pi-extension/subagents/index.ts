@@ -766,13 +766,34 @@ const modelConfig = loadModelConfig();
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "partial" | "timeout"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout"
   >,
   name: string,
 ): string {
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
+
+  // TASK-326: classify what actually happened. Only genuine
+  // provider/transport failures keep the provider wording verbatim;
+  // operator interrupts/closes and no-result exits render distinctly so the
+  // orchestrator does not retry a closed pane or misread an empty crash.
+  if (result.errorMessage && result.failureKind === "operator") {
+    return (
+      `Sub-agent "${name}" was closed by the operator after ${formatElapsed(result.elapsed)}.\n\n` +
+      `Error: ${result.errorMessage}\n\n` +
+      `The session remains on disk and can be resumed with subagent_resume.${sessionRef}`
+    );
+  }
+
+  if (result.errorMessage && result.failureKind === "no-result") {
+    return (
+      `Sub-agent "${name}" exited without producing a result after ${formatElapsed(result.elapsed)}.\n\n` +
+      `Error: ${result.errorMessage}\n\n` +
+      `The subagent did not produce a result. You can retry by spawning a new ` +
+      `subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -807,6 +828,8 @@ function buildResultTimeoutDetails(result: Pick<SubagentResult, "partial" | "tim
   };
 }
 
+export type SubagentFailureKind = "provider" | "operator" | "no-result";
+
 /**
  * Result from running a single subagent.
  */
@@ -819,8 +842,16 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
-  /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
+  /** Provider/agent error message (provider overloads, crash sidecars, watchdog kills). */
   errorMessage?: string;
+  /**
+   * What actually happened (TASK-326). Only genuine provider/transport
+   * failures are "provider"; operator interrupts/closes are "operator";
+   * exits that produced nothing (crash without stopReason, worker-died,
+   * missing pane, sentinel loss) are "no-result". Unset = pre-classification
+   * errorMessage path, rendered with the legacy provider wording.
+   */
+  failureKind?: SubagentFailureKind;
   /** A normal completion produced by the one-shot time-limit report continuation. */
   partial?: boolean;
   timeout?: "warned-wrapup" | "hard-stop";

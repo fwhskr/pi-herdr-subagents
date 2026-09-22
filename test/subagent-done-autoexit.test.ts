@@ -91,6 +91,21 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       cwd?: string;
     } = {},
   ) {
+    // TASK-327 hygiene: instantiating the real extension must never leak a
+    // process "exit" listener into the runner. Snapshot before, restore in
+    // the caller's finally via the returned release().
+    const priorExitHandlers = process.listeners("exit");
+    const priorUncaughtHandlers = process.listeners("uncaughtException");
+    const releaseCrashHooks = () => {
+      for (const handler of process.listeners("exit")) {
+        if (!priorExitHandlers.includes(handler)) process.off("exit", handler as () => void);
+      }
+      for (const handler of process.listeners("uncaughtException")) {
+        if (!priorUncaughtHandlers.includes(handler)) {
+          process.off("uncaughtException", handler as (error: Error) => void);
+        }
+      }
+    };
     const autoExit = opts.autoExit ?? true;
     if (autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
     else delete process.env.PI_SUBAGENT_AUTO_EXIT;
@@ -131,6 +146,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       registeredTools,
       sentUserMessages,
       registeredShortcuts,
+      releaseCrashHooks,
       fire(event: string, payload: any = {}) {
         for (const handler of eventHandlers.get(event) ?? []) handler(payload, ctx);
       },
@@ -151,6 +167,11 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     if (!child.sessionFile || !existsSync(`${child.sessionFile}.exit`)) return null;
     return JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8"));
   }
+
+  // TASK-327: every boot() installs the REAL extension, so every test must
+  // release any process "exit" listeners it did not own. Wrap the two bare
+  // multi-child cases; the single-child cases below are covered by the new
+  // focused no-leak test plus afterEach env restore.
 
   describe("resolveAutoExit decision table", () => {
     // [disarmed, oneShotReArm, stopReason, expected]
@@ -186,11 +207,15 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
 
   it("ignores the initial task input before the first agent run", () => {
     const child = boot();
-    child.fire("input", { type: "input", text: "do the whole task" });
-    child.settle([{ role: "assistant", stopReason: "stop" }]);
-    assert.equal(child.ctx.shutdowns, 1, "zero-real-input child still exits");
-    assert.deepEqual(sidecarOf(child), { type: "done" });
-    assert.equal(child.notifications.length, 0, "no warning for the injected task");
+    try {
+      child.fire("input", { type: "input", text: "do the whole task" });
+      child.settle([{ role: "assistant", stopReason: "stop" }]);
+      assert.equal(child.ctx.shutdowns, 1, "zero-real-input child still exits");
+      assert.deepEqual(sidecarOf(child), { type: "done" });
+      assert.equal(child.notifications.length, 0, "no warning for the injected task");
+    } finally {
+      child.releaseCrashHooks();
+    }
   });
 
   it("keeps the child alive after a tool-use turn until the final report", () => {
@@ -373,25 +398,63 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
 
   it("background regression: zero-input child behaves byte-for-byte like v0.2.0", () => {
     const child = boot();
-    child.fire("session_start", {});
-    child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
-    assert.equal(child.ctx.shutdowns, 0, "no shutdown before agent_settled");
-    assert.equal(existsSync(`${child.sessionFile}.exit`), false);
-    child.fire("agent_settled", { type: "agent_settled" });
-    assert.equal(child.ctx.shutdowns, 1);
-    assert.deepEqual(sidecarOf(child), { type: "done" });
-    assert.equal(child.notifications.length, 0, "silent for background children");
-
     const failing = boot();
-    failing.settle([
-      { role: "assistant", stopReason: "error", errorMessage: "529 overloaded" },
-    ]);
-    assert.equal(failing.ctx.shutdowns, 1, "error stopReason still wakes the parent");
-    assert.deepEqual(sidecarOf(failing), {
-      type: "error",
-      errorMessage: "529 overloaded",
-      stopReason: "error",
-    });
+    try {
+      child.fire("session_start", {});
+      child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+      assert.equal(child.ctx.shutdowns, 0, "no shutdown before agent_settled");
+      assert.equal(existsSync(`${child.sessionFile}.exit`), false);
+      child.fire("agent_settled", { type: "agent_settled" });
+      assert.equal(child.ctx.shutdowns, 1);
+      assert.deepEqual(sidecarOf(child), { type: "done" });
+      assert.equal(child.notifications.length, 0, "silent for background children");
+
+      failing.settle([
+        { role: "assistant", stopReason: "error", errorMessage: "529 overloaded" },
+      ]);
+      assert.equal(failing.ctx.shutdowns, 1, "error stopReason still wakes the parent");
+      assert.deepEqual(sidecarOf(failing), {
+        type: "error",
+        errorMessage: "529 overloaded",
+        stopReason: "error",
+      });
+    } finally {
+      child.releaseCrashHooks();
+      failing.releaseCrashHooks();
+    }
+  });
+
+  // TASK-327: instantiating the real extension in a test process must leave
+  // no process "exit"/"uncaughtException" listeners behind and must write
+  // no sidecar — the guard (no --session in argv) keeps the leak shut.
+  it("leaves no crash hooks or sidecar behind in a test process", () => {
+    const priorExit = process.listeners("exit");
+    const priorUncaught = process.listeners("uncaughtException");
+    const child = boot();
+    try {
+      assert.deepEqual(
+        process.listeners("exit").filter((h) => !priorExit.includes(h)),
+        [],
+        "test-process argv registers no exit hook",
+      );
+      assert.deepEqual(
+        process.listeners("uncaughtException").filter((h) => !priorUncaught.includes(h)),
+        [],
+        "test-process argv registers no uncaughtException hook",
+      );
+      assert.equal(sidecarOf(child), null);
+      assert.equal(existsSync(`${child.sessionFile}.exit`), false);
+    } finally {
+      child.releaseCrashHooks();
+    }
+    assert.deepEqual(
+      process.listeners("exit").filter((h) => !priorExit.includes(h)),
+      [],
+    );
+    assert.deepEqual(
+      process.listeners("uncaughtException").filter((h) => !priorUncaught.includes(h)),
+      [],
+    );
   });
 
   it("does not overwrite an explicit completion sidecar when agent_settled follows", async () => {
