@@ -115,7 +115,12 @@ describe("recovery ladder", () => {
     assert.doesNotMatch(result.summary, /cancelled|wrap-up|completed/i);
 
     const presentation = testApi.resolveResultPresentation(result, running.name);
-    assert.match(presentation, /failed/);
+    // TASK-326 AC6: a recovery/watchdog kill names itself and must never render
+    // as a provider outage with exhausted retries, nor as a bare exit code.
+    assert.match(presentation, /was killed by the recovery watchdog after/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /failed \(exit code/);
     assert.doesNotMatch(presentation, /completed/);
 
     const repeated = testApi.advanceRunningRecovery(running, { kind: "stalled" }, 999_999, delays, operations);

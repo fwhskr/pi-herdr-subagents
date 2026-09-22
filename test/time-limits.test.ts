@@ -233,8 +233,15 @@ describe("parent time-limit actions", () => {
       );
       assert.match(result.summary, /timed out after 60s/i);
       assert.match(result.summary, /Halfway through the migration/);
-      assert.match(testApi.resolveResultPresentation(result, running.name), /failed/);
-      assert.doesNotMatch(testApi.resolveResultPresentation(result, running.name), /completed/);
+      // TASK-326 AC6: a hard time-limit stop is a parent-initiated lifecycle
+      // stop, not a provider failure. Pin the branch-specific wording and keep
+      // ruling out the legacy provider/exit-code renderings it replaced.
+      const hardStopPresentation = testApi.resolveResultPresentation(result, running.name);
+      assert.match(hardStopPresentation, /was stopped at its hard time limit after/);
+      assert.doesNotMatch(hardStopPresentation, /auto-retry exhausted/);
+      assert.doesNotMatch(hardStopPresentation, /provider\/agent error/);
+      assert.doesNotMatch(hardStopPresentation, /failed \(exit code/);
+      assert.doesNotMatch(hardStopPresentation, /completed/);
 
       assert.equal(testApi.advanceRunningTimeLimit(running, 61_000, operations).action, null);
       assert.equal(closes, 1, "terminal hard-stop must not close twice");
@@ -324,8 +331,20 @@ describe("completion classification", () => {
       ["partial", "timed-out", "recovery-kill", "clean"],
     );
     assert.match(testApi.resolveResultPresentation(partial, partial.name), /partial report/i);
-    assert.match(testApi.resolveResultPresentation(timedOut, timedOut.name), /failed/i);
-    assert.match(testApi.resolveResultPresentation(recovery, recovery.name), /failed/i);
+    // TASK-326 AC6: each parent-initiated stop names itself and never falls
+    // back to the provider/exit-code wording this change removed.
+    const timedOutPresentation = testApi.resolveResultPresentation(timedOut, timedOut.name);
+    assert.match(timedOutPresentation, /was stopped at its hard time limit after/);
+    assert.doesNotMatch(timedOutPresentation, /auto-retry exhausted/);
+    assert.doesNotMatch(timedOutPresentation, /provider\/agent error/);
+    assert.doesNotMatch(timedOutPresentation, /failed \(exit code/);
+
+    const recoveryPresentation = testApi.resolveResultPresentation(recovery, recovery.name);
+    assert.match(recoveryPresentation, /was killed by the recovery watchdog after/);
+    assert.doesNotMatch(recoveryPresentation, /auto-retry exhausted/);
+    assert.doesNotMatch(recoveryPresentation, /provider\/agent error/);
+    assert.doesNotMatch(recoveryPresentation, /failed \(exit code/);
+
     assert.match(testApi.resolveResultPresentation(clean, clean.name), /completed/i);
   });
 });
