@@ -3454,12 +3454,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
+        // First-launch lineage: identity travels with the session, so everything
+        // keyed on the agent profile (strict profiles, fallback chains) keeps
+        // working across every resume. Missing/corrupt metadata ⇒ no agent env,
+        // exactly the pre-fix resume behavior.
+        const spawnMetadata = readSpawnMetadata(params.sessionPath);
+
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
+        if (typeof spawnMetadata?.agent === "string" && spawnMetadata.agent.trim()) {
+          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellQuote(spawnMetadata.agent)}`);
+        }
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
@@ -3470,7 +3479,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Spawn rights on resume are clamped to what the first launch recorded:
         // missing metadata ⇒ 0 (deny); never larger than first launch.
         const resumeSpawn = clampResumeSpawn(
-          readSpawnMetadata(params.sessionPath),
+          spawnMetadata,
           parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH),
         );
         if (!resumeSpawn.maySpawn) {
