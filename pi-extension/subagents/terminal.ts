@@ -16,6 +16,7 @@ import {
   sendHerdrEscape,
   listHerdrPaneSessions,
   type HerdrPaneSessionReference,
+  type HerdrReadSource,
 } from "./herdr.ts";
 
 export type PaneId = string;
@@ -100,14 +101,22 @@ export function runScriptInPane(
   return scriptPath;
 }
 
-export function readPane(paneId: PaneId, lines = 50): string {
+export function readPane(
+  paneId: PaneId,
+  lines = 50,
+  source: HerdrReadSource = "visible",
+): string {
   assertTerminalAvailable();
-  return readHerdrScreen(paneId, lines);
+  return readHerdrScreen(paneId, lines, source);
 }
 
-export async function readPaneAsync(paneId: PaneId, lines = 50): Promise<string> {
+export async function readPaneAsync(
+  paneId: PaneId,
+  lines = 50,
+  source: HerdrReadSource = "visible",
+): Promise<string> {
   assertTerminalAvailable();
-  return readHerdrScreenAsync(paneId, lines);
+  return readHerdrScreenAsync(paneId, lines, source);
 }
 
 export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";

@@ -174,14 +174,37 @@ export function createHerdrSurfaceSplit(
   return paneId;
 }
 
-export function readHerdrScreen(surface: string, lines = 50): string {
-  // `visible` is reliable for freshly created panes where herdr's `recent`
-  // scrollback may not be populated yet.
-  return herdrExec(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
+export type HerdrReadSource = "visible" | "recent" | "recent-unwrapped" | "detection";
+
+/**
+ * Build a `herdr pane read` invocation. `visible` (the viewport) stays the
+ * default for the existing inline tail; scrollback snapshots pass an explicit
+ * `recent-unwrapped` source so the last N KiB survive the pane close.
+ */
+export function buildPaneReadArgs(
+  surface: string,
+  lines: number,
+  source: HerdrReadSource = "visible",
+): string[] {
+  return ["pane", "read", surface, "--source", source, "--lines", String(lines)];
 }
 
-export async function readHerdrScreenAsync(surface: string, lines = 50): Promise<string> {
-  return herdrExecAsync(["pane", "read", surface, "--source", "visible", "--lines", String(lines)]);
+export function readHerdrScreen(
+  surface: string,
+  lines = 50,
+  source: HerdrReadSource = "visible",
+): string {
+  // `visible` is reliable for freshly created panes where herdr's `recent`
+  // scrollback may not be populated yet.
+  return herdrExec(buildPaneReadArgs(surface, lines, source));
+}
+
+export async function readHerdrScreenAsync(
+  surface: string,
+  lines = 50,
+  source: HerdrReadSource = "visible",
+): Promise<string> {
+  return herdrExecAsync(buildPaneReadArgs(surface, lines, source));
 }
 
 export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
@@ -451,6 +474,7 @@ export const __herdrTest__ = {
   clearCommandAvailability: () => commandAvailability.clear(),
   buildTabCreateArgs,
   buildPaneReportTaskArgs,
+  buildPaneReadArgs,
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,

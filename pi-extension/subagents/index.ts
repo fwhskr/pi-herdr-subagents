@@ -5,7 +5,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import {
   readdirSync,
   readFileSync,
@@ -37,6 +37,7 @@ import {
   listPaneSessionReferences,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
+import type { HerdrReadSource } from "./herdr.ts";
 import {
   buildAuthenticatedModelCatalog,
   resolveRuntimePlan,
@@ -1009,6 +1010,14 @@ interface RunningSubagent {
   runtimePlan: ResolvedRuntimePlan | undefined;
   /** Per-run file receiving the child's stderr for truthful failure reports. */
   stderrFile?: string;
+  /**
+   * Artifact root for this run. The pane tail is snapshotted here before the
+   * pane closes so the only copy of a startup death survives the close
+   * (herdr returns `pane_not_found` once a pane is gone).
+   */
+  artifactDir?: string;
+  /** Reference to the persisted pre-close scrollback, when one was written. */
+  paneScrollback?: PaneScrollbackRef;
 }
 
 interface RecoveryPaneOperations {
@@ -1492,6 +1501,7 @@ function finalizeInterruptedSubagent(
 
   running.interrupted = { errorMessage: INTERRUPTED_ERROR, interruptedAt: now };
   running.lifecycle = markFailed(lifecycle, INTERRUPTED_ERROR, now, INTERRUPTED_EXIT_CODE);
+  persistPaneTailBeforeClose(running);
   try {
     operations.closePane(running.surface);
   } catch {
@@ -1542,6 +1552,7 @@ function failAndTeardownSubagent(
 
   beforeAbort?.();
   running.lifecycle = markFailed(lifecycle, error, now, 1);
+  persistPaneTailBeforeClose(running);
   try {
     operations.closePane(running.surface);
   } catch {
@@ -1592,7 +1603,7 @@ function buildRecoveryKilledResult(running: RunningSubagent, now: number): Subag
   return {
     name: running.name,
     task: running.task,
-    summary: `Subagent error: ${recoveryKilled.errorMessage}`,
+    summary: withPaneScrollbackRef(`Subagent error: ${recoveryKilled.errorMessage}`, running),
     sessionFile: running.sessionFile,
     exitCode: 1,
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
@@ -1611,7 +1622,10 @@ function buildInterruptedResult(running: RunningSubagent, now: number): Subagent
   return {
     name: running.name,
     task: running.task,
-    summary: `${interrupted.errorMessage}\n\nThe session remains on disk and can be resumed with subagent_resume.`,
+    summary: withPaneScrollbackRef(
+      `${interrupted.errorMessage}\n\nThe session remains on disk and can be resumed with subagent_resume.`,
+      running,
+    ),
     sessionFile: running.sessionFile,
     exitCode: INTERRUPTED_EXIT_CODE,
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
@@ -1707,7 +1721,10 @@ function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): Sub
   return {
     name: running.name,
     task: running.task,
-    summary: `${stopped.errorMessage}${tail ? `\n\nLast session output:\n${tail}` : ""}`,
+    summary: withPaneScrollbackRef(
+      `${stopped.errorMessage}${tail ? `\n\nLast session output:\n${tail}` : ""}`,
+      running,
+    ),
     sessionFile: running.sessionFile,
     exitCode: 1,
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1_000),
@@ -1877,6 +1894,11 @@ function buildResumeAutoExitEnv(params: { autoExit: boolean; hasMessage: boolean
   ];
 }
 
+/** TASK-332 scrollback read source, requested line count, and persisted cap. */
+const PANE_SCROLLBACK_SOURCE: HerdrReadSource = "recent-unwrapped";
+const PANE_SCROLLBACK_READ_LINES = 10_000;
+const PANE_SCROLLBACK_MAX_BYTES = 256 * 1024;
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1925,6 +1947,13 @@ export const __test__ = {
   clearResumeExitSidecar,
   preflightSubagentDonePath,
   enrichNoSessionFailure,
+  persistPaneScrollback,
+  persistPaneTailBeforeClose,
+  formatPaneScrollbackRef,
+  withPaneScrollbackRef,
+  PANE_SCROLLBACK_READ_LINES,
+  PANE_SCROLLBACK_MAX_BYTES,
+  PANE_SCROLLBACK_SOURCE,
   writeSpawnMetadata,
   discoverOrphanedSubagents,
   formatOrphanRestoreReport,
@@ -2118,6 +2147,7 @@ async function launchSubagent(
     runtimePlan,
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
     stderrFile,
+    artifactDir,
     timeLimit,
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
@@ -2159,24 +2189,140 @@ async function launchSubagent(
 
 const FAILURE_PANE_TAIL_LINES = 20;
 
+/** Persisted pre-close snapshot of a child pane (TASK-332). */
+export interface PaneScrollbackRef {
+  path: string;
+  bytes: number;
+  sha256: string;
+  source: HerdrReadSource;
+  readLines: number;
+  truncated: boolean;
+}
+
+/**
+ * TASK-332: the pane is where a process-start death is rendered, and herdr
+ * drops the scrollback when the pane closes (a later read returns
+ * `pane_not_found`). Snapshot the scrollback — not the viewport — to the run's
+ * artifact directory before any close, so the failure report can point at a
+ * durable copy.
+ *
+ * The read/cap constants are declared above `__test__` (module-init order).
+ */
+function sanitizeSurfaceForPath(surface: string): string {
+  return surface.replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+
+function persistPaneScrollback(
+  running: { id?: string; surface: string; artifactDir?: string },
+  readPaneFn: typeof readPane = readPane,
+): PaneScrollbackRef | undefined {
+  if (!running.artifactDir) return undefined;
+
+  let raw: string;
+  try {
+    raw = readPaneFn(running.surface, PANE_SCROLLBACK_READ_LINES, PANE_SCROLLBACK_SOURCE);
+  } catch {
+    return undefined;
+  }
+  if (!raw.trim()) return undefined;
+
+  let bytes = Buffer.from(raw, "utf8");
+  const truncated = bytes.byteLength > PANE_SCROLLBACK_MAX_BYTES;
+  if (truncated) {
+    // Keep the tail: startup errors render last.
+    bytes = bytes.subarray(bytes.byteLength - PANE_SCROLLBACK_MAX_BYTES);
+    // Do not start the file mid-UTF-8-sequence.
+    let offset = 0;
+    while (offset < 3 && offset < bytes.byteLength && (bytes[offset] & 0xc0) === 0x80) offset++;
+    bytes = bytes.subarray(offset);
+  }
+
+  const dir = join(running.artifactDir, "pane-scrollback");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${running.id ?? "unknown-run"}-${sanitizeSurfaceForPath(running.surface)}.log`);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  writeFileSync(file, bytes);
+  writeFileSync(
+    `${file}.meta.json`,
+    `${JSON.stringify(
+      {
+        runId: running.id ?? null,
+        surface: running.surface,
+        persistedAt: new Date().toISOString(),
+        bytes: bytes.byteLength,
+        sha256,
+        source: PANE_SCROLLBACK_SOURCE,
+        readLines: PANE_SCROLLBACK_READ_LINES,
+        truncated,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  return {
+    path: file,
+    bytes: bytes.byteLength,
+    sha256,
+    source: PANE_SCROLLBACK_SOURCE,
+    readLines: PANE_SCROLLBACK_READ_LINES,
+    truncated,
+  };
+}
+
+/** Human/agent-readable report line naming the persisted artifact by path. */
+function formatPaneScrollbackRef(ref: PaneScrollbackRef): string {
+  return `Pane scrollback persisted: ${ref.path} (${ref.bytes} bytes, sha256:${ref.sha256})`;
+}
+
+/**
+ * Snapshot the pane tail once per run, immediately before a close that would
+ * otherwise discard it. Idempotent: a run that already has a snapshot (e.g.
+ * the enrich path ran first) is left alone.
+ */
+function persistPaneTailBeforeClose(
+  running: Pick<RunningSubagent, "id" | "surface" | "artifactDir" | "paneScrollback">,
+): void {
+  if (running.paneScrollback || !running.artifactDir) return;
+  const ref = persistPaneScrollback(running);
+  if (ref) running.paneScrollback = ref;
+}
+
+/** Append the persisted-tail reference to a failure summary when one exists. */
+function withPaneScrollbackRef(
+  summary: string,
+  running: { paneScrollback?: PaneScrollbackRef },
+): string {
+  return running.paneScrollback
+    ? `${summary}\n\n${formatPaneScrollbackRef(running.paneScrollback)}`
+    : summary;
+}
+
 function enrichNoSessionFailure(
   result: Pick<import("./completion.ts").CompletionResult, "exitCode">,
-  running: Pick<RunningSubagent, "sessionFile" | "surface">,
+  running: Pick<RunningSubagent, "sessionFile" | "surface"> & {
+    id?: string;
+    artifactDir?: string;
+    paneScrollback?: PaneScrollbackRef;
+  },
   summary: string,
   readPaneFn: typeof readPane = readPane,
 ): { summary: string; error?: string } {
   if (result.exitCode === 0 || existsSync(running.sessionFile)) return { summary };
 
+  const scrollback = running.paneScrollback ?? persistPaneScrollback(running, readPaneFn);
+  if (scrollback) running.paneScrollback = scrollback;
+  const scrollbackNote = scrollback ? `\n\n${formatPaneScrollbackRef(scrollback)}` : "";
+
   let paneTail: string;
   try {
     paneTail = readPaneFn(running.surface, FAILURE_PANE_TAIL_LINES);
   } catch {
-    return { summary };
+    return { summary: `${summary}${scrollbackNote}` };
   }
-  if (!paneTail.trim()) return { summary };
+  if (!paneTail.trim()) return { summary: `${summary}${scrollbackNote}` };
 
   return {
-    summary: `${summary}\n\nChild pane output:\n${paneTail}`,
+    summary: `${summary}\n\nChild pane output:\n${paneTail}${scrollbackNote}`,
     error: paneTail,
   };
 }
@@ -2365,6 +2511,7 @@ async function watchSubagent(
       return interruptedResult;
     }
 
+    persistPaneTailBeforeClose(running);
     try {
       closePane(surface);
     } catch {
@@ -2382,7 +2529,7 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: withPaneScrollbackRef("Subagent cancelled.", running),
         exitCode: 1,
         elapsed: Math.floor((now - startTime) / 1000),
         error: "cancelled",
@@ -2392,7 +2539,7 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      summary: withPaneScrollbackRef(`Subagent error: ${err?.message ?? String(err)}`, running),
       exitCode: 1,
       elapsed: Math.floor((now - startTime) / 1000),
       error: err?.message ?? String(err),
@@ -3125,6 +3272,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // other await runs between here and runningSubagents.set, so releasing
         // immediately after the delay leaves no window for a second pi.
         if (!claimResumeSession(params.sessionPath)) {
+          // TASK-332: best-effort snapshot even on a refusal; a pane that never
+          // ran the child usually has no scrollback, so this is normally a no-op.
+          persistPaneScrollback({
+            id,
+            surface,
+            artifactDir: getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()),
+          });
           closePaneQuietly(surface);
           return {
             content: [{
@@ -3230,6 +3384,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           stderrFile,
+          artifactDir,
           interactive,
           runtimePlan: undefined,
           lifecycle: createLifecycle(startTime),
