@@ -14,6 +14,10 @@ import {
   mkdirSync,
   renameSync,
   unlinkSync,
+  openSync,
+  readSync,
+  closeSync,
+  statSync,
   accessSync,
   constants as fsConstants,
 } from "node:fs";
@@ -767,6 +771,24 @@ const modelConfig = loadModelConfig();
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "stderr"
+  >,
+  name: string,
+): string {
+  return resolveResultPresentationCore(result, name) + formatStderrCapture(result.stderr);
+}
+
+function formatStderrCapture(stderr: StderrCapture | undefined): string {
+  if (!stderr) return "";
+  if (stderr.tail && stderr.tail.trim()) {
+    return `\n\nChild stderr (last ${STDERR_TAIL_BYTES} bytes):\n${stderr.tail}`;
+  }
+  return `\n\nstderr not captured: ${stderr.reason ?? "reason unavailable"}`;
+}
+
+function resolveResultPresentationCore(
+  result: Pick<
+    SubagentResult,
     "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout"
   >,
   name: string,
@@ -871,6 +893,39 @@ export type SubagentFailureKind =
   | "time-limit";
 
 /**
+ * Bounded child-stderr evidence attached to process-start / no-result
+ * failures. `tail` is the last captured bytes; `reason` explains why nothing
+ * could be captured so the parent report never silently omits the evidence.
+ */
+export interface StderrCapture {
+  tail?: string;
+  reason?: string;
+}
+
+const STDERR_TAIL_BYTES = 4096;
+
+/** Read the last >=4 KiB of a child's captured stderr, or name why not. */
+export function captureStderrTail(stderrFile: string | undefined): StderrCapture {
+  if (!stderrFile) return { reason: "no stderr file was configured for this run" };
+  try {
+    if (!existsSync(stderrFile)) return { reason: `stderr file not found at ${stderrFile}` };
+    const size = statSync(stderrFile).size;
+    if (size === 0) return { reason: `stderr file is empty at ${stderrFile}` };
+    const start = Math.max(0, size - STDERR_TAIL_BYTES);
+    const fd = openSync(stderrFile, "r");
+    try {
+      const buffer = Buffer.alloc(size - start);
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, start);
+      return { tail: buffer.subarray(0, bytesRead).toString("utf8") };
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    return { reason: `stderr read failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
  * Result from running a single subagent.
  */
 interface SubagentResult {
@@ -896,6 +951,8 @@ interface SubagentResult {
   partial?: boolean;
   timeout?: "warned-wrapup" | "hard-stop";
   ping?: { name: string; message: string };
+  /** Child stderr evidence on process-start / no-result failures (TASK-330). */
+  stderr?: StderrCapture;
 }
 
 /**
@@ -950,6 +1007,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Per-run file receiving the child's stderr for truthful failure reports. */
+  stderrFile?: string;
 }
 
 interface RecoveryPaneOperations {
@@ -993,6 +1052,45 @@ const runtime: SubagentRuntime =
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
 const completionDelivery = runtime.delivery ??= new CompletionDelivery<ExtensionAPI>();
+
+/**
+ * Sessions reserved by an in-flight subagent_resume, closed synchronously
+ * before the first await so two resume calls can never both spawn a pi on one
+ * session file (TASK-330 death 2). Released once the running registry owns the
+ * reservation, or when the launch fails.
+ */
+const resumeClaims = new Set<string>();
+
+export interface ActiveSessionRun {
+  id: string;
+  name: string;
+}
+
+/**
+ * The active run (if any) currently owning a session file. Considers both the
+ * running registry and the synchronous resume reservation.
+ */
+export function findActiveSessionRun(
+  sessionFile: string,
+  agents: Map<string, Pick<RunningSubagent, "id" | "name" | "sessionFile">> = runningSubagents,
+  claims: Set<string> = resumeClaims,
+): ActiveSessionRun | undefined {
+  for (const agent of agents.values()) {
+    if (agent.sessionFile === sessionFile) return { id: agent.id, name: agent.name };
+  }
+  if (claims.has(sessionFile)) return { id: "(pending)", name: "resume" };
+  return undefined;
+}
+
+function claimResumeSession(sessionFile: string): boolean {
+  if (resumeClaims.has(sessionFile)) return false;
+  resumeClaims.add(sessionFile);
+  return true;
+}
+
+function releaseResumeSession(sessionFile: string): void {
+  resumeClaims.delete(sessionFile);
+}
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
   return reason === "reload";
@@ -1341,7 +1439,9 @@ function closePaneQuietly(
 ): void {
   try {
     closePaneKey(surface);
-  } catch {}
+  } catch {
+    // Pane cleanup is best effort; a pane that is already gone is not an error.
+  }
 }
 
 /** Persist a terminal projection so result delivery can remove its widget row. */
@@ -1394,10 +1494,14 @@ function finalizeInterruptedSubagent(
   running.lifecycle = markFailed(lifecycle, INTERRUPTED_ERROR, now, INTERRUPTED_EXIT_CODE);
   try {
     operations.closePane(running.surface);
-  } catch {}
+  } catch {
+    // Best-effort teardown after the interrupt grace expired.
+  }
   try {
     operations.abortWatcher(running.abortController);
-  } catch {}
+  } catch {
+    // Best-effort watcher stop after the interrupt grace expired.
+  }
   return true;
 }
 
@@ -1440,10 +1544,14 @@ function failAndTeardownSubagent(
   running.lifecycle = markFailed(lifecycle, error, now, 1);
   try {
     operations.closePane(running.surface);
-  } catch {}
+  } catch {
+    // Best-effort teardown of a failed run.
+  }
   try {
     operations.abortWatcher(running.abortController);
-  } catch {}
+  } catch {
+    // Best-effort watcher stop of a failed run.
+  }
   return true;
 }
 
@@ -1549,7 +1657,9 @@ function advanceRunningTimeLimit(
     if ("error" in interruption) {
       try {
         operations.removeWrapup(running.sessionFile);
-      } catch {}
+      } catch {
+        // The wrap-up directive may already be gone; not an error.
+      }
       return { action: null };
     }
 
@@ -1571,7 +1681,9 @@ function advanceRunningTimeLimit(
       running.wrapupPending = false;
       try {
         operations.removeWrapup(running.sessionFile);
-      } catch {}
+      } catch {
+        // The wrap-up directive may already be gone; not an error.
+      }
     });
     return { action: stopped ? "hard-stop" : null };
   }
@@ -1588,7 +1700,9 @@ function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): Sub
     if (existsSync(running.sessionFile)) {
       tail = findLastAssistantMessage(getNewEntries(running.sessionFile, 0));
     }
-  } catch {}
+  } catch {
+    // The session tail is optional enrichment; a read failure is not fatal.
+  }
 
   return {
     name: running.name,
@@ -1818,6 +1932,8 @@ export const __test__ = {
   isRestorableOrphan,
   resumeOrphanedSubagents,
   runningSubagents,
+  findActiveSessionRun,
+  captureStderrTail,
   formatElapsed,
 };
 
@@ -1923,6 +2039,8 @@ async function launchSubagent(
     mkdirSync(dirname(activityFile), { recursive: true });
     resetSubagentActivityFile(activityFile);
   }
+  const stderrFile = join(artifactDir, "subagent-stderr", `${id}.log`);
+  mkdirSync(dirname(stderrFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1999,6 +2117,7 @@ async function launchSubagent(
     interactive: effectiveInteractive,
     runtimePlan,
     activityFile: driver.hasActivitySnapshots ? activityFile : undefined,
+    stderrFile,
     timeLimit,
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
@@ -2026,6 +2145,7 @@ async function launchSubagent(
 
   runScriptInPane(surface, built.command, {
     scriptPath: launchScriptFile,
+    stderrFile,
     scriptPreamble: (built.launchScriptPreamble ?? [
       `# Subagent launch script for ${params.name}`,
       `# Generated: ${new Date().toISOString()}`,
@@ -2077,6 +2197,7 @@ async function watchSubagent(
       intervalMs: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      expectedSidecarWriter: { runId: running.id },
       readTerminalTail: () => readPaneAsync(surface, 5),
       inspectPane: async () => inspectPane(surface),
       readWorkerActivity: running.activityFile
@@ -2202,6 +2323,9 @@ async function watchSubagent(
     }
 
     const enriched = enrichNoSessionFailure(result, running, summary);
+    const stderr = !existsSync(sessionFile) || failureKind === "no-result"
+      ? captureStderrTail(running.stderrFile)
+      : undefined;
     if (!result.preservePane) closePaneQuietly(surface);
     running.lifecycle = result.exitCode === 0
       ? markCompleted(running.lifecycle, Date.now())
@@ -2216,6 +2340,7 @@ async function watchSubagent(
       elapsed,
       ping: result.ping,
       ...(enriched.error ? { error: enriched.error } : {}),
+      ...(stderr ? { stderr } : {}),
       ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
       ...(result.errorMessage
         ? { errorMessage: result.errorMessage, failureKind }
@@ -2242,7 +2367,9 @@ async function watchSubagent(
 
     try {
       closePane(surface);
-    } catch {}
+    } catch {
+      // Best-effort pane close on the watcher error path.
+    }
     running.lifecycle = markFailed(
       running.lifecycle,
       signal.aborted ? "Subagent cancelled." : err?.message ?? String(err),
@@ -2933,6 +3060,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        // TASK-330 AC1: never put a second pi process on a session that already
+        // has an active run — the two runs would share one ${session}.exit
+        // consumer path and cross-attribute their outcomes (death 2).
+        const active = findActiveSessionRun(params.sessionPath);
+        if (active) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                `Refused to resume ${params.sessionPath}: an active run is already on that ` +
+                `session (id ${active.id}, "${active.name}"). A second pi on one session ` +
+                `would conflate the two runs' exit sidecars. Wait for it to finish or ` +
+                `interrupt it first.`,
+            }],
+            details: {
+              error: "session already active",
+              status: "refused",
+              sessionPath: params.sessionPath,
+              activeRunId: active.id,
+              activeRunName: active.name,
+            },
+          };
+        }
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -2971,7 +3121,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (params.message) {
           setPaneTask(surface, params.message);
         }
+        // Reserve the session across the only await before registration. No
+        // other await runs between here and runningSubagents.set, so releasing
+        // immediately after the delay leaves no window for a second pi.
+        if (!claimResumeSession(params.sessionPath)) {
+          closePaneQuietly(surface);
+          return {
+            content: [{
+              type: "text",
+              text: `Refused to resume ${params.sessionPath}: a resume is already starting.`,
+            }],
+            details: { error: "session already active", status: "refused", sessionPath: params.sessionPath },
+          };
+        }
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        releaseResumeSession(params.sessionPath);
 
         // Build pi resume command
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
@@ -2984,6 +3148,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
         resetSubagentActivityFile(activityFile);
+        const stderrFile = join(artifactDir, "subagent-stderr", `${id}.log`);
+        mkdirSync(dirname(stderrFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -3043,6 +3209,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
         runScriptInPane(surface, command, {
           scriptPath: launchScriptFile,
+          stderrFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
             `# Generated: ${new Date().toISOString()}`,
@@ -3062,6 +3229,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           launchScriptFile,
           activityFile,
+          stderrFile,
           interactive,
           runtimePlan: undefined,
           lifecycle: createLifecycle(startTime),

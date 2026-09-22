@@ -16,8 +16,6 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
-export const CRASH_EXIT_MESSAGE = "Subagent process exited unexpectedly.";
-
 export function isSubagentSessionHost(sessionFile: string, argv: readonly string[]): boolean {
   if (!sessionFile) return false;
   const flagIndex = argv.indexOf("--session");
@@ -33,20 +31,58 @@ export function shouldRegisterCrashHooks(
     isSubagentSessionHost(sessionFile, argv);
 }
 
-export interface ExitSidecarWriterIdentity {
-  pid: number;
-  startTime: number;
+/**
+ * Run identity stamped on EVERY exit-sidecar payload so a watcher can drop a
+ * payload written by a different run that happens to share the session file
+ * (the resume-while-running conflation in TASK-330). Fields are omitted when
+ * the child genuinely cannot know them, which keeps unstamped legacy payloads
+ * accepted by the parent (accept-when-unknown).
+ */
+export interface ExitSidecarRunIdentity {
+  runId?: string;
+  workerPid?: number;
+  workerStartTime?: number;
 }
 
-export function buildCrashSidecar(
-  errorMessage: string,
-  writer: ExitSidecarWriterIdentity | undefined,
+/** Terminal metadata carried alongside the run identity. */
+export interface ExitSidecarMeta {
+  exitCode?: number;
+  signal?: string;
+  lastPhase?: string;
+  message?: string;
+}
+
+/**
+ * Merge the run identity and terminal metadata into an exit-sidecar payload.
+ * Pure so both the completion paths and the crash hooks share one shape.
+ */
+export function stampExitSidecar(
+  base: Record<string, unknown>,
+  identity: ExitSidecarRunIdentity,
+  meta: ExitSidecarMeta,
 ): Record<string, unknown> {
   return {
-    type: "error",
-    errorMessage,
-    ...(writer ? { workerPid: writer.pid, workerStartTime: writer.startTime } : {}),
+    ...base,
+    ...(identity.runId ? { runId: identity.runId } : {}),
+    ...(identity.workerPid != null && identity.workerStartTime != null
+      ? { workerPid: identity.workerPid, workerStartTime: identity.workerStartTime }
+      : {}),
+    ...(meta.exitCode != null ? { exitCode: meta.exitCode } : {}),
+    ...(meta.signal ? { signal: meta.signal } : {}),
+    ...(meta.lastPhase ? { lastPhase: meta.lastPhase } : {}),
+    ...(meta.message ? { message: meta.message } : {}),
   };
+}
+
+/**
+ * Truthful crash sidecar. The message is the observed terminal cause (exit
+ * code or uncaught-exception text) — never a constant that masks it.
+ */
+export function buildCrashSidecar(
+  identity: ExitSidecarRunIdentity,
+  meta: ExitSidecarMeta & { message: string },
+): Record<string, unknown> {
+  return stampExitSidecar({ type: "error", errorMessage: meta.message }, identity, meta);
 }
 
 function isTerminalAutoExitStopReason(stopReason: string | undefined): boolean {
@@ -293,6 +329,8 @@ export default function (
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  const runId = process.env.PI_SUBAGENT_ID?.trim() || undefined;
+  const processIdentity = readCurrentProcessIdentity();
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -355,7 +393,7 @@ export default function (
   let latestAgentMessages: any[] | undefined;
   let wrapupInProgress = false;
   let exitSidecarWritten = false;
-  let processExitHandler: (() => void) | undefined;
+  let processExitHandler: ((code: number) => void) | undefined;
   let uncaughtExceptionHandler: ((error: Error) => void) | undefined;
 
   function writeExitSidecar(
@@ -368,6 +406,22 @@ export default function (
     exitSidecarWritten = true;
   }
 
+  /** Stamp the current run identity + last known phase onto a payload. */
+  function stampedSidecar(
+    base: Record<string, unknown>,
+    meta: ExitSidecarMeta,
+  ): Record<string, unknown> {
+    return stampExitSidecar(
+      base,
+      {
+        runId,
+        workerPid: processIdentity?.pid,
+        workerStartTime: processIdentity?.startTime,
+      },
+      { ...meta, lastPhase: meta.lastPhase ?? recorder.currentPhase() },
+    );
+  }
+
   function registerCrashHooks(argv: readonly string[] = process.argv): void {
     const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
     if (!shouldRegisterCrashHooks(targetSessionFile, argv)) return;
@@ -376,10 +430,20 @@ export default function (
     // parent can ignore foreign writes (a stale watcher for a recycled pid
     // would otherwise still reject a mismatched payload).
     const writerIdentity = readCurrentProcessIdentity();
+    const crashIdentity: ExitSidecarRunIdentity = {
+      runId,
+      workerPid: writerIdentity?.pid,
+      workerStartTime: writerIdentity?.startTime,
+    };
 
-    processExitHandler = () => {
+    processExitHandler = (code: number) => {
       try {
-        writeExitSidecar(buildCrashSidecar(CRASH_EXIT_MESSAGE, writerIdentity), targetSessionFile);
+        const exitCode = Number.isInteger(code) ? code : 1;
+        writeExitSidecar(buildCrashSidecar(crashIdentity, {
+          exitCode,
+          lastPhase: recorder.currentPhase(),
+          message: `Subagent process exited before completing (exit code ${exitCode}).`,
+        }), targetSessionFile);
       } catch {
         // Process exit is already in progress; sidecar publication is best effort.
       }
@@ -387,7 +451,11 @@ export default function (
     uncaughtExceptionHandler = (error) => {
       try {
         writeExitSidecar(
-          buildCrashSidecar(uncaughtExceptionMessage(error), writerIdentity),
+          buildCrashSidecar(crashIdentity, {
+            exitCode: 1,
+            lastPhase: recorder.currentPhase(),
+            message: uncaughtExceptionMessage(error),
+          }),
           targetSessionFile,
         );
       } catch {
@@ -427,7 +495,13 @@ export default function (
     const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
     if (targetSessionFile) {
       try {
-        writeExitSidecar(buildCompletionSidecar(latestAgentMessages, wrapupInProgress));
+        const completion = buildCompletionSidecar(latestAgentMessages, wrapupInProgress);
+        writeExitSidecar(stampedSidecar(
+          completion,
+          completion.type === "error"
+            ? { exitCode: 1, message: completion.errorMessage }
+            : { exitCode: 0, message: "completed" },
+        ));
       } catch {
         // Best effort — the watcher can still detect the terminal sentinel
         // after shutdown if the completion sidecar cannot be written.
@@ -694,11 +768,14 @@ export default function (
       }
 
       recorder.callerPing();
-      const exitData = {
-        type: "ping" as const,
-        name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-        message: params.message,
-      };
+      const exitData = stampedSidecar(
+        {
+          type: "ping" as const,
+          name: process.env.PI_SUBAGENT_NAME ?? "subagent",
+          message: params.message,
+        },
+        { exitCode: 0, message: params.message },
+      );
       writeExitSidecar(exitData);
       unregisterCrashHooks();
 
@@ -734,7 +811,10 @@ export default function (
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
       if (sessionFile) {
-        writeExitSidecar({ type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) });
+        writeExitSidecar(stampedSidecar(
+          { type: "done", ...(wrapupInProgress ? { wrapup: true } : {}) },
+          { exitCode: 0, message: "completed" },
+        ));
       }
       unregisterCrashHooks();
       ctx.shutdown();

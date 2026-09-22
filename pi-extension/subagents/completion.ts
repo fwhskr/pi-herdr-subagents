@@ -124,28 +124,43 @@ export interface CompletionOptions {
 }
 
 export interface SidecarWriterIdentity {
-  pid: number;
-  startTime: number;
+  pid?: number;
+  startTime?: number;
+  /** Run identity (PI_SUBAGENT_ID) — the strongest discriminator. */
+  runId?: string;
 }
 
 /**
  * Identity guard for foreign crash-sidecar writes (TASK-327 defense in
- * depth). A crash payload stamped with a worker identity that does not
- * match the lane the watcher is tracking is ignored, so a stray process
- * inheriting PI_SUBAGENT_SESSION can never publish a failure for a real
- * lane. Unstamped payloads (done, ping, provider errors, and crash
+ * depth, extended by TASK-330 with run identity). A crash payload stamped
+ * with a run/worker identity that does not match the lane the watcher is
+ * tracking is ignored, so a stray process inheriting PI_SUBAGENT_SESSION —
+ * or a second pi on the same session file — can never publish a failure for
+ * a real lane. Unstamped payloads (done, ping, provider errors, and crash
  * writes from a platform where /proc identity is unavailable) pass through
- * unchanged so every legitimate path keeps working.
+ * unchanged so every legitimate path keeps working (accept-when-unknown).
  */
 export function isForeignSidecarIdentity(
-  payload: { workerPid?: unknown; workerStartTime?: unknown },
+  payload: { runId?: unknown; workerPid?: unknown; workerStartTime?: unknown },
   expected: SidecarWriterIdentity | undefined,
 ): boolean {
-  const pid = payload.workerPid;
-  const startTime = payload.workerStartTime;
-  if (pid == null && startTime == null) return false;
   if (!expected) return false;
-  return pid !== expected.pid || startTime !== expected.startTime;
+  const payloadHasIdentity =
+    payload.runId != null || payload.workerPid != null || payload.workerStartTime != null;
+  if (!payloadHasIdentity) return false;
+  // Prefer the run id when both sides know it: it survives pid recycling and
+  // is exactly what distinguishes two runs on one shared session file.
+  if (payload.runId != null && expected.runId != null) {
+    return payload.runId !== expected.runId;
+  }
+  if (
+    payload.workerPid != null && payload.workerStartTime != null &&
+    expected.pid != null && expected.startTime != null
+  ) {
+    return payload.workerPid !== expected.pid || payload.workerStartTime !== expected.startTime;
+  }
+  // Identity present but not comparable: never reject on a guess.
+  return false;
 }
 
 export function interpretExitSidecar(data: unknown): CompletionResult {
@@ -200,6 +215,7 @@ function consumeExitSidecar(
     const payload = JSON.parse(readFileSync(exitFile, "utf8")) as {
       type?: unknown;
       stopReason?: unknown;
+      runId?: unknown;
       workerPid?: unknown;
       workerStartTime?: unknown;
     };
@@ -277,11 +293,12 @@ export async function waitForCompletion(
   const startedAt = Date.now();
   let missingPaneDetectedAt: number | undefined;
   let knownWorkerIdentity: SubagentProcessIdentity | undefined;
+  let knownSidecarIdentity: SidecarWriterIdentity | undefined;
 
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile, options.expectedSidecarWriter ?? knownWorkerIdentity);
+    const sidecarResult = consumeExitSidecar(options.sessionFile, options.expectedSidecarWriter ?? knownSidecarIdentity);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {
@@ -309,6 +326,15 @@ export async function waitForCompletion(
       if (read) {
         const candidate = activityWorkerIdentity(read);
         if (candidate && !knownWorkerIdentity) knownWorkerIdentity = candidate;
+        if (read.ok) {
+          knownSidecarIdentity = {
+            ...(read.activity.workerPid != null ? { pid: read.activity.workerPid } : {}),
+            ...(read.activity.workerStartTime != null
+              ? { startTime: read.activity.workerStartTime }
+              : {}),
+            runId: read.activity.runningChildId,
+          };
+        }
         try {
           options.onWorkerActivity?.(read, Date.now());
         } catch {

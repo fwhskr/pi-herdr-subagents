@@ -86,6 +86,12 @@ export interface SubagentActivityRecorder {
   callerPing(): void;
   subagentDone(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
+  /**
+   * Last known lifecycle phase, for stamping truthful exit sidecars. The
+   * noop recorder (no activity file configured) reports undefined so the
+   * sidecar carries no fabricated phase.
+   */
+  currentPhase(): SubagentActivityPhase | undefined;
 }
 
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;
@@ -274,6 +280,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
+  // SAFETY: every field was validated above against the SubagentActivityState
+  // schema; TypeScript cannot narrow the dynamic Record<string, unknown>.
   return { ok: true, activity: object as unknown as SubagentActivityState };
 }
 
@@ -334,6 +342,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     callerPing() {},
     subagentDone() {},
     sessionShutdown() {},
+    currentPhase() { return undefined; },
   };
 }
 
@@ -603,6 +612,9 @@ export function createSubagentActivityRecorder(params: {
     sessionShutdown(reason) {
       if (reason === "quit") markDone("session_shutdown");
       else disable();
+    },
+    currentPhase() {
+      return activity.phase;
     },
   };
 }
