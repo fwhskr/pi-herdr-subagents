@@ -135,6 +135,125 @@ export function findObservedSessionRuntime(entries: SessionEntry[]): ObservedSes
   return observed;
 }
 
+export interface ServedSessionRuntime {
+  provider?: string;
+  modelId?: string;
+  api?: string;
+}
+
+/**
+ * Read the runtime that actually SERVED the child's final assistant turn.
+ *
+ * TASK-336: the runtime-mismatch check used to compare the resolved launch
+ * model against the last *declared* `model_change` (findObservedSessionRuntime)
+ * — a switch target the child may never have run (occurrence #17 named a model
+ * that never served a token). This reads the provider/model/api of the final
+ * assistant `message` entry instead; an error turn still counts, because that
+ * is the provider that attempted to serve it.
+ */
+export function findServedSessionRuntime(entries: SessionEntry[]): ServedSessionRuntime {
+  const served: ServedSessionRuntime = {};
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    const message = (entry as { message?: Record<string, unknown> }).message;
+    if (!message || message.role !== "assistant") continue;
+    if (typeof message.provider !== "string" && typeof message.model !== "string") continue;
+    if (typeof message.provider === "string") served.provider = message.provider;
+    if (typeof message.model === "string") served.modelId = message.model;
+    if (typeof message.api === "string") served.api = message.api;
+  }
+  return served;
+}
+
+export interface SessionFallbackRecord {
+  kind: "agent-fallback" | "provider-failover";
+  from?: string;
+  to?: string;
+  reason?: string;
+}
+
+/**
+ * Read the last recorded failover declaration from the child session. Both the
+ * agent-profile chain (`agent-fallback`) and pi-multi-account
+ * (`provider-failover`) write a `custom` entry whose `data.to` is the fallback
+ * target and `data.reason` the cause.
+ */
+export function findSessionFallbackRecord(entries: SessionEntry[]): SessionFallbackRecord | undefined {
+  let record: SessionFallbackRecord | undefined;
+  for (const entry of entries) {
+    if (entry.type !== "custom") continue;
+    const customType = entry.customType;
+    if (customType !== "agent-fallback" && customType !== "provider-failover") continue;
+    const data = entry.data as Record<string, unknown> | undefined;
+    if (!data || typeof data !== "object") continue;
+    record = {
+      kind: customType,
+      ...(typeof data.from === "string" ? { from: data.from } : {}),
+      ...(typeof data.to === "string" ? { to: data.to } : {}),
+      ...(typeof data.reason === "string" ? { reason: data.reason } : {}),
+    };
+  }
+  return record;
+}
+
+export interface RuntimeObservation {
+  /** Last declared model_change / thinking_level_change (unchanged semantics). */
+  observed: ObservedSessionRuntime;
+  /** Model that served the final assistant turn, when one exists. */
+  served?: { provider: string; modelId: string; api?: string };
+  /** Last declared fallback record, when one exists. */
+  fallback?: SessionFallbackRecord;
+  /**
+   * Reserved for a served model that differs from the resolved launch model
+   * with NO recorded fallback: an unexplained substitution.
+   */
+  runtimeMismatch?: string;
+  /** Informational note when the served model IS the recorded fallback target. */
+  runtimeFallback?: string;
+}
+
+/**
+ * TASK-336: classify what the child session actually did. The mismatch warning
+ * is reserved for a served model that differs from the resolved launch model
+ * with no fallback record; a served fallback target is informational, and a
+ * session whose declared model_change never served a turn is not reported as
+ * having run that model.
+ */
+export function classifyRuntimeObservation(
+  entries: SessionEntry[],
+  resolvedModel: string | undefined,
+): RuntimeObservation {
+  const observed = findObservedSessionRuntime(entries);
+  const servedRuntime = findServedSessionRuntime(entries);
+  const fallback = findSessionFallbackRecord(entries);
+  const served =
+    servedRuntime.provider && servedRuntime.modelId
+      ? {
+          provider: servedRuntime.provider,
+          modelId: servedRuntime.modelId,
+          ...(servedRuntime.api ? { api: servedRuntime.api } : {}),
+        }
+      : undefined;
+  const servedModel = served ? `${served.provider}/${served.modelId}` : undefined;
+
+  const observation: RuntimeObservation = {
+    observed,
+    ...(served ? { served } : {}),
+    ...(fallback ? { fallback } : {}),
+  };
+
+  if (!servedModel || !resolvedModel || servedModel === resolvedModel) return observation;
+
+  if (fallback?.to === servedModel) {
+    observation.runtimeFallback = `Resolved model ${resolvedModel}; fell back to ${servedModel}${
+      fallback.reason ? ` (${fallback.reason})` : ""
+    }`;
+  } else {
+    observation.runtimeMismatch = `Resolved model ${resolvedModel} but child served ${servedModel}`;
+  }
+  return observation;
+}
+
 export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
   // Deep's L-162 phase 2 priority chain:
   // (1) final same-message text; (2) final subagent_done arguments.report (non-empty);

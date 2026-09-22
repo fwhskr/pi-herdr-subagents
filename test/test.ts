@@ -19,6 +19,9 @@ import {
   getNewEntries,
   findLastAssistantMessage,
   findObservedSessionRuntime,
+  findServedSessionRuntime,
+  findSessionFallbackRecord,
+  classifyRuntimeObservation,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
@@ -618,6 +621,189 @@ describe("session.ts", () => {
         ]),
         { provider: "other", modelId: "new", thinking: "medium" },
       );
+    });
+  });
+
+  // TASK-336: the runtime-mismatch check must compare against the model that
+  // actually SERVED the final assistant turn, and must distinguish a declared
+  // fallback from an unexplained substitution. Fixtures are exact session
+  // shapes recovered in TASK-334 under
+  // /home/kris/projects/sade/.artifacts/model-identity-forensics/ — each is
+  // written to a real session file and read back through the production
+  // getNewEntries() reader before classification runs.
+  describe("classifyRuntimeObservation (TASK-336 served-model comparison)", () => {
+    function served(provider: string, model: string, stopReason: string) {
+      return {
+        type: "message",
+        id: `served-${provider}-${model}`,
+        message: {
+          role: "assistant",
+          provider,
+          model,
+          api: "openai-completions",
+          content: [],
+          stopReason,
+        },
+      };
+    }
+
+    // Occurrence #12 (deep 0c2a703d, TASK-330) for agent-fallback; the
+    // 2026-09-17 acbf4ae0 lane for provider-failover. Both are declared
+    // fallbacks that served the final turn.
+    it("AC3a: a declared fallback that serves yields an informational note, never a mismatch", () => {
+      withTempDir((dir) => {
+        const agentFallbackFile = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "openai-codex", modelId: "gpt-6-astra" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "low" },
+          served("openai-codex", "gpt-6-astra", "error"),
+          { type: "model_change", id: "m2", provider: "opencode-go", modelId: "deepseek-v4.1-flash" },
+          { type: "thinking_level_change", id: "t2", thinkingLevel: "max" },
+          { type: "thinking_level_change", id: "t3", thinkingLevel: "high" },
+          {
+            type: "custom",
+            id: "f1",
+            customType: "agent-fallback",
+            data: {
+              from: "openai-codex/gpt-6-astra",
+              to: "opencode-go/deepseek-v4.1-flash",
+              reason: "provider-limit",
+              status: "continuation-requested",
+            },
+          },
+          served("opencode-go", "deepseek-v4.1-flash", "toolUse"),
+        ]);
+        const agentEntries = getNewEntries(agentFallbackFile, 0);
+        assert.equal(findServedSessionRuntime(agentEntries).modelId, "deepseek-v4.1-flash");
+        assert.equal(
+          findSessionFallbackRecord(agentEntries)?.to,
+          "opencode-go/deepseek-v4.1-flash",
+        );
+        const agentObservation = classifyRuntimeObservation(
+          agentEntries,
+          "openai-codex/gpt-6-astra",
+        );
+        assert.equal(agentObservation.runtimeMismatch, undefined);
+        const note = agentObservation.runtimeFallback ?? "";
+        assert.match(note, /Resolved model openai-codex\/gpt-6-astra/);
+        assert.match(note, /fell back to opencode-go\/deepseek-v4\.1-flash/);
+        assert.match(note, /\(provider-limit\)/);
+        assert.equal(agentObservation.served?.modelId, "deepseek-v4.1-flash");
+
+        const providerFailoverFile = createSessionFile(dir, [
+          { type: "session", id: "s2" },
+          { type: "model_change", id: "p1", provider: "openai-codex", modelId: "gpt-5.6-luna" },
+          { type: "model_change", id: "p2", provider: "zai", modelId: "glm-5.3-flash" },
+          {
+            type: "custom",
+            id: "pf1",
+            customType: "provider-failover",
+            data: {
+              from: "openai-codex/gpt-5.6-luna",
+              to: "zai/glm-5.3-flash",
+              reason: "assistant error: Codex error: The usage limit has been reached",
+            },
+          },
+          served("zai", "glm-5.3-flash", "toolUse"),
+        ]);
+        const failoverObservation = classifyRuntimeObservation(
+          getNewEntries(providerFailoverFile, 0),
+          "openai-codex/gpt-5.6-luna",
+        );
+        assert.equal(failoverObservation.runtimeMismatch, undefined);
+        assert.match(failoverObservation.runtimeFallback ?? "", /fell back to zai\/glm-5\.3-flash/);
+      });
+    });
+
+    // Occurrence #17 (Halo fab8ec27): the child declared a fallback model in a
+    // model_change but the only turn it ever served was the primary error. The
+    // check must not report the child as having run the declared model.
+    it("AC3b: a declared fallback that never served (error-terminated) reports no foreign model", () => {
+      withTempDir((dir) => {
+        const file = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "openai-codex", modelId: "gpt-6-astra" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "low" },
+          {
+            type: "message",
+            id: "err",
+            message: {
+              role: "assistant",
+              provider: "openai-codex",
+              model: "gpt-6-astra",
+              api: "openai-codex-responses",
+              content: [],
+              stopReason: "error",
+              errorMessage: "Codex error: The usage limit has been reached",
+            },
+          },
+          { type: "model_change", id: "m2", provider: "deepseek", modelId: "deepseek-flash" },
+          { type: "thinking_level_change", id: "t2", thinkingLevel: "max" },
+          { type: "thinking_level_change", id: "t3", thinkingLevel: "high" },
+          {
+            type: "custom",
+            id: "f1",
+            customType: "agent-fallback",
+            data: {
+              from: "openai-codex/gpt-6-astra",
+              to: "deepseek/deepseek-flash",
+              reason: "provider-limit",
+              status: "continuation-requested",
+            },
+          },
+        ]);
+        const observation = classifyRuntimeObservation(
+          getNewEntries(file, 0),
+          "openai-codex/gpt-6-astra",
+        );
+        assert.equal(observation.runtimeMismatch, undefined);
+        assert.equal(observation.runtimeFallback, undefined);
+        assert.equal(observation.served?.modelId, "gpt-6-astra");
+      });
+    });
+
+    // Occurrences #18 f04cbe16 / #19 cea24d91 / #21 80b35c56: the final turn
+    // was served by a different model with no fallback entry anywhere.
+    it("AC3c: an unrecorded served-model substitution warns, naming the served model", () => {
+      withTempDir((dir) => {
+        const file = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "zai", modelId: "glm-5.3-flash" },
+          { type: "thinking_level_change", id: "t1", thinkingLevel: "high" },
+          served("zai", "glm-5.3-flash", "toolUse"),
+          { type: "model_change", id: "m2", provider: "deepseek", modelId: "deepseek-flash" },
+          { type: "thinking_level_change", id: "t2", thinkingLevel: "max" },
+          served("deepseek", "deepseek-flash", "toolUse"),
+        ]);
+        const observation = classifyRuntimeObservation(
+          getNewEntries(file, 0),
+          "zai/glm-5.3-flash",
+        );
+        const mismatch = observation.runtimeMismatch ?? "";
+        assert.match(mismatch, /Resolved model zai\/glm-5\.3-flash/);
+        assert.match(mismatch, /but child served deepseek\/deepseek-flash/);
+        assert.ok(!mismatch.includes("child reported"), "must name the SERVED model, not the declared one");
+        assert.equal(observation.runtimeFallback, undefined);
+      });
+    });
+
+    // A trailing declared change that never served must not fabricate a
+    // mismatch now that the check follows the served turn.
+    it("AC3d: identical resolved/served emits neither a mismatch nor a fallback note", () => {
+      withTempDir((dir) => {
+        const file = createSessionFile(dir, [
+          { type: "session", id: "s" },
+          { type: "model_change", id: "m1", provider: "openai-codex", modelId: "gpt-6-astra" },
+          served("openai-codex", "gpt-6-astra", "toolUse"),
+          { type: "model_change", id: "m2", provider: "deepseek", modelId: "deepseek-flash" },
+        ]);
+        const observation = classifyRuntimeObservation(
+          getNewEntries(file, 0),
+          "openai-codex/gpt-6-astra",
+        );
+        assert.equal(observation.runtimeMismatch, undefined);
+        assert.equal(observation.runtimeFallback, undefined);
+      });
     });
   });
 

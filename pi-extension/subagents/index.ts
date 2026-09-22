@@ -54,9 +54,9 @@ import {
 import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
 
 import {
+  classifyRuntimeObservation,
   classifySessionFailure,
   findLastAssistantMessage,
-  findObservedSessionRuntime,
   getNewEntries,
   seedSubagentSessionFile,
 } from "./session.ts";
@@ -2426,30 +2426,38 @@ async function watchSubagent(
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
       failureKind = classifySessionFailure(allEntries);
-      const observed = findObservedSessionRuntime(allEntries);
-      if (running.runtimePlan && observed.provider && observed.modelId) {
-        const observedModel = `${observed.provider}/${observed.modelId}`;
+      if (running.runtimePlan) {
+        const observation = classifyRuntimeObservation(allEntries, running.runtimePlan.model);
         const observedThinking =
-          observed.thinking === "off" ||
-          observed.thinking === "minimal" ||
-          observed.thinking === "low" ||
-          observed.thinking === "medium" ||
-          observed.thinking === "high" ||
-          observed.thinking === "xhigh" ||
-          observed.thinking === "max"
-            ? observed.thinking
+          observation.observed.thinking === "off" ||
+          observation.observed.thinking === "minimal" ||
+          observation.observed.thinking === "low" ||
+          observation.observed.thinking === "medium" ||
+          observation.observed.thinking === "high" ||
+          observation.observed.thinking === "xhigh" ||
+          observation.observed.thinking === "max"
+            ? observation.observed.thinking
             : undefined;
-        const mismatch = observedModel !== running.runtimePlan.model
-          ? `Resolved model ${running.runtimePlan.model} but child reported ${observedModel}`
-          : undefined;
+        // Prefer the model that actually served the final turn; fall back to the
+        // last declared change only when no assistant turn served a model.
+        const observedModel = observation.served
+          ? `${observation.served.provider}/${observation.served.modelId}`
+          : observation.observed.provider && observation.observed.modelId
+            ? `${observation.observed.provider}/${observation.observed.modelId}`
+            : undefined;
         running.runtimePlan = {
           ...running.runtimePlan,
           ...(observedThinking ? { thinking: observedThinking } : {}),
-          observed: {
-            model: observedModel,
-            ...(observedThinking ? { thinking: observedThinking } : {}),
-          },
-          ...(mismatch ? { runtimeMismatch: mismatch } : {}),
+          ...(observedModel
+            ? {
+                observed: {
+                  model: observedModel,
+                  ...(observedThinking ? { thinking: observedThinking } : {}),
+                },
+              }
+            : {}),
+          ...(observation.runtimeMismatch ? { runtimeMismatch: observation.runtimeMismatch } : {}),
+          ...(observation.runtimeFallback ? { runtimeFallback: observation.runtimeFallback } : {}),
         };
       }
       summary =
@@ -2893,8 +2901,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const basePresentation = resolveResultPresentation(result, running.name);
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
+            const runtimeNote = running.runtimePlan?.runtimeMismatch
+              ? `Runtime warning: ${running.runtimePlan.runtimeMismatch}`
+              : running.runtimePlan?.runtimeFallback
+                ? `Runtime note: ${running.runtimePlan.runtimeFallback}`
+                : undefined;
+            const presentation = runtimeNote
+              ? `${basePresentation}\n\n${runtimeNote}`
               : basePresentation;
 
             completionApi.sendMessage(
@@ -3442,8 +3455,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               { ...result, summary, sessionFile: params.sessionPath, failureKind },
               name,
             );
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
+            const runtimeNote = running.runtimePlan?.runtimeMismatch
+              ? `Runtime warning: ${running.runtimePlan.runtimeMismatch}`
+              : running.runtimePlan?.runtimeFallback
+                ? `Runtime note: ${running.runtimePlan.runtimeFallback}`
+                : undefined;
+            const presentation = runtimeNote
+              ? `${basePresentation}\n\n${runtimeNote}`
               : basePresentation;
 
             completionApi.sendMessage(
