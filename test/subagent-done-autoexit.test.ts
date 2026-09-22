@@ -7,6 +7,7 @@ import subagentDoneExtension, {
   resolveAutoExit,
   resolveFallbackAwareExit,
 } from "../pi-extension/subagents/subagent-done.ts";
+import { readCurrentProcessIdentity } from "../pi-extension/subagents/activity.ts";
 
 // L-95 — auto-exit hardening: operator input / Escape permanently disarms,
 // /auto-exit re-arms for exactly one completion. Child-side only.
@@ -60,6 +61,8 @@ const origSession = process.env.PI_SUBAGENT_SESSION;
 const origAgent = process.env.PI_SUBAGENT_AGENT;
 const origAgentDir = process.env.PI_CODING_AGENT_DIR;
 const origGuardMs = process.env.PI_SUBAGENT_FALLBACK_GUARD_MS;
+const origSubagentId = process.env.PI_SUBAGENT_ID;
+const origActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name];
@@ -70,6 +73,11 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
   let dir: string | undefined;
 
   beforeEach(() => {
+    // Isolate from an inherited parent/child identity so the stamped sidecar
+    // shape is deterministic and the recorder cannot write into a real
+    // session's activity file.
+    delete process.env.PI_SUBAGENT_ID;
+    delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
     dir = mkdtempSync(join(tmpdir(), "l95-autoexit-"));
   });
 
@@ -79,6 +87,8 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     restoreEnv("PI_SUBAGENT_AGENT", origAgent);
     restoreEnv("PI_CODING_AGENT_DIR", origAgentDir);
     restoreEnv("PI_SUBAGENT_FALLBACK_GUARD_MS", origGuardMs);
+    restoreEnv("PI_SUBAGENT_ID", origSubagentId);
+    restoreEnv("PI_SUBAGENT_ACTIVITY_FILE", origActivityFile);
     if (dir) rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
@@ -168,6 +178,27 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     return JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8"));
   }
 
+  const TEST_PROCESS_IDENTITY = readCurrentProcessIdentity();
+  function identityFields(): Record<string, unknown> {
+    return TEST_PROCESS_IDENTITY
+      ? { workerPid: TEST_PROCESS_IDENTITY.pid, workerStartTime: TEST_PROCESS_IDENTITY.startTime }
+      : {};
+  }
+  /** Every exit sidecar now carries run identity + terminal metadata (TASK-330). */
+  function doneSidecar(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return { type: "done", exitCode: 0, message: "completed", ...identityFields(), ...extra };
+  }
+  function errorSidecar(errorMessage: string): Record<string, unknown> {
+    return {
+      type: "error",
+      errorMessage,
+      stopReason: "error",
+      exitCode: 1,
+      message: errorMessage,
+      ...identityFields(),
+    };
+  }
+
   // TASK-327: every boot() installs the REAL extension, so every test must
   // release any process "exit" listeners it did not own. Wrap the two bare
   // multi-child cases; the single-child cases below are covered by the new
@@ -211,7 +242,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       child.fire("input", { type: "input", text: "do the whole task" });
       child.settle([{ role: "assistant", stopReason: "stop" }]);
       assert.equal(child.ctx.shutdowns, 1, "zero-real-input child still exits");
-      assert.deepEqual(sidecarOf(child), { type: "done" });
+      assert.deepEqual(sidecarOf(child), doneSidecar());
       assert.equal(child.notifications.length, 0, "no warning for the injected task");
     } finally {
       child.releaseCrashHooks();
@@ -249,7 +280,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       },
     ]);
     assert.equal(child.ctx.shutdowns, 1, "later final assistant turn exits");
-    assert.deepEqual(sidecarOf(child), { type: "done" });
+    assert.deepEqual(sidecarOf(child), doneSidecar());
   });
 
   it("publishes an injected tool or policy error as a failure", () => {
@@ -263,11 +294,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       },
     ]);
     assert.equal(child.ctx.shutdowns, 1, "terminal tool error wakes the parent");
-    assert.deepEqual(sidecarOf(child), {
-      type: "error",
-      errorMessage: "Tool execution blocked by policy",
-      stopReason: "error",
-    });
+    assert.deepEqual(sidecarOf(child), errorSidecar("Tool execution blocked by policy"));
   });
 
   it("keeps a policy-denied tool boundary open before reporting terminal failure", () => {
@@ -298,11 +325,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       },
     ]);
     assert.equal(child.ctx.shutdowns, 1, "later terminal error wakes the parent");
-    assert.deepEqual(sidecarOf(child), {
-      type: "error",
-      errorMessage: "Tool execution blocked by policy",
-      stopReason: "error",
-    });
+    assert.deepEqual(sidecarOf(child), errorSidecar("Tool execution blocked by policy"));
   });
 
   it("does not treat a wrap-up tool-use boundary as the report", () => {
@@ -329,7 +352,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       },
     ]);
     assert.equal(child.ctx.shutdowns, 1, "wrap-up exits on its final report");
-    assert.deepEqual(sidecarOf(child), { type: "done", wrapup: true });
+    assert.deepEqual(sidecarOf(child), doneSidecar({ wrapup: true }));
   });
 
   it("operator input disarms auto-exit persistently across settled turns", () => {
@@ -382,7 +405,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
 
     child.settle([{ role: "assistant", stopReason: "stop" }]);
     assert.equal(child.ctx.shutdowns, 1, "re-armed child exits on next completion");
-    assert.deepEqual(sidecarOf(child), { type: "done" }, "done sidecar written");
+    assert.deepEqual(sidecarOf(child), doneSidecar(), "done sidecar written");
 
     // One-shot consumed: another settled completion does not exit again.
     child.settle([{ role: "assistant", stopReason: "stop" }]);
@@ -406,18 +429,14 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       assert.equal(existsSync(`${child.sessionFile}.exit`), false);
       child.fire("agent_settled", { type: "agent_settled" });
       assert.equal(child.ctx.shutdowns, 1);
-      assert.deepEqual(sidecarOf(child), { type: "done" });
+      assert.deepEqual(sidecarOf(child), doneSidecar());
       assert.equal(child.notifications.length, 0, "silent for background children");
 
       failing.settle([
         { role: "assistant", stopReason: "error", errorMessage: "529 overloaded" },
       ]);
       assert.equal(failing.ctx.shutdowns, 1, "error stopReason still wakes the parent");
-      assert.deepEqual(sidecarOf(failing), {
-        type: "error",
-        errorMessage: "529 overloaded",
-        stopReason: "error",
-      });
+      assert.deepEqual(sidecarOf(failing), errorSidecar("529 overloaded"));
     } finally {
       child.releaseCrashHooks();
       failing.releaseCrashHooks();
@@ -573,14 +592,14 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       const child = boot({ entries });
       child.settle([errorAssistant]);
       assert.equal(child.ctx.shutdowns, 1, "exhausted recovery still wakes the parent");
-      assert.deepEqual(sidecarOf(child), { type: "error", errorMessage, stopReason: "error" });
+      assert.deepEqual(sidecarOf(child), errorSidecar(errorMessage));
     });
 
     it("error + no declared fallback chain exits immediately", () => {
       const child = boot({ entries: [] });
       child.settle([errorAssistant]);
       assert.equal(child.ctx.shutdowns, 1, "no chain means no grace");
-      assert.deepEqual(sidecarOf(child), { type: "error", errorMessage, stopReason: "error" });
+      assert.deepEqual(sidecarOf(child), errorSidecar(errorMessage));
     });
 
     it("a recovered turn_start cancels the bounded deferral guard", async () => {
@@ -605,7 +624,7 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       assert.equal(child.ctx.shutdowns, 0, "grace defers while the async switch races");
       await delay(300);
       assert.equal(child.ctx.shutdowns, 1, "bounded grace expires to the original failure");
-      assert.deepEqual(sidecarOf(child), { type: "error", errorMessage, stopReason: "error" });
+      assert.deepEqual(sidecarOf(child), errorSidecar(errorMessage));
     });
 
     it("grace recovers when the fallback entry lands before the guard expires", async () => {

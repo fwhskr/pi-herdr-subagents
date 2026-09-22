@@ -1,9 +1,10 @@
-import { describe, it, afterEach } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+import { readCurrentProcessIdentity } from "../pi-extension/subagents/activity.ts";
 import { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
@@ -37,8 +38,33 @@ const originalEnv = {
   resumeInput: process.env.PI_SUBAGENT_RESUME_INPUT,
   session: process.env.PI_SUBAGENT_SESSION,
   interruptGrace: process.env.PI_SUBAGENT_INTERRUPT_GRACE_MS,
+  subagentId: process.env.PI_SUBAGENT_ID,
+  activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
 };
 const tempDirs = new Set<string>();
+
+// Keep the child sidecar shape deterministic and never write activity into a
+// real session's artifact dir when the test process inherits these variables.
+before(() => {
+  delete process.env.PI_SUBAGENT_ID;
+  delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+});
+after(() => {
+  restoreEnv("PI_SUBAGENT_ID", originalEnv.subagentId);
+  restoreEnv("PI_SUBAGENT_ACTIVITY_FILE", originalEnv.activityFile);
+});
+
+const TEST_PROCESS_IDENTITY = readCurrentProcessIdentity();
+function doneSidecar(): Record<string, unknown> {
+  return {
+    type: "done",
+    exitCode: 0,
+    message: "completed",
+    ...(TEST_PROCESS_IDENTITY
+      ? { workerPid: TEST_PROCESS_IDENTITY.pid, workerStartTime: TEST_PROCESS_IDENTITY.startTime }
+      : {}),
+  };
+}
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value == null) delete process.env[name];
@@ -186,7 +212,7 @@ describe("F-108 resumed auto-exit", () => {
       child.fire("agent_settled");
 
       assert.equal(child.ctx.shutdowns, 1);
-      assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), { type: "done" });
+      assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), doneSidecar());
       const result = await waitForCompletion(new AbortController().signal, {
         intervalMs: 1,
         sessionFile: child.sessionFile,
@@ -208,7 +234,7 @@ describe("F-108 resumed auto-exit", () => {
       child.fire("agent_settled");
 
       assert.equal(child.ctx.shutdowns, 1, "resume re-arms one-shot completion");
-      assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), { type: "done" });
+      assert.deepEqual(JSON.parse(readFileSync(`${child.sessionFile}.exit`, "utf8")), doneSidecar());
 
       const result = await waitForCompletion(new AbortController().signal, {
         intervalMs: 1,

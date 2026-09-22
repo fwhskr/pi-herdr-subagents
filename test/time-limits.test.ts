@@ -1,10 +1,11 @@
-import { describe, it } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
+import { readCurrentProcessIdentity } from "../pi-extension/subagents/activity.ts";
 import { interpretExitSidecar } from "../pi-extension/subagents/completion.ts";
 import {
   REPORT_ONLY_WRAPUP_DIRECTIVE,
@@ -21,6 +22,35 @@ function withTempDir(run: (dir: string) => void) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// Isolate the child sidecar shape from an inherited parent identity and keep
+// the recorder from writing into a real session's activity file.
+const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
+const inheritedActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+before(() => {
+  delete process.env.PI_SUBAGENT_ID;
+  delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+});
+after(() => {
+  if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
+  else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
+  if (inheritedActivityFile == null) delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+  else process.env.PI_SUBAGENT_ACTIVITY_FILE = inheritedActivityFile;
+});
+
+const TEST_PROCESS_IDENTITY = readCurrentProcessIdentity();
+/** TASK-330: the wrap-up completion sidecar now carries run identity + meta. */
+function wrapupDoneSidecar(): Record<string, unknown> {
+  return {
+    type: "done",
+    wrapup: true,
+    exitCode: 0,
+    message: "completed",
+    ...(TEST_PROCESS_IDENTITY
+      ? { workerPid: TEST_PROCESS_IDENTITY.pid, workerStartTime: TEST_PROCESS_IDENTITY.startTime }
+      : {}),
+  };
 }
 
 function makeRunning(overrides: Record<string, unknown> = {}) {
@@ -388,10 +418,7 @@ describe("wrap-up directive and completion delivery", () => {
         agentEnd({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
         agentSettled({}, ctx);
         assert.equal(shutdowns, 1);
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
-          type: "done",
-          wrapup: true,
-        });
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), wrapupDoneSidecar());
         assert.deepEqual(interpretExitSidecar({ type: "done", wrapup: true }), {
           reason: "done",
           exitCode: 0,
@@ -545,10 +572,7 @@ describe("wrap-up × auto-exit disarm interaction guard (L-95 × L-96 merge)", (
         child.fire("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
         child.fire("agent_settled", {});
         assert.equal(child.getShutdowns(), 1, "settled wrap-up turn exits with the partial report");
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
-          type: "done",
-          wrapup: true,
-        });
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), wrapupDoneSidecar());
         assert.equal(
           child.notifications.filter((notification) => notification.type === "warning").length,
           0,

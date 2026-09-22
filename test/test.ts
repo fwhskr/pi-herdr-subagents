@@ -46,6 +46,7 @@ import {
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
+  readCurrentProcessIdentity,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import subagentDoneExtension, {
@@ -56,7 +57,6 @@ import subagentDoneExtension, {
   isSubagentSessionHost,
   shouldRegisterCrashHooks,
   buildCrashSidecar,
-  CRASH_EXIT_MESSAGE,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { interpretExitSidecar, waitForCompletion, isForeignSidecarIdentity } from "../pi-extension/subagents/completion.ts";
 import {
@@ -76,17 +76,32 @@ import {
 // Isolate the unit suite from inherited parent/child capability variables.
 const inheritedSubagentId = process.env.PI_SUBAGENT_ID;
 const inheritedDenyTools = process.env.PI_DENY_TOOLS;
+const inheritedActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
 before(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
+  delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
 });
 const createdTestDirs: string[] = [];
+
+// Deterministic process identity for the sidecar-shape assertions; the
+// extension captures the same value at instantiation.
+const TEST_PROCESS_IDENTITY = readCurrentProcessIdentity();
+
+/** Expected run-identity fields on every sidecar written by this test process. */
+function stampedIdentity(): Record<string, unknown> {
+  return TEST_PROCESS_IDENTITY
+    ? { workerPid: TEST_PROCESS_IDENTITY.pid, workerStartTime: TEST_PROCESS_IDENTITY.startTime }
+    : {};
+}
 
 after(() => {
   if (inheritedSubagentId == null) delete process.env.PI_SUBAGENT_ID;
   else process.env.PI_SUBAGENT_ID = inheritedSubagentId;
   if (inheritedDenyTools == null) delete process.env.PI_DENY_TOOLS;
   else process.env.PI_DENY_TOOLS = inheritedDenyTools;
+  if (inheritedActivityFile == null) delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+  else process.env.PI_SUBAGENT_ACTIVITY_FILE = inheritedActivityFile;
   for (const dir of createdTestDirs) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1710,6 +1725,9 @@ describe("subagent-done.ts", () => {
             type: "error",
             errorMessage: "latest failure",
             stopReason: "error",
+            exitCode: 1,
+            message: "latest failure",
+            ...stampedIdentity(),
           });
         } finally {
           for (const handler of process.listeners("exit")) {
@@ -1818,14 +1836,32 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldRegisterCrashHooks(undefined, childArgvFor(sf)), false);
     });
 
-    it("stamps the crash sidecar with the writer identity", () => {
-      assert.deepEqual(buildCrashSidecar(CRASH_EXIT_MESSAGE, { pid: 1, startTime: 2 }), {
-        type: "error",
-        errorMessage: CRASH_EXIT_MESSAGE,
-        workerPid: 1,
-        workerStartTime: 2,
-      });
-      assert.deepEqual(buildCrashSidecar("boom", undefined), { type: "error", errorMessage: "boom" });
+    it("stamps the crash sidecar with the writer identity and the terminal cause", () => {
+      assert.deepEqual(
+        buildCrashSidecar(
+          { runId: "run-1", workerPid: 1, workerStartTime: 2 },
+          { exitCode: 3, lastPhase: "active", message: "boom" },
+        ),
+        {
+          type: "error",
+          errorMessage: "boom",
+          message: "boom",
+          runId: "run-1",
+          workerPid: 1,
+          workerStartTime: 2,
+          exitCode: 3,
+          lastPhase: "active",
+        },
+      );
+      assert.deepEqual(
+        buildCrashSidecar({}, { exitCode: 1, message: "Subagent process exited before completing (exit code 1)." }),
+        {
+          type: "error",
+          errorMessage: "Subagent process exited before completing (exit code 1).",
+          message: "Subagent process exited before completing (exit code 1).",
+          exitCode: 1,
+        },
+      );
     });
   });
 
