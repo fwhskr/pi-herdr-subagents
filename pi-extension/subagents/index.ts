@@ -775,6 +775,26 @@ function resolveResultPresentation(
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
 
+  // TASK-326 AC5: an explicit/parent interrupt is a parent-owned lifecycle
+  // stop. It carries no provider errorMessage, so without this branch it fell
+  // through to the bare exit-code wording ("failed (exit code 130)"). It is
+  // rendered as interrupted and never as a provider failure.
+  if (result.failureKind === "interrupted") {
+    return (
+      `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)}.\n\n` +
+      `The session remains on disk and can be resumed with subagent_resume.${sessionRef}`
+    );
+  }
+
+  // TASK-326 AC6: a hard time-limit stop is a parent-initiated lifecycle stop
+  // that likewise carries no provider errorMessage; name it as such.
+  if (result.failureKind === "time-limit") {
+    return (
+      `Sub-agent "${name}" was stopped at its hard time limit after ` +
+      `${formatElapsed(result.elapsed)}.\n\n${result.summary}${sessionRef}`
+    );
+  }
+
   // TASK-326: classify what actually happened. Only genuine
   // provider/transport failures keep the provider wording verbatim;
   // operator interrupts/closes and no-result exits render distinctly so the
@@ -790,6 +810,19 @@ function resolveResultPresentation(
   if (result.errorMessage && result.failureKind === "no-result") {
     return (
       `Sub-agent "${name}" exited without producing a result after ${formatElapsed(result.elapsed)}.\n\n` +
+      `Error: ${result.errorMessage}\n\n` +
+      `The subagent did not produce a result. You can retry by spawning a new ` +
+      `subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
+
+  // TASK-326 AC6: a recovery/watchdog kill is a parent-initiated lifecycle
+  // stop, not a provider outage. Without this branch it rendered as
+  // "provider/agent error — auto-retry exhausted", the exact misleading
+  // report this task exists to remove.
+  if (result.errorMessage && result.failureKind === "watchdog") {
+    return (
+      `Sub-agent "${name}" was killed by the recovery watchdog after ${formatElapsed(result.elapsed)}.\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_resume.${sessionRef}`
@@ -829,7 +862,13 @@ function buildResultTimeoutDetails(result: Pick<SubagentResult, "partial" | "tim
   };
 }
 
-export type SubagentFailureKind = "provider" | "operator" | "no-result";
+export type SubagentFailureKind =
+  | "provider"
+  | "operator"
+  | "interrupted"
+  | "no-result"
+  | "watchdog"
+  | "time-limit";
 
 /**
  * Result from running a single subagent.
@@ -1451,6 +1490,10 @@ function buildRecoveryKilledResult(running: RunningSubagent, now: number): Subag
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
     error: recoveryKilled.errorMessage,
     errorMessage: recoveryKilled.errorMessage,
+    // TASK-326 AC6: a recovery/watchdog kill is a parent lifecycle stop, not
+    // a provider failure; assigned here because this result is returned before
+    // the transcript classification runs.
+    failureKind: "watchdog",
   };
 }
 
@@ -1465,6 +1508,9 @@ function buildInterruptedResult(running: RunningSubagent, now: number): Subagent
     exitCode: INTERRUPTED_EXIT_CODE,
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
     error: "interrupted",
+    // TASK-326 AC5: assigned at construction so every early return of this
+    // result is classified without depending on a later code path.
+    failureKind: "interrupted",
   };
 }
 
@@ -1553,6 +1599,8 @@ function buildTimeLimitStoppedResult(running: RunningSubagent, now: number): Sub
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1_000),
     error: stopped.errorMessage,
     timeout: "hard-stop",
+    // TASK-326 AC6: hard time-limit stop, assigned at construction.
+    failureKind: "time-limit",
   };
 }
 
@@ -2588,9 +2636,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
                   ...buildResultTimeoutDetails(result),
-                  ...(result.errorMessage
-                    ? { errorMessage: result.errorMessage, failureKind: result.failureKind }
-                    : {}),
+                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.failureKind ? { failureKind: result.failureKind } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
@@ -3058,7 +3105,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const failureKind = classifySessionFailure(allEntries);
+            // Preserve a kind the watcher's own lifecycle builders already
+            // assigned (interrupt/watchdog/time-limit); only classify from the
+            // transcript when no kind survived.
+            const failureKind = result.failureKind ?? classifySessionFailure(allEntries);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
@@ -3085,9 +3135,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
                   ...buildResultTimeoutDetails(result),
-                  ...(result.errorMessage
-                    ? { errorMessage: result.errorMessage, failureKind }
-                    : {}),
+                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(failureKind ? { failureKind } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
               },
@@ -3210,12 +3259,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           : partial
             ? theme.fg("warning", "⚠")
             : theme.fg("success", "✓");
-        const status = errorMessage
-          ? failureKind === "operator"
+        // TASK-326: a known failure kind owns the label whether or not an
+        // errorMessage is present (interrupts and hard time-limit stops carry
+        // none). Legacy errorMessages with no kind keep the provider wording.
+        const knownKind =
+          failureKind === "provider" ||
+          failureKind === "operator" ||
+          failureKind === "interrupted" ||
+          failureKind === "no-result" ||
+          failureKind === "watchdog" ||
+          failureKind === "time-limit";
+        const kindStatus =
+          failureKind === "operator"
             ? "interrupted (closed)"
-            : failureKind === "no-result"
-              ? "failed (no result)"
-              : "failed (provider/agent error)"
+            : failureKind === "interrupted"
+              ? "interrupted"
+              : failureKind === "no-result"
+                ? "failed (no result)"
+                : failureKind === "watchdog"
+                  ? "killed (recovery watchdog)"
+                  : failureKind === "time-limit"
+                    ? "stopped (time limit)"
+                    : "failed (provider/agent error)";
+        const status = errorMessage || knownKind
+          ? kindStatus
           : failed
             ? `failed (exit ${exitCode})`
             : partial

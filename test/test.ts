@@ -3684,6 +3684,86 @@ describe("TASK-326 failure kind assignment in the production watcher", () => {
     assert.doesNotMatch(presentation, /provider\/agent error/);
     assert.doesNotMatch(presentation, /closed by the operator/i);
   });
+
+  // AC5/AC6 (audit 2026-09-22): the parent-interrupt and parent-initiated
+  // lifecycle-stop results are built and returned BEFORE the transcript
+  // classification above, so their kind must be assigned where those results
+  // are constructed. These cases drive the real production watcher with the
+  // parent-owned state the interrupt/watchdog/time-limit paths set.
+  async function runWatcherWith(
+    dir: string,
+    entries: object[],
+    overrides: Record<string, unknown>,
+  ) {
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    writeFileSync(
+      `${sessionFile}.exit`,
+      JSON.stringify({ type: "error", errorMessage: "Subagent process exited unexpectedly." }),
+    );
+    const startTime = Date.now() - 31_000;
+    return await testApi.watchSubagent(
+      {
+        id: "t326-child",
+        name: "Worker",
+        task: "t326",
+        surface: "pane-t326",
+        startTime,
+        sessionFile,
+        interactive: false,
+        lifecycle: createLifecycle(startTime),
+        ...overrides,
+      },
+      new AbortController().signal,
+    );
+  }
+
+  it("(AC5) reports an explicit parent interrupt as interrupted, not a bare exit code", async () => {
+    const result = await runWatcherWith(createTestDir(), [assistantEntry("toolUse")], {
+      interrupted: {
+        errorMessage: "Subagent interrupted by parent after the grace period.",
+        interruptedAt: Date.now(),
+      },
+    });
+    assert.equal(result.failureKind, "interrupted");
+    assert.equal(result.exitCode, 130);
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /interrupted/i);
+    assert.match(presentation, /was interrupted after/);
+    assert.doesNotMatch(presentation, /exit code 130/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
+
+  it("(AC6) reports a recovery-watchdog kill distinctly from a provider failure", async () => {
+    const result = await runWatcherWith(createTestDir(), [assistantEntry("toolUse")], {
+      recoveryKilled: {
+        errorMessage: "Subagent stalled for 120s; recovery watchdog killed it.",
+        killedAt: Date.now(),
+      },
+    });
+    assert.equal(result.failureKind, "watchdog");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /was killed by the recovery watchdog after/);
+    assert.match(presentation, /stalled for 120s; recovery watchdog killed it/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
+
+  it("(AC6) reports a hard time-limit stop distinctly from a provider failure", async () => {
+    const result = await runWatcherWith(createTestDir(), [assistantEntry("toolUse")], {
+      timeLimitStopped: {
+        errorMessage: "Subagent reached its hard time limit.",
+        stoppedAt: Date.now(),
+      },
+    });
+    assert.equal(result.failureKind, "time-limit");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /was stopped at its hard time limit after/);
+    assert.doesNotMatch(presentation, /failed \(exit code/);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
 });
 
 describe("subagent status renderer", () => {
@@ -3731,6 +3811,12 @@ describe("subagent status renderer", () => {
     assert.match(headerFor("operator"), /interrupted \(closed\)/);
     assert.match(headerFor("no-result"), /failed \(no result\)/);
     assert.match(headerFor("provider"), /failed \(provider\/agent error\)/);
+    assert.match(headerFor("interrupted"), /interrupted/);
+    assert.doesNotMatch(headerFor("interrupted"), /exit 130/);
+    assert.match(headerFor("watchdog"), /watchdog/i);
+    assert.doesNotMatch(headerFor("watchdog"), /provider\/agent error/);
+    assert.match(headerFor("time-limit"), /time limit/i);
+    assert.doesNotMatch(headerFor("time-limit"), /provider\/agent error/);
   });
 
   it("renders only capped lines plus overflow", () => {
