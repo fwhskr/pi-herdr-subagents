@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -274,6 +274,29 @@ const TOOL_RESULT = {
 };
 
 // --- Tests ---
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+describe("repository pi configuration", () => {
+  it("declares bundled extensions exactly once across package.json and .pi/settings.json", () => {
+    const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as {
+      pi?: { extensions?: string[] };
+    };
+    const projectSettings = JSON.parse(readFileSync(join(REPO_ROOT, ".pi", "settings.json"), "utf8")) as {
+      extensions?: string[];
+    };
+    const packageExtensions = (packageJson.pi?.extensions ?? []).map((entry) => resolve(REPO_ROOT, entry));
+    const projectExtensions = (projectSettings.extensions ?? []).map((entry) =>
+      resolve(REPO_ROOT, ".pi", entry),
+    );
+    const duplicates = projectExtensions.filter((entry) => packageExtensions.includes(entry));
+    assert.deepEqual(
+      duplicates,
+      [],
+      `.pi/settings.json must not re-declare a package extension; the duplicate registration is fatal: ${duplicates.join(", ")}`,
+    );
+  });
+});
 
 describe("session.ts", () => {
   let dir: string;
