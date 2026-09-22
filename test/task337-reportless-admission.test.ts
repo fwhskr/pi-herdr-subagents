@@ -25,8 +25,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
-import subagentsExtension from "../pi-extension/subagents/index.ts";
+import subagentsExtension, { REPORTLESS_COMPLETION_SUMMARY } from "../pi-extension/subagents/index.ts";
 import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
+import { getHarnessDriver } from "../pi-extension/subagents/harness/index.ts";
 
 const testApi = (subagentsModule as any).__test__;
 
@@ -106,6 +107,8 @@ interface WatchOptions {
   stderrFile?: string;
   artifactDir?: string;
   paneScrollback?: any;
+  /** TASK-337: entries before this offset belong to the pre-resume transcript. */
+  resumeFromEntryCount?: number;
 }
 
 async function runWatcher(dir: string, options: WatchOptions) {
@@ -129,6 +132,7 @@ async function runWatcher(dir: string, options: WatchOptions) {
       lifecycle: createLifecycle(startTime),
     },
     new AbortController().signal,
+    options.resumeFromEntryCount ?? 0,
   );
 }
 
@@ -310,4 +314,152 @@ describe("TASK-337 reportless completion admission", () => {
     assert.equal(result.failureKind, undefined);
     assert.ok(result.ping);
   });
+});
+
+/**
+ * TASK-337 gap 1 — resumed-session render path.
+ *
+ * `watchSubagent` reads the whole session file (including the pre-resume
+ * transcript), so a resume that exits 0 without writing anything new used to
+ * be admitted as completed and rendered to the parent as
+ *
+ *   Sub-agent "general" completed (3s).
+ *   Resumed session exited without new output
+ *
+ * The resume delivery callback now classifies from ONLY the post-resume
+ * entries. These fixtures drive that exact production helper
+ * (`classifyResumeCompletion`) and the same `resolveResultPresentation`
+ * renderer the parent sees.
+ */
+describe("TASK-337 gap 1: resumed-session completion uses only post-resume evidence", () => {
+  const classify = testApi.classifyResumeCompletion as (
+    entries: object[],
+    result: { exitCode: number; errorMessage?: string; failureKind?: string; ping?: boolean },
+  ) => { failureKind: string | undefined; summary: string };
+
+  it("does NOT render a no-new-output resume as completed (red-first parent-visible shape)", () => {
+    // New-entries list is empty: the resume wrote no new terminal output. The
+    // pre-resume report that exists in the full session is deliberately not
+    // passed, so it cannot stand in for this run's report.
+    const { failureKind, summary } = classify([], { exitCode: 0 });
+    const presentation = testApi.resolveResultPresentation(
+      { summary, exitCode: 0, elapsed: 3, failureKind, sessionFile: "/tmp/child.jsonl" },
+      "general",
+    );
+
+    assert.equal(failureKind, "reportless");
+    assert.equal(summary, REPORTLESS_COMPLETION_SUMMARY);
+    assert.doesNotMatch(
+      presentation,
+      /completed \(3s\)\.\n\nResumed session exited without new output/,
+      "a reportless resume must not render as completed + 'Resumed session exited without new output'",
+    );
+    assert.doesNotMatch(presentation, /\bcompleted\b/i);
+    assert.match(presentation, /without a terminal report/i);
+  });
+
+  it("does NOT admit a resumed run with no new terminal output as completed (watcher lifecycle)", async () => {
+    const dir = createDir();
+    // The full session already holds a terminal report from the OLD run; only
+    // entries after offset 1 belong to the resumed run, which wrote nothing.
+    const result = await runWatcher(dir, {
+      entries: [REPORT_TEXT_ASSISTANT],
+      resumeFromEntryCount: 1,
+    });
+    assert.equal(result.failureKind, "reportless");
+    const presentation = testApi.resolveResultPresentation(result, "general");
+    assert.doesNotMatch(presentation, /\bcompleted\b/i);
+    assert.match(presentation, /without a terminal report/i);
+  });
+
+  it("still admits a resumed run that writes a new terminal report (watcher lifecycle)", async () => {
+    const dir = createDir();
+    // Entry 0 is the old run's report; the resumed run writes a new one.
+    const result = await runWatcher(dir, {
+      entries: [REPORT_TEXT_ASSISTANT, REPORT_ARG_ASSISTANT],
+      resumeFromEntryCount: 1,
+    });
+    assert.equal(result.failureKind, undefined);
+    assert.equal(result.summary, "Report via arg");
+  });
+
+  it("classifies a resume whose only new assistant turn has no report as reportless", () => {
+    const { failureKind, summary } = classify([REPORTLESS_ASSISTANT], { exitCode: 0 });
+    assert.equal(failureKind, "reportless");
+    assert.equal(summary, REPORTLESS_COMPLETION_SUMMARY);
+    const presentation = testApi.resolveResultPresentation(
+      { summary, exitCode: 0, elapsed: 3, failureKind, sessionFile: "/tmp/child.jsonl" },
+      "general",
+    );
+    assert.doesNotMatch(presentation, /\bcompleted\b/i);
+  });
+
+  it("still admits a resume that writes a new terminal report", () => {
+    const { failureKind, summary } = classify([REPORT_TEXT_ASSISTANT], { exitCode: 0 });
+    assert.notEqual(failureKind, "reportless");
+    assert.equal(summary, "Task complete: wrote the report.");
+    const presentation = testApi.resolveResultPresentation(
+      { summary, exitCode: 0, elapsed: 3, failureKind, sessionFile: "/tmp/child.jsonl" },
+      "general",
+    );
+    assert.match(presentation, /completed \(3s\)\.\n\nTask complete: wrote the report\./);
+  });
+
+  it("preserves a watcher-assigned lifecycle kind on a resumed run", () => {
+    const { failureKind } = classify([], { exitCode: 130, failureKind: "interrupted" });
+    assert.equal(failureKind, "interrupted");
+  });
+
+  it("keeps the exit-code summary for a resumed run that exits non-zero", () => {
+    const { failureKind, summary } = classify([], { exitCode: 7 });
+    assert.equal(failureKind, "no-result");
+    assert.equal(summary, "Resumed session exited with code 7");
+  });
+});
+
+/**
+ * TASK-337 gap 2 — external-harness driver path.
+ *
+ * The `driver.extractResult` branch admits `completed` on exit 0 without
+ * re-checking a terminal report. The disclosed concern was an empty extracted
+ * summary slipping through. Every non-Pi driver synthesizes its summary
+ * through `extractPaneSummary`, whose fallback names the absence rather than
+ * returning "": an exit-0 run with an empty pane yields
+ * "<displayName> exited without output", never an empty string. These fixtures
+ * pin that invariant for every registered external driver.
+ */
+describe("TASK-337 gap 2: external drivers always synthesize a non-empty summary", () => {
+  const externalDrivers = [
+    { cli: "claude", name: "Claude Code" },
+    { cli: "opencode", name: "OpenCode" },
+    { cli: "codex", name: "Codex" },
+    { cli: "grok", name: "Grok" },
+    { cli: "aider", name: "aider" },
+  ];
+
+  for (const { cli, name } of externalDrivers) {
+    it(`${cli}: exit-0 with an empty pane still yields a non-empty, absence-naming summary`, async () => {
+      const driver = getHarnessDriver(cli);
+      assert.ok(driver.extractResult, `${cli} driver must expose extractResult`);
+      const extracted = await driver.extractResult!({
+        running: {
+          id: "g2",
+          name: "general",
+          task: "g2",
+          surface: "pane-g2",
+          startTime: Date.now(),
+          sessionFile: "n/a",
+          interactive: false,
+        },
+        completionResult: { reason: "done", exitCode: 0 },
+        surface: "pane-g2",
+        readPane: () => "",
+        closePane: () => {},
+        artifactDir: "/tmp",
+      });
+      assert.ok(extracted, "extractResult must return a result object, not null");
+      assert.notEqual(extracted.summary.trim(), "", "summary must never be empty");
+      assert.equal(extracted.summary, `${name} exited without output`);
+    });
+  }
 });

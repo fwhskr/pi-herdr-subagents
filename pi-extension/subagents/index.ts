@@ -917,6 +917,50 @@ export const REPORTLESS_COMPLETION_SUMMARY =
   "(no assistant final text and no subagent_done report argument).";
 
 /**
+ * TASK-337: exit code alone never admits a completion. A clean exit (0) with
+ * no provider error, no ping, and no terminal report in the supplied
+ * transcript is `reportless`. Shared by the first-run watcher and the
+ * resumed-session delivery so both apply one admission rule; callers pass only
+ * the entries that belong to the run being admitted.
+ */
+function isReportlessCompletion(
+  entries: ReturnType<typeof getNewEntries>,
+  result: Pick<SubagentResult, "exitCode" | "errorMessage" | "ping">,
+): boolean {
+  return (
+    result.exitCode === 0 &&
+    !result.errorMessage &&
+    !result.ping &&
+    findTerminalReport(entries) === null
+  );
+}
+
+/**
+ * TASK-337: classify a resumed run's completion from only the entries written
+ * after the resume. The pre-resume transcript must never supply terminal
+ * evidence, so a resume that exits 0 without a new terminal report is
+ * `reportless` rather than `completed`.
+ */
+function classifyResumeCompletion(
+  newEntries: ReturnType<typeof getNewEntries>,
+  result: Pick<SubagentResult, "exitCode" | "errorMessage" | "failureKind" | "ping">,
+): { failureKind: SubagentFailureKind | undefined; summary: string } {
+  if (isReportlessCompletion(newEntries, result)) {
+    return { failureKind: "reportless", summary: REPORTLESS_COMPLETION_SUMMARY };
+  }
+  return {
+    failureKind: result.failureKind ?? classifySessionFailure(newEntries),
+    summary:
+      findLastAssistantMessage(newEntries) ??
+      (result.errorMessage
+        ? `Subagent error: ${result.errorMessage}`
+        : result.exitCode !== 0
+          ? `Resumed session exited with code ${result.exitCode}`
+          : "Resumed session exited without new output"),
+  };
+}
+
+/**
  * Bounded child-stderr evidence attached to process-start / no-result
  * failures. `tail` is the last captured bytes; `reason` explains why nothing
  * could be captured so the parent report never silently omits the evidence.
@@ -1965,6 +2009,8 @@ export const __test__ = {
   buildResumeAutoExitEnv,
   handleSubagentInterrupt,
   resolveResultPresentation,
+  isReportlessCompletion,
+  classifyResumeCompletion,
   watchSubagent,
   resolveResumeLaunchBehavior,
   clearResumeExitSidecar,
@@ -2358,6 +2404,10 @@ function enrichNoSessionFailure(
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  // TASK-337: a resumed run shares its session file with the pre-resume
+  // transcript. Only entries after this offset belong to the run being
+  // admitted; the pre-resume report must never satisfy the admission rule.
+  resumeFromEntryCount = 0,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
@@ -2446,14 +2496,14 @@ async function watchSubagent(
     // outcome that carries stopReason "error"; an aborted or mid-turn cut-off
     // is an interrupt/close; no assistant turn at all produced no result.
     let failureKind: SubagentFailureKind;
-    // TASK-337: the terminal report (final-message text or subagent_done report
-    // argument). Null means the completion carries no substantive evidence and
-    // must not be admitted as completed on exit code alone.
-    let terminalReport: string | null = null;
+    // TASK-337: the entries that may supply terminal evidence for this run.
+    // Empty when the child session file never appeared; the admission rule then
+    // treats a clean exit as reportless rather than completed.
+    let admissionEntries: ReturnType<typeof getNewEntries> = [];
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
+      const allEntries = getNewEntries(sessionFile, resumeFromEntryCount);
+      admissionEntries = allEntries;
       failureKind = classifySessionFailure(allEntries);
-      terminalReport = findTerminalReport(allEntries);
       if (running.runtimePlan) {
         const observation = classifyRuntimeObservation(allEntries, running.runtimePlan.model);
         const observedThinking =
@@ -2507,11 +2557,7 @@ async function watchSubagent(
     // TASK-337: a clean exit (0) with no terminal report is NOT a completion,
     // whether or not the child session file survives. Pings are not
     // completions and are delivered separately, so they keep their own path.
-    const reportless =
-      result.exitCode === 0 &&
-      !result.errorMessage &&
-      !result.ping &&
-      terminalReport === null;
+    const reportless = isReportlessCompletion(admissionEntries, result);
     if (reportless) {
       failureKind = "reportless";
       summary = REPORTLESS_COMPLETION_SUMMARY;
@@ -3459,7 +3505,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, entryCountBefore)
           .then((result) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
@@ -3489,17 +3535,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            // Preserve a kind the watcher's own lifecycle builders already
-            // assigned (interrupt/watchdog/time-limit); only classify from the
-            // transcript when no kind survived.
-            const failureKind = result.failureKind ?? classifySessionFailure(allEntries);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
+            const newEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            // TASK-337: only entries written after the resume may supply
+            // terminal evidence. A resumed run that exits 0 with no new
+            // terminal report is reportless, not completed — the pre-resume
+            // transcript must never stand in for this run's report. Kinds the
+            // watcher's lifecycle builders already assigned (interrupt,
+            // watchdog, time-limit) survive.
+            const { failureKind, summary } = classifyResumeCompletion(newEntries, result);
             const basePresentation = resolveResultPresentation(
               { ...result, summary, sessionFile: params.sessionPath, failureKind },
               name,
