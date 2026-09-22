@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import subagentsExtension, { REPORTLESS_COMPLETION_SUMMARY } from "../pi-extension/subagents/index.ts";
 import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
-import { getHarnessDriver } from "../pi-extension/subagents/harness/index.ts";
+import { getHarnessDriver, registerHarnessDriver } from "../pi-extension/subagents/harness/index.ts";
 
 const testApi = (subagentsModule as any).__test__;
 
@@ -420,15 +420,21 @@ describe("TASK-337 gap 1: resumed-session completion uses only post-resume evide
 /**
  * TASK-337 gap 2 — external-harness driver path.
  *
- * The `driver.extractResult` branch admits `completed` on exit 0 without
- * re-checking a terminal report. The disclosed concern was an empty extracted
- * summary slipping through. Every non-Pi driver synthesizes its summary
+ * The `driver.extractResult` branch admitted `completed` on exit 0 without
+ * re-checking a terminal report. Every non-Pi driver synthesizes its summary
  * through `extractPaneSummary`, whose fallback names the absence rather than
- * returning "": an exit-0 run with an empty pane yields
- * "<displayName> exited without output", never an empty string. These fixtures
- * pin that invariant for every registered external driver.
+ * returning "" — but that synthesized literal is the ABSENCE NAMED, not
+ * substantive evidence. The admission boundary now treats the synthesized
+ * literal as null evidence and reuses the Pi reportless rule, so a genuinely
+ * silent external run classifies `reportless` instead of `completed`.
+ *
+ * These fixtures drive the REAL driver extractResult through the REAL
+ * `watchSubagent` admission boundary (with the pane read pinned empty) for
+ * every registered external driver, keep the assertion that the absence text
+ * is still synthesized, and add the positive control that real pane content at
+ * exit 0 is still admitted `completed`.
  */
-describe("TASK-337 gap 2: external drivers always synthesize a non-empty summary", () => {
+describe("TASK-337 gap 2: external drivers treat a synthesized pane absence as reportless", () => {
   const externalDrivers = [
     { cli: "claude", name: "Claude Code" },
     { cli: "opencode", name: "OpenCode" },
@@ -437,8 +443,43 @@ describe("TASK-337 gap 2: external drivers always synthesize a non-empty summary
     { cli: "aider", name: "aider" },
   ];
 
+  /** Register a driver whose real extractResult reads a pinned pane text. */
+  function registerPaneDriver(cli: string, paneText: string): string {
+    const real = getHarnessDriver(cli);
+    const id = `t337-pane-${cli}`;
+    registerHarnessDriver({
+      id,
+      name: real.name,
+      extractResult: (ctx: any) => real.extractResult!({ ...ctx, readPane: () => paneText }),
+    } as any);
+    return id;
+  }
+
+  async function runDriverWatcher(dir: string, cli: string) {
+    const sessionFile = join(dir, "driver-child.jsonl");
+    writeFileSync(sessionFile, "");
+    writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+    const startTime = Date.now() - 3_000;
+    return await testApi.watchSubagent(
+      {
+        id: "t337-driver",
+        name: "general",
+        task: "t337",
+        surface: "pane-t337-driver",
+        startTime,
+        sessionFile,
+        cli,
+        interactive: false,
+        lifecycle: createLifecycle(startTime),
+      },
+      new AbortController().signal,
+    );
+  }
+
   for (const { cli, name } of externalDrivers) {
-    it(`${cli}: exit-0 with an empty pane still yields a non-empty, absence-naming summary`, async () => {
+    it(`${cli}: exit-0 with an empty pane classifies reportless, not completed`, async () => {
+      // The driver's own extractResult still synthesizes the absence literal
+      // (used for non-zero exits and display), never an empty string.
       const driver = getHarnessDriver(cli);
       assert.ok(driver.extractResult, `${cli} driver must expose extractResult`);
       const extracted = await driver.extractResult!({
@@ -460,6 +501,28 @@ describe("TASK-337 gap 2: external drivers always synthesize a non-empty summary
       assert.ok(extracted, "extractResult must return a result object, not null");
       assert.notEqual(extracted.summary.trim(), "", "summary must never be empty");
       assert.equal(extracted.summary, `${name} exited without output`);
+
+      // Through the real admission boundary that literal is null evidence.
+      const id = registerPaneDriver(cli, "");
+      const dir = createDir();
+      const result = await runDriverWatcher(dir, id);
+      const presentation = testApi.resolveResultPresentation(result, "general");
+      assert.equal(result.failureKind, "reportless");
+      assert.doesNotMatch(presentation, /\bcompleted\b/i);
+      assert.match(presentation, /without a terminal report/i);
+      // The absence text is still named in the admitted summary.
+      assert.match(result.summary, /no terminal report/i);
+      assert.match(result.summary, /exited without output/);
     });
   }
+
+  it("positive control: non-empty pane content at exit 0 is still admitted completed", async () => {
+    const id = registerPaneDriver("claude", "Task complete: real pane report");
+    const dir = createDir();
+    const result = await runDriverWatcher(dir, id);
+    assert.equal(result.failureKind, undefined);
+    assert.equal(result.summary, "Task complete: real pane report");
+    const presentation = testApi.resolveResultPresentation(result, "general");
+    assert.match(presentation, /completed \(3s\)\.\n\nTask complete: real pane report/);
+  });
 });

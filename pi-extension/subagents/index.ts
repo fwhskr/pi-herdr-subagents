@@ -51,6 +51,7 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
+import { isPaneAbsenceSummary } from "./harness/pane-summary.ts";
 import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
 
 import {
@@ -2469,21 +2470,43 @@ async function watchSubagent(
       });
 
       if (extracted) {
-        const enriched = enrichNoSessionFailure(result, running, extracted.summary);
+        // TASK-337: an external driver that exits 0 with no provider error, no
+        // ping, and only the synthesized pane-absence summary carries no
+        // terminal report. Treat that synthesized literal as null evidence and
+        // reuse the Pi admission rule instead of admitting `completed` on the
+        // exit code alone. `extractPaneSummary` keeps synthesizing the absence
+        // (non-zero exits and display still need it); classification happens
+        // here, at the single point where a driver result is finalized.
+        const reportless =
+          isReportlessCompletion([], result) &&
+          isPaneAbsenceSummary(extracted.summary, driver.name, result.exitCode);
+        // Keep the driver's own absence naming in the parent-visible summary
+        // and add the canonical reportless statement used by the Pi path.
+        const baseSummary = reportless
+          ? `${REPORTLESS_COMPLETION_SUMMARY}\n\n${extracted.summary}`
+          : extracted.summary;
+        const enriched = enrichNoSessionFailure(result, running, baseSummary);
+        if (reportless) persistPaneTailBeforeClose(running);
+        const finalSummary = reportless ? withPaneScrollbackRef(enriched.summary, running) : enriched.summary;
+        const stderr = reportless ? captureStderrTail(running.stderrFile) : undefined;
         if (!result.preservePane) closePaneQuietly(surface);
-        running.lifecycle = result.exitCode === 0
-          ? markCompleted(running.lifecycle, Date.now())
-          : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
+        running.lifecycle = reportless
+          ? markFailed(running.lifecycle, finalSummary, Date.now(), result.exitCode)
+          : result.exitCode === 0
+            ? markCompleted(running.lifecycle, Date.now())
+            : markFailed(running.lifecycle, result.errorMessage ?? enriched.summary, Date.now(), result.exitCode);
 
         return {
           name,
           task,
-          summary: enriched.summary,
+          summary: finalSummary,
           exitCode: result.exitCode,
           elapsed,
+          ...(stderr ? { stderr } : {}),
+          ...(reportless ? { failureKind: "reportless" as const } : {}),
           ...(enriched.error ? { error: enriched.error } : {}),
           ...(extracted.sessionId ? { claudeSessionId: extracted.sessionId } : {}),
-          ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
+          ...(!reportless && result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
           ...extracted.details,
         };
       }
