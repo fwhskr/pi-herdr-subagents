@@ -2,6 +2,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -2833,6 +2834,85 @@ describe("child launch hardening", () => {
   });
 });
 
+describe("TASK-332 pane scrollback persistence on close", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("persists the pre-close scrollback tail and references it by path in the failure report", () => {
+    const artifactDir = createTestDir();
+    const sessionFile = join(artifactDir, "missing-child.jsonl");
+    const scrollback = [
+      "boot: loading extension /missing/subagent-done.ts",
+      'Error: Failed to load extension "/missing/subagent-done.ts"',
+      "STARTUP-ERROR-MARKER-t332",
+      "",
+    ].join("\n");
+
+    const reads: Array<{ surface: string; lines?: number; source?: string }> = [];
+    const reader = (surface: string, lines?: number, source?: string) => {
+      reads.push({ surface, lines, source });
+      return scrollback;
+    };
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { id: "run-t332", sessionFile, surface: "w38:pQ", artifactDir },
+      "Sub-agent exited with code 1",
+      reader,
+    );
+
+    const artifact = join(artifactDir, "pane-scrollback", "run-t332-w38_pQ.log");
+    assert.ok(existsSync(artifact), "expected the persisted scrollback artifact on disk");
+    assert.equal(readFileSync(artifact, "utf8"), scrollback);
+    assert.match(result.summary, /STARTUP-ERROR-MARKER-t332/);
+    assert.match(result.summary, /Pane scrollback persisted: .*run-t332-w38_pQ\.log/);
+    assert.match(result.summary, /sha256:[0-9a-f]{64}/);
+
+    const meta = JSON.parse(readFileSync(`${artifact}.meta.json`, "utf8"));
+    assert.equal(meta.bytes, Buffer.byteLength(scrollback));
+    assert.equal(meta.source, "recent-unwrapped");
+    assert.equal(meta.sha256, createHash("sha256").update(scrollback).digest("hex"));
+
+    // The scrollback snapshot must read herdr scrollback, not the viewport-only tail.
+    assert.equal(reads[0]?.source, "recent-unwrapped");
+    assert.equal(reads[0]?.lines, testApi.PANE_SCROLLBACK_READ_LINES);
+  });
+
+  it("keeps the tail (last 256 KiB) when the scrollback is larger", () => {
+    const artifactDir = createTestDir();
+    const sessionFile = join(artifactDir, "missing-child.jsonl");
+    const head = "HEAD".repeat(100_000);
+    const tailMarker = "TAIL-END-MARKER-t332\n";
+    const scrollback = `${head}\n${tailMarker}`;
+
+    testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { id: "run-big", sessionFile, surface: "w39:pR", artifactDir },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => (lines === 20 ? "visible" : scrollback),
+    );
+
+    const artifact = join(artifactDir, "pane-scrollback", "run-big-w39_pR.log");
+    const written = readFileSync(artifact);
+    assert.equal(written.byteLength, testApi.PANE_SCROLLBACK_MAX_BYTES);
+    assert.ok(written.toString("utf8").endsWith(tailMarker), "expected the tail to be preserved");
+  });
+
+  it("does not fabricate an artifact when no scrollback is readable", () => {
+    const artifactDir = createTestDir();
+    const sessionFile = join(artifactDir, "missing-child.jsonl");
+
+    const result = testApi.enrichNoSessionFailure(
+      { exitCode: 1 },
+      { id: "run-empty", sessionFile, surface: "w40:pS", artifactDir },
+      "Sub-agent exited with code 1",
+      (_surface: string, lines?: number) => (lines === 20 ? "visible" : ""),
+    );
+
+    assert.equal(existsSync(join(artifactDir, "pane-scrollback", "run-empty-w40_pS.log")), false);
+    assert.doesNotMatch(result.summary, /Pane scrollback persisted:/);
+  });
+});
+
 describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
@@ -4277,6 +4357,27 @@ describe("herdr.ts", () => {
           "task=Line 1 Line 2 Line 3",
         ],
       );
+    });
+
+    it("builds pane reads with an explicit source, defaulting to the viewport", () => {
+      assert.deepEqual(__herdrTest__.buildPaneReadArgs("w38:pQ", 20), [
+        "pane",
+        "read",
+        "w38:pQ",
+        "--source",
+        "visible",
+        "--lines",
+        "20",
+      ]);
+      assert.deepEqual(__herdrTest__.buildPaneReadArgs("w38:pQ", 10000, "recent-unwrapped"), [
+        "pane",
+        "read",
+        "w38:pQ",
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "10000",
+      ]);
     });
   });
 
