@@ -3575,6 +3575,117 @@ describe("subagent interruption", () => {
   });
 });
 
+// TASK-326: the failure kind must be ASSIGNED by production code, not merely
+// rendered. These cases drive the real production watcher (watchSubagent),
+// whose completion is resolved from a real <session>.exit sidecar, and assert
+// that the returned SubagentResult carries the classification derived from the
+// child's own session transcript. Without the assignment the type's render
+// branches are dead code and these cases fail with failureKind undefined.
+// The three shapes are taken from the two real owner-closed transcripts
+// observed 2026-09-21 (last assistant stopReason "aborted"; last assistant
+// stopReason "toolUse" with no terminal sidecar) plus an empty session.
+describe("TASK-326 failure kind assignment in the production watcher", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function assistantEntry(stopReason: string, errorMessage?: string) {
+    return {
+      type: "message",
+      id: `assistant-${stopReason}`,
+      parentId: "root",
+      timestamp: "2026-09-21T20:40:00.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "working" }],
+        stopReason,
+        ...(errorMessage ? { errorMessage } : {}),
+      },
+    };
+  }
+
+  // No stopReason on the sidecar keeps preservePane set, so the watcher never
+  // reaches for herdr; the classification under test comes only from the
+  // transcript the production path reads.
+  async function runWatcher(dir: string, entries: object[]) {
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    writeFileSync(
+      `${sessionFile}.exit`,
+      JSON.stringify({ type: "error", errorMessage: "Subagent process exited unexpectedly." }),
+    );
+    const startTime = Date.now() - 14_000;
+    return await testApi.watchSubagent(
+      {
+        id: "t326-child",
+        name: "Worker",
+        task: "t326",
+        surface: "pane-t326",
+        startTime,
+        sessionFile,
+        interactive: false,
+        lifecycle: createLifecycle(startTime),
+      },
+      new AbortController().signal,
+    );
+  }
+
+  it("(TASK-326) assigns provider for a stopReason=error turn and preserves the provider message", async () => {
+    const dir = createTestDir();
+    const providerError = "Anthropic 529 Overloaded after 3 retries";
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, JSON.stringify(assistantEntry("error", providerError)) + "\n");
+    writeFileSync(
+      `${sessionFile}.exit`,
+      JSON.stringify({ type: "error", errorMessage: providerError, stopReason: "error" }),
+    );
+    const startTime = Date.now() - 14_000;
+    const result = await testApi.watchSubagent(
+      {
+        id: "t326-child",
+        name: "Worker",
+        task: "t326",
+        surface: "pane-t326",
+        startTime,
+        sessionFile,
+        interactive: false,
+        lifecycle: createLifecycle(startTime),
+      },
+      new AbortController().signal,
+    );
+    assert.equal(result.failureKind, "provider");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+  });
+
+  it("(TASK-326) assigns operator for an aborted child turn", async () => {
+    const result = await runWatcher(createTestDir(), [assistantEntry("aborted", "Operation aborted")]);
+    assert.equal(result.failureKind, "operator");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /closed by the operator/i);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+  });
+
+  it("(TASK-326) assigns operator for a child cut off mid-turn", async () => {
+    const result = await runWatcher(createTestDir(), [assistantEntry("toolUse")]);
+    assert.equal(result.failureKind, "operator");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /closed by the operator/i);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+  });
+
+  it("(TASK-326) assigns no-result for a child with no assistant turn", async () => {
+    const result = await runWatcher(createTestDir(), [
+      { type: "session", version: 3, id: "s-1", timestamp: "2026-09-21T20:34:00.000Z" },
+    ]);
+    assert.equal(result.failureKind, "no-result");
+    const presentation = testApi.resolveResultPresentation(result, "Worker");
+    assert.match(presentation, /without producing a result/i);
+    assert.doesNotMatch(presentation, /provider\/agent error/);
+    assert.doesNotMatch(presentation, /closed by the operator/i);
+  });
+});
+
 describe("subagent status renderer", () => {
   function createTheme() {
     return {
@@ -3589,6 +3700,38 @@ describe("subagent status renderer", () => {
       },
     };
   }
+
+  it("(TASK-326) labels the result header by failure kind instead of always provider error", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_result");
+    assert.ok(rendererEntry, "expected subagent_result renderer to be registered");
+
+    const headerFor = (failureKind: string) => {
+      const rendered = rendererEntry.renderer(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "Worker" failed after 14s.\n\nError: boom`,
+          details: {
+            name: "Worker",
+            exitCode: 1,
+            elapsed: 14,
+            errorMessage: "boom",
+            failureKind,
+            sessionFile: "/tmp/subagent.jsonl",
+          },
+        },
+        { expanded: true },
+        createTheme(),
+      );
+      return rendered.render(80).join("\n");
+    };
+
+    assert.match(headerFor("operator"), /interrupted \(closed\)/);
+    assert.match(headerFor("no-result"), /failed \(no result\)/);
+    assert.match(headerFor("provider"), /failed \(provider\/agent error\)/);
+  });
 
   it("renders only capped lines plus overflow", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();

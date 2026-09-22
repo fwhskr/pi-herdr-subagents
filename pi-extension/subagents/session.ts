@@ -243,6 +243,39 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
 }
 
 /**
+ * Classify why a child run ended without a normal completion (TASK-326).
+ *
+ * Grounded in the two real owner-closed transcripts observed 2026-09-21
+ * (19 and 22 successful tool calls, zero error entries): one ended with an
+ * assistant turn whose `stopReason` was `aborted`; the other was cut off
+ * mid-turn (`stopReason: "toolUse"` with no terminal sidecar). Only a genuine
+ * provider/transport failure carries `stopReason: "error"` alongside the
+ * provider's own error message, so that is the sole case allowed to keep the
+ * provider-failure wording. A session with no assistant turn at all produced
+ * no result; a terminal turn whose completion evidence was lost is reported
+ * as no-result rather than as a provider outage.
+ */
+export function classifySessionFailure(
+  entries: SessionEntry[],
+): "provider" | "operator" | "no-result" {
+  let lastIdx = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "message" && (entry as MessageEntry).message.role === "assistant") {
+      lastIdx = i;
+      break;
+    }
+  }
+  if (lastIdx === -1) return "no-result";
+
+  const stopReason = ((entries[lastIdx] as MessageEntry).message as { stopReason?: unknown })
+    .stopReason;
+  if (stopReason === "error") return "provider";
+  if (stopReason === "aborted" || stopReason === "toolUse") return "operator";
+  return "no-result";
+}
+
+/**
  * Append a branch_summary entry to the session file.
  * Returns the new entry's id.
  */

@@ -49,6 +49,7 @@ import {
 import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
 
 import {
+  classifySessionFailure,
   findLastAssistantMessage,
   findObservedSessionRuntime,
   getNewEntries,
@@ -1757,6 +1758,7 @@ export const __test__ = {
   buildResumeAutoExitEnv,
   handleSubagentInterrupt,
   resolveResultPresentation,
+  watchSubagent,
   resolveResumeLaunchBehavior,
   clearResumeExitSidecar,
   preflightSubagentDonePath,
@@ -2101,8 +2103,14 @@ async function watchSubagent(
 
     // Pi subagent result extraction
     let summary: string;
+    // TASK-326: classify what actually happened from the child's own session
+    // transcript before rendering. A genuine provider failure is the only
+    // outcome that carries stopReason "error"; an aborted or mid-turn cut-off
+    // is an interrupt/close; no assistant turn at all produced no result.
+    let failureKind: SubagentFailureKind;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
+      failureKind = classifySessionFailure(allEntries);
       const observed = findObservedSessionRuntime(allEntries);
       if (running.runtimePlan && observed.provider && observed.modelId) {
         const observedModel = `${observed.provider}/${observed.modelId}`;
@@ -2137,6 +2145,7 @@ async function watchSubagent(
             ? `Sub-agent exited with code ${result.exitCode}`
             : "Sub-agent exited without output");
     } else {
+      failureKind = "no-result";
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
         : result.exitCode !== 0
@@ -2160,7 +2169,9 @@ async function watchSubagent(
       ping: result.ping,
       ...(enriched.error ? { error: enriched.error } : {}),
       ...(result.wrapup ? { partial: true, timeout: "warned-wrapup" as const } : {}),
-      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(result.errorMessage
+        ? { errorMessage: result.errorMessage, failureKind }
+        : {}),
     };
   } catch (err: any) {
     const now = Date.now();
@@ -2577,7 +2588,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
                   ...buildResultTimeoutDetails(result),
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.errorMessage
+                    ? { errorMessage: result.errorMessage, failureKind: result.failureKind }
+                    : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
@@ -3045,6 +3058,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            const failureKind = classifySessionFailure(allEntries);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
@@ -3052,7 +3066,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ? `Resumed session exited with code ${result.exitCode}`
                   : "Resumed session exited without new output");
             const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
+              { ...result, summary, sessionFile: params.sessionPath, failureKind },
               name,
             );
             const presentation = running.runtimePlan?.runtimeMismatch
@@ -3071,7 +3085,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
                   ...buildResultTimeoutDetails(result),
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.errorMessage
+                    ? { errorMessage: result.errorMessage, failureKind }
+                    : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
               },
@@ -3180,6 +3196,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
         const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
+        const failureKind = typeof details.failureKind === "string" ? details.failureKind : "";
         const failed = exitCode !== 0 || !!errorMessage;
         const partial = !failed && (details.partial === true || details.timeout === "warned-wrapup");
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
@@ -3194,7 +3211,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ? theme.fg("warning", "⚠")
             : theme.fg("success", "✓");
         const status = errorMessage
-          ? "failed (provider/agent error)"
+          ? failureKind === "operator"
+            ? "interrupted (closed)"
+            : failureKind === "no-result"
+              ? "failed (no result)"
+              : "failed (provider/agent error)"
           : failed
             ? `failed (exit ${exitCode})`
             : partial
