@@ -50,6 +50,12 @@ pi install npm:pi-herdr-subagents
 
 This project does not install or load `HazAT/pi-interactive-subagents` automatically.
 
+The extension ships as a pi package (see the `pi.extensions` entry in `package.json`), so it loads automatically once the package is installed. It is intentionally **not** re-declared in this repository's tracked `.pi/settings.json`: declaring it there as well would load a second copy whenever the package is also installed — including a checkout used as a spawned subagent's cwd — and Pi aborts before session init on the duplicate tool registration. When running Pi from a checkout without installing the package, load the working-tree extension explicitly:
+
+```bash
+pi -ne -e ./pi-extension/subagents/index.ts
+```
+
 Changing the `package.json` version on `main` automatically creates a matching Git tag and GitHub Release, generates release notes, and publishes the package to npm. For authentication, versioning, verification, and troubleshooting, see [RELEASING.md](RELEASING.md).
 
 Start herdr, then run pi inside it:
