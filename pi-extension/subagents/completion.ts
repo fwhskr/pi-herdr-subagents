@@ -281,7 +281,7 @@ export async function waitForCompletion(
   for (;;) {
     if (signal.aborted) throw new Error(ABORT_MESSAGE);
 
-    const sidecarResult = consumeExitSidecar(options.sessionFile, options.expectedSidecarWriter);
+    const sidecarResult = consumeExitSidecar(options.sessionFile, options.expectedSidecarWriter ?? knownWorkerIdentity);
     if (sidecarResult) return sidecarResult;
 
     if (options.sentinelFile && existsSync(options.sentinelFile)) {

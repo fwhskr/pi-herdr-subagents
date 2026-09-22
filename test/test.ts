@@ -2557,6 +2557,138 @@ describe("completion.ts", () => {
     controller.abort();
     await assert.rejects(completion, /Aborted while waiting for subagent to finish/);
   });
+
+  // TASK-328: the single production caller (watchSubagent) never passes
+  // expectedSidecarWriter, so the expected writer must come from the worker
+  // activity snapshot already observed by the watcher. The mutation to guard
+  // against is rejecting when that identity is not yet known: undefined MUST
+  // mean accept, and it must not arrive after the loop already saw activity.
+  const activityRead = (overrides: Record<string, unknown> = {}) => ({
+    ok: true as const,
+    activity: {
+      version: 1,
+      runningChildId: "t328-child",
+      createdAt: 1_000,
+      updatedAt: 1_000,
+      sequence: 1,
+      latestEvent: "agent_start",
+      phase: "active",
+      agentActive: true,
+      turnActive: true,
+      providerActive: false,
+      toolActive: false,
+      ...overrides,
+    },
+  });
+
+  it("ignores a foreign stamped sidecar once the activity identity is known", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-t328-foreign-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    try {
+      let activityReads = 0;
+      let terminalReads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        // The foreign writer strikes only AFTER the watcher learned the real
+        // worker identity, so this drives the known-identity rejection path
+        // rather than the undefined-means-accept bootstrap iteration.
+        readTerminalTail: async () => {
+          terminalReads += 1;
+          if (terminalReads === 2) {
+            writeFileSync(exitFile, JSON.stringify({
+              type: "error",
+              errorMessage: "foreign crash",
+              workerPid: 999_999,
+              workerStartTime: 1,
+            }));
+          }
+          return terminalReads >= 4 ? "__SUBAGENT_DONE_0__" : "";
+        },
+        readWorkerActivity: () => {
+          activityReads += 1;
+          return activityRead({ workerPid: 6_101, workerStartTime: 7_001 });
+        },
+        probeWorkerProcess: () => "alive",
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+      assert.ok(activityReads >= 1, "the watcher must learn the identity from activity");
+      assert.equal(
+        existsSync(exitFile),
+        false,
+        "the foreign sidecar must be deleted and never returned as the result",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a sidecar stamped with the known activity identity", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-t328-match-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    try {
+      let terminalReads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        readTerminalTail: async () => {
+          terminalReads += 1;
+          // Publish only after iteration 1 observed the activity identity, so
+          // the matching stamp is actually compared against a known writer.
+          if (terminalReads === 2) {
+            writeFileSync(exitFile, JSON.stringify({
+              type: "ping",
+              name: "Worker",
+              message: "ready",
+              workerPid: 6_201,
+              workerStartTime: 7_201,
+            }));
+          }
+          return "";
+        },
+        readWorkerActivity: () => activityRead({ workerPid: 6_201, workerStartTime: 7_201 }),
+        probeWorkerProcess: () => "alive",
+      });
+      assert.deepEqual(result, {
+        reason: "ping",
+        exitCode: 0,
+        ping: { name: "Worker", message: "ready" },
+      });
+      assert.equal(existsSync(exitFile), false, "a matching sidecar is consumed and removed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a stamped sidecar when no activity identity is known", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "completion-t328-unknown-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const exitFile = `${sessionFile}.exit`;
+    writeFileSync(exitFile, JSON.stringify({
+      type: "done",
+      workerPid: 999_999,
+      workerStartTime: 1,
+    }));
+    try {
+      let terminalReads = 0;
+      const result = await waitForCompletion(new AbortController().signal, {
+        intervalMs: 1,
+        sessionFile,
+        // No usable identity is ever published; the watcher must not reject.
+        readWorkerActivity: () => ({ ok: false as const, error: "missing" }),
+        readTerminalTail: async () => {
+          terminalReads += 1;
+          return "__SUBAGENT_DONE_0__";
+        },
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+      assert.equal(terminalReads, 0, "an unknown identity must accept the sidecar immediately");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("resume completion sidecar", () => {
