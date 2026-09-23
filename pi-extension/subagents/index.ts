@@ -374,6 +374,34 @@ function readSpawnMetadata(sessionFile: string): SpawnMetadataRecord | null {
   }
 }
 
+/**
+ * Identity env for a RESUMED child. The resume tool takes no agent argument,
+ * so the agent identity recorded at first launch (session .spawn.json) must be
+ * exported explicitly: PI_SUBAGENT_AGENT is what profile-aware behavior reads
+ * to resolve the agent profile — the declared fallback chain
+ * (agent-fallback-chain.ts agentName()), pi-multi-account's declared-chain
+ * failover deferral, strict-agent-profiles identity gates, and subagent-done
+ * name resolution all resolve it from this variable. Without it a resumed
+ * worker silently loses its profile: owner bug 2026-09-23 — a resumed `deep`
+ * lane was failed over to zai/glm-5.3-flash by pi-multi-account because the
+ * resume env exported only the display name.
+ *
+ * A missing/null recorded agent exports nothing (never a guessed identity):
+ * bare, unnamed spawns stay exactly as they were.
+ */
+export function buildResumeAgentEnv(
+  sessionPath: string,
+  name: string,
+  readMetadata: (sessionFile: string) => SpawnMetadataRecord | null = readSpawnMetadata,
+): string[] {
+  const parts = [`PI_SUBAGENT_NAME=${shellQuote(name)}`];
+  const agent = readMetadata(sessionPath)?.agent;
+  if (typeof agent === "string" && agent.trim()) {
+    parts.push(`PI_SUBAGENT_AGENT=${shellQuote(agent.trim())}`);
+  }
+  return parts;
+}
+
 /** Write one complete spawn record without exposing a partially-written JSON. */
 function writeSpawnMetadata(sessionFile: string, metadata: SpawnMetadataRecord): void {
   const target = `${sessionFile}.spawn.json`;
@@ -1988,6 +2016,7 @@ export const __test__ = {
   decrementSpawnDepth,
   clampResumeSpawn,
   readSpawnMetadata,
+  buildResumeAgentEnv,
   ensureResumeSessionCwd,
   blockedSelfSpawn,
   SPAWNING_TOOLS,
@@ -3459,7 +3488,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
+        resumeEnvParts.push(...buildResumeAgentEnv(params.sessionPath, name));
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);

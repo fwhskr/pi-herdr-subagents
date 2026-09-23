@@ -367,3 +367,40 @@ describe("self-spawn guard via the real registered tool execute()", () => {
     }
   });
 });
+
+describe("resume identity env — resumed children keep their agent profile identity", () => {
+  it("exports PI_SUBAGENT_AGENT from the spawn sidecar so profile behavior survives a resume", () => {
+    const dir = mkdtempSync(join(tmpdir(), "resume-agent-env-"));
+    try {
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(sessionFile, '{"type":"session"}\n');
+      writeFileSync(
+        `${sessionFile}.spawn.json`,
+        JSON.stringify({ name: "deep", agent: "deep", launchedAt: new Date(0).toISOString() }),
+      );
+      const parts = testApi.buildResumeAgentEnv(sessionFile, "deep");
+      assert.ok(
+        parts.includes("PI_SUBAGENT_AGENT='deep'"),
+        `expected the resume env to carry the agent identity, got ${parts.join(" ")}`,
+      );
+      assert.ok(parts.includes("PI_SUBAGENT_NAME='deep'"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never guesses an identity when the sidecar has no agent", () => {
+    const dir = mkdtempSync(join(tmpdir(), "resume-agent-env-"));
+    try {
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(sessionFile, '{"type":"session"}\n');
+      writeFileSync(`${sessionFile}.spawn.json`, JSON.stringify({ name: "worker", agent: null }));
+      const withNullAgent = testApi.buildResumeAgentEnv(sessionFile, "worker");
+      assert.deepEqual(withNullAgent, ["PI_SUBAGENT_NAME='worker'"]);
+      const noSidecar = testApi.buildResumeAgentEnv(join(dir, "absent.jsonl"), "worker");
+      assert.deepEqual(noSidecar, ["PI_SUBAGENT_NAME='worker'"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
