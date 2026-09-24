@@ -252,6 +252,22 @@ function completionArtifact(options: CompletionOptions): CompletionResult | null
   return null;
 }
 
+/**
+ * A worker writes its sidecar synchronously and then exits, often while this
+ * loop is awaiting Herdr pane/terminal reads after its sidecar check. A dead
+ * process has finished every write, so one re-read decides whether it died
+ * after a real completion or without one.
+ */
+function workerDiedResult(
+  options: CompletionOptions,
+  knownSidecarIdentity: SidecarWriterIdentity | undefined,
+): CompletionResult {
+  const sidecar = consumeExitSidecar(options.sessionFile, options.expectedSidecarWriter ?? knownSidecarIdentity);
+  if (sidecar) return sidecar;
+  if (options.sentinelFile && existsSync(options.sentinelFile)) return { reason: "sentinel", exitCode: 0 };
+  return { reason: "error", exitCode: 1, preservePane: true, errorMessage: WORKER_PROCESS_DIED_ERROR };
+}
+
 async function waitForDisappearanceArtifacts(
   signal: AbortSignal,
   options: CompletionOptions,
@@ -360,26 +376,14 @@ export async function waitForCompletion(
         } catch {
           // A permission/read/parse failure is unknown, never worker death.
         }
-        if (probeResult === "dead") {
-          return {
-            reason: "error",
-            exitCode: 1,
-            preservePane: true,
-            errorMessage: WORKER_PROCESS_DIED_ERROR,
-          };
-        }
+        if (probeResult === "dead") return workerDiedResult(options, knownSidecarIdentity);
       } else if (
         inspection.kind === "present" &&
         !options.readWorkerActivity &&
         options.processExists &&
         legacyWorkerProcessDied(inspection, options.processExists)
       ) {
-        return {
-          reason: "error",
-          exitCode: 1,
-          preservePane: true,
-          errorMessage: WORKER_PROCESS_DIED_ERROR,
-        };
+        return workerDiedResult(options, knownSidecarIdentity);
       }
       if (inspection.kind === "missing") {
         // A single pane_not_found can race Herdr's pane publication/update.
@@ -412,14 +416,7 @@ export async function waitForCompletion(
       } catch {
         // A permission/read/parse failure is unknown, never worker death.
       }
-      if (probeResult === "dead") {
-        return {
-          reason: "error",
-          exitCode: 1,
-          preservePane: true,
-          errorMessage: WORKER_PROCESS_DIED_ERROR,
-        };
-      }
+      if (probeResult === "dead") return workerDiedResult(options, knownSidecarIdentity);
     }
 
     options.onTick?.(Math.floor((Date.now() - startedAt) / 1000));
