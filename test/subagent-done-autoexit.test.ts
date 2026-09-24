@@ -63,6 +63,8 @@ const origAgentDir = process.env.PI_CODING_AGENT_DIR;
 const origGuardMs = process.env.PI_SUBAGENT_FALLBACK_GUARD_MS;
 const origSubagentId = process.env.PI_SUBAGENT_ID;
 const origActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+const origResumeInput = process.env.PI_SUBAGENT_RESUME_INPUT;
+const origAutoExitRearm = process.env.PI_SUBAGENT_AUTO_EXIT_REARM;
 
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name];
@@ -78,6 +80,10 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     // session's activity file.
     delete process.env.PI_SUBAGENT_ID;
     delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+    // TASK-395: a resumed subagent pane exports these; inherited, they pre-arm
+    // the resume re-arm path and make the disarm cases shell-dependent.
+    delete process.env.PI_SUBAGENT_RESUME_INPUT;
+    delete process.env.PI_SUBAGENT_AUTO_EXIT_REARM;
     dir = mkdtempSync(join(tmpdir(), "l95-autoexit-"));
   });
 
@@ -89,6 +95,8 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
     restoreEnv("PI_SUBAGENT_FALLBACK_GUARD_MS", origGuardMs);
     restoreEnv("PI_SUBAGENT_ID", origSubagentId);
     restoreEnv("PI_SUBAGENT_ACTIVITY_FILE", origActivityFile);
+    restoreEnv("PI_SUBAGENT_RESUME_INPUT", origResumeInput);
+    restoreEnv("PI_SUBAGENT_AUTO_EXIT_REARM", origAutoExitRearm);
     if (dir) rmSync(dir, { recursive: true, force: true });
     dir = undefined;
   });
