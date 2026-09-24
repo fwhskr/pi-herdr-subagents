@@ -238,6 +238,27 @@ export function agentDeclaresFallbackChain(cwd: string): boolean {
 const DEFAULT_FALLBACK_GUARD_MS = 5000;
 const FALLBACK_GUARD_POLL_MS = 200;
 
+// Pending-child yield (TASK-395; Sade agent-identity LLA §5A). The parent-side
+// extension (index.ts) keeps its delegated children in a process-global
+// runtime registry keyed by this symbol; each entry is removed only when the
+// child's watcher settles it and steers the result back into this session.
+const SUBAGENT_RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
+const DEFAULT_PENDING_CHILD_POLL_MS = 1000;
+/** Consecutive empty polls before the guard exits without a result turn. */
+const PENDING_CHILD_SETTLE_TICKS = 3;
+
+/** Number of delegated children this process launched that have not settled. */
+export function countOutstandingChildren(): number {
+  const registry = (globalThis as any)[SUBAGENT_RUNTIME_KEY]?.runningSubagents;
+  return registry instanceof Map ? registry.size : 0;
+}
+
+function pendingChildPollMs(): number {
+  const raw = Number(process.env.PI_SUBAGENT_PENDING_CHILD_POLL_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_PENDING_CHILD_POLL_MS;
+  return Math.min(raw, 10_000);
+}
+
 function fallbackGuardMs(): number {
   const raw = Number(process.env.PI_SUBAGENT_FALLBACK_GUARD_MS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_FALLBACK_GUARD_MS;
@@ -474,6 +495,14 @@ export default function (
   }
 
   let fallbackGuardTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingChildTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function clearPendingChildGuard(): void {
+    if (pendingChildTimer) {
+      clearTimeout(pendingChildTimer);
+      pendingChildTimer = undefined;
+    }
+  }
 
   function clearFallbackGuard(): void {
     if (fallbackGuardTimer) {
@@ -492,6 +521,7 @@ export default function (
 
   function performExit(ctx: any): void {
     clearFallbackGuard();
+    clearPendingChildGuard();
     const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
     if (targetSessionFile) {
       try {
@@ -533,6 +563,33 @@ export default function (
     fallbackGuardTimer = setTimeout(tick, FALLBACK_GUARD_POLL_MS);
   }
 
+  /**
+   * Pending-child yield: an armed auto-exit turn settled while a delegated
+   * child is still outstanding. Stay active. The normal path is the child's
+   * watcher removing its registry row and steering the result in as a new
+   * turn, whose own agent_settled re-decides the exit (turn_start cancels this
+   * guard). The guard only covers a registry that empties WITHOUT a result
+   * turn (e.g. a suppressed delivery): after PENDING_CHILD_SETTLE_TICKS
+   * consecutive empty polls it re-applies the auto-exit decision, so the pane
+   * is never left idle once no child is outstanding. It never aborts a child.
+   */
+  function armPendingChildGuard(ctx: any, stopReason: string | undefined): void {
+    clearPendingChildGuard();
+    let emptyTicks = 0;
+    const tick = () => {
+      pendingChildTimer = undefined;
+      emptyTicks = countOutstandingChildren() > 0 ? 0 : emptyTicks + 1;
+      if (emptyTicks < PENDING_CHILD_SETTLE_TICKS) {
+        pendingChildTimer = setTimeout(tick, pendingChildPollMs());
+        return;
+      }
+      if (!resolveAutoExit({ disarmed, oneShotReArm }, stopReason)) return;
+      oneShotReArm = false;
+      performExit(ctx);
+    };
+    pendingChildTimer = setTimeout(tick, pendingChildPollMs());
+  }
+
   registerCrashHooks();
   testHooks?.onReady?.({ registerCrashHooks, unregisterCrashHooks });
 
@@ -541,6 +598,7 @@ export default function (
   // exactly once no matter how often the operator interacts afterwards.
   function disarmAutoExit(cause: string, ctx: any): void {
     disarmed = true;
+    clearPendingChildGuard();
     if (!autoExit || warnedOperatorTakeover) return;
     warnedOperatorTakeover = true;
     ctx.ui.notify(
@@ -584,6 +642,7 @@ export default function (
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    clearPendingChildGuard();
     recorder.agentStart();
   });
 
@@ -596,6 +655,8 @@ export default function (
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    // A newer settled turn supersedes any pending-child wait from an earlier one.
+    clearPendingChildGuard();
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     const stopReason = latestAssistantStopReason(latestAgentMessages);
 
@@ -629,6 +690,14 @@ export default function (
       && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
     const shouldExit = autoExitShouldFire
       || (wrapupInProgress && isTerminalAutoExitStopReason(stopReason));
+
+    // Pending-child yield (LLA §5A): an armed one-shot yield never settles
+    // while a delegated child is outstanding. The time-limit wrap-up is the
+    // bounded exception: its report-only turn still exits on schedule.
+    if (autoExitShouldFire && !wrapupInProgress && countOutstandingChildren() > 0) {
+      armPendingChildGuard(ctx, stopReason);
+      return;
+    }
 
     // Fallback-aware one-shot exit (B12): an error turn may already have a
     // queued recovery continuation ("pending") or be racing the fallback
@@ -665,9 +734,10 @@ export default function (
   });
 
   pi.on("turn_start", (event) => {
-    // A recovered fallback turn actually started: cancel the bounded guard so
-    // the normal lifecycle owns the session again.
+    // A recovered fallback turn (or a delivered child result) actually started:
+    // cancel the bounded guards so the normal lifecycle owns the session again.
     clearFallbackGuard();
+    clearPendingChildGuard();
     recorder.turnStart((event as any).turnIndex);
   });
 
@@ -709,6 +779,7 @@ export default function (
 
   pi.on("session_shutdown", (event) => {
     clearFallbackGuard();
+    clearPendingChildGuard();
     recorder.sessionShutdown((event as any).reason);
   });
 
