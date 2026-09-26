@@ -51,7 +51,8 @@ function sessionBrief(sessionFile: string): { brief?: string; cwd?: string } {
   return { brief: typeof spawnTask === "string" ? spawnTask : firstUser, cwd };
 }
 
-function backlogStatus(root: string, taskId: string): TerminalTask["status"] | undefined {
+/** The task's recorded status on one board (open or terminal), or undefined when that board lacks it. */
+function backlogStatus(root: string, taskId: string): string | undefined {
   const prefix = taskId.toLowerCase();
   for (const dir of ["tasks", "completed"]) {
     const path = join(root, "backlog", dir);
@@ -67,20 +68,31 @@ function backlogStatus(root: string, taskId: string): TerminalTask["status"] | u
       continue;
     }
     const trimmed = status?.trim();
-    if (dir === "completed") return trimmed || "Done"; // completed/ is terminal by location
-    return trimmed?.toLowerCase() === "done" ? trimmed : undefined;
+    if (dir === "completed") return trimmed?.toLowerCase() === "done" ? trimmed : "Done"; // terminal by location
+    return trimmed || "(no status)";
   }
   return undefined;
 }
 
-/** The terminal Backlog task a lane session belongs to, or undefined when open/unknown. */
-export function terminalTaskOfSession(sessionFile: string, extraRoots: readonly string[] = []): TerminalTask | undefined {
+/**
+ * The terminal Backlog task a lane session belongs to, or undefined when open/unknown.
+ *
+ * Board disagreement (TASK-458 revision decision): boards are consulted in the
+ * order given — `authorityRoots` first (the resuming session's project), then
+ * the lane's own session cwd, which may be a stale worktree copy — and the
+ * FIRST board that records the task decides, open or terminal. A later board
+ * never overrides it. So a stale copy can neither refuse a task the authority
+ * board holds open, nor rescue one it holds Done; the lane's own board only
+ * decides when the authority board does not know the task.
+ */
+export function terminalTaskOfSession(sessionFile: string, authorityRoots: readonly string[] = []): TerminalTask | undefined {
   const { brief, cwd } = sessionBrief(sessionFile);
   const taskId = brief ? TASK_NAME.exec(brief)?.[1]?.toUpperCase() : undefined;
   if (!taskId) return undefined;
-  for (const root of new Set([cwd, ...extraRoots].filter((r): r is string => Boolean(r)))) {
+  for (const root of new Set([...authorityRoots, cwd].filter((r): r is string => Boolean(r)))) {
     const status = backlogStatus(root, taskId);
-    if (status) return { taskId, status };
+    if (status === undefined) continue;
+    return status.toLowerCase() === "done" ? { taskId, status } : undefined;
   }
   return undefined;
 }

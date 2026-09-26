@@ -2015,7 +2015,11 @@ function clearResumeExitSidecar(sessionFile: string): void {
   }
 }
 
-/** TASK-458: roots whose Backlog board can prove a lane's task terminal, besides the lane's own cwd. */
+/**
+ * TASK-458: the resuming/delivering session's project board is authoritative;
+ * the lane's own (possibly stale worktree) board decides only when that board
+ * lacks the task. See terminalTaskOfSession for the disagreement rule.
+ */
 function terminalTaskField(sessionFile: string, cwd?: string): { terminalTask?: TerminalTask } {
   const roots = [cwd, runtime.latestCtx?.cwd].filter((root): root is string => Boolean(root));
   const terminalTask = terminalTaskOfSession(sessionFile, roots);

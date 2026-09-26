@@ -19,7 +19,7 @@ import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
 //
 // Run: timeout 60 node --test --test-name-pattern='<selector>' test/task458-terminal-task-resume.test.ts
 // Selectors: "resume-terminal" (AC1 RED), "terminal-refusal" (AC2), "open-task" (AC3),
-//            "issuer" (AC4)
+//            "issuer" (AC4), "disagree-stale-done" and "disagree-stale-open" (board precedence)
 
 const ENV_NAMES = [
   "HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "PATH", "PI_CODING_AGENT_DIR",
@@ -167,6 +167,34 @@ describe("TASK-458 terminal-task resume guard", () => {
     writeFileSync(`${child}.spawn.json`, JSON.stringify({ task: "Coverage audit, no task id" }), "utf8");
     const plain = await resume(root, child);
     assert.equal(plain.details?.status, "started");
+  });
+
+  /** The lane's session cwd is a worktree whose board copy disagrees with the resuming session's live board. */
+  function staleWorktree(root: string, child: string, worktreeStatus: string): void {
+    const worktree = join(root, "worktree");
+    mkdirSync(join(worktree, "backlog", "tasks"), { recursive: true });
+    writeFileSync(join(worktree, "backlog", "tasks", "task-451 - Rootless-diagnoseNovaState.md"),
+      `---\nid: TASK-451\nstatus: ${worktreeStatus}\n---\n`, "utf8");
+    writeFileSync(child, JSON.stringify({ type: "session", version: 3, id: "child-id", cwd: worktree }) + "\n", "utf8");
+  }
+
+  it("disagree-stale-done: a stale worktree board saying Done cannot refuse a task the live board holds open", async () => {
+    const { root, child, paneRuns } = project("In Progress");
+    staleWorktree(root, child, "Done");
+    const result = await resume(root, child);
+    console.log(`   [disagree-stale-done] status=${result.details?.status} taskStatus=${result.details?.taskStatus} paneRuns=${paneRuns()}`);
+    assert.equal(result.details?.status, "started", "the live (resuming session's) board decides: open resumes");
+    assert.equal(paneRuns(), 1);
+  });
+
+  it("disagree-stale-open: a stale worktree board saying open cannot rescue a task the live board holds Done", async () => {
+    const { root, child, paneRuns } = project("Done");
+    staleWorktree(root, child, "In Progress");
+    const result = await resume(root, child);
+    console.log(`   [disagree-stale-open] status=${result.details?.status} taskStatus=${result.details?.taskStatus} paneRuns=${paneRuns()}`);
+    assert.equal(result.details?.status, "refused");
+    assert.equal(result.details?.taskStatus, "Done");
+    assert.equal(paneRuns(), 0);
   });
 
   it("issuer: a deliberate interrupt names its issuer in the result and in the child's exit sidecar", async () => {
