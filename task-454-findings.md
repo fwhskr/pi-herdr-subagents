@@ -43,4 +43,44 @@ exactly like `cwd = <parent cwd>` (the launcher's existing session-dir default).
 
 ## Commands / results
 
-(see bottom, appended as the lane runs)
+All from the clone root, node v22 (`node --test`).
+
+1. RED (base 47310d5 + fixture, commit 5f0f52e):
+   `timeout 60 node --test test/task454-cwdless-spawn.test.ts` -> exit 1,
+   `not ok 1 - cwd-less ...`, `error: 'The "paths[0]" argument must be of type
+   string. Received null'`, `# pass 3 # fail 1` (the three controls already pass).
+   Stack: `resolve (node:path:1272)` <- `canonicalizePath spawn-trust.ts:26:20`
+   <- `resolveSpawnTrustFlag spawn-trust.ts:95:5` <- `PiHarnessDriver.buildCommand
+   drivers/pi.ts:124:16` <- `launchSubagent index.ts:2201:24` <- `execute
+   index.ts:3017:25`.
+2. GREEN after fix: same command -> exit 0, `# pass 4 # fail 0 # skipped 0`.
+3. Mutation (AC5): `const effectiveCwd = declaredCwd ?? defaultCwd;` ->
+   `declaredCwd as string;` then
+   `timeout 60 node --test --test-name-pattern="cwd-less" test/task454-cwdless-spawn.test.ts`
+   -> exit 1, `error: "Cannot read properties of null (reading 'replace')"`
+   (null now hits getDefaultSessionDirFor first, since the call site no longer
+   re-defaults), `# fail 1`. Restored from copy: sha256 before and after
+   `09afdb27ca9c349c3e28665c94fe78a5470bfc089cb664eb1777f19d31e9c723`, `cmp` exit 0;
+   re-run GREEN exit 0, `# pass 4 # fail 0`.
+4. Adjacent: `timeout 120 node --test test/harness-drivers.test.ts
+   test/task450-resume-tools-allowlist.test.ts test/test.ts` -> exit 0,
+   `# tests 273 # pass 273 # fail 0`.
+5. Lint: `timeout 90 npx --no-install oxlint pi-extension/subagents/index.ts
+   test/task454-cwdless-spawn.test.ts` -> exit 0.
+
+## Design notes
+
+- `localAgentDir` still derives only from a declared (call/profile) cwd, so a
+  cwd-less call keeps the global agent dir as before; only the cwd is defaulted.
+- The guard control imports the live
+  /home/kris/.pi/agent/extensions/strict-agent-profiles.ts read-only (skipped
+  when absent); the guard lives there, not in this clone, and is cwd-independent.
+
+## Candidate findings (out of scope, not in the diff)
+
+- `createSubagentPane` runs (index.ts ~2151) before `driver.buildCommand`; a
+  buildCommand throw leaves a created pane with no launch. The recorded failures
+  may have left empty panes; failure containment around buildCommand is not
+  covered by this task.
+- `harness/types.ts:44` declared `effectiveCwd: string` while index.ts passed
+  `string | null`; no typecheck (no tsc in the repo) caught it.
