@@ -1,5 +1,6 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
 
 /**
  * TASK-458: a lane whose Backlog task is already terminal must not be resumed
@@ -18,7 +19,7 @@ export interface TerminalTask {
 
 const TASK_NAME = /^Task name:\s*(TASK-\d+(?:\.\d+)*)/im;
 
-function readJson(path: string): Record<string, any> | undefined {
+function readJson(path: string): Record<string, unknown> | undefined {
   try {
     return JSON.parse(readFileSync(path, "utf8"));
   } catch {
@@ -75,6 +76,23 @@ function backlogStatus(root: string, taskId: string): string | undefined {
 }
 
 /**
+ * TASK-465: the main checkout's counterpart of `root` when it lies in a linked
+ * git worktree (a stale board copy), else `root` itself. Outside a repository,
+ * on any git failure, or for a non-`.git` common dir (bare/submodule), `root`.
+ */
+function mainCheckout(root: string): string {
+  try {
+    const [common, top] = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"], {
+      cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000,
+    }).trim().split("\n");
+    if (!common || !top || basename(common) !== ".git") return root;
+    return join(dirname(common), relative(top, realpathSync(root)));
+  } catch {
+    return root;
+  }
+}
+
+/**
  * The terminal Backlog task a lane session belongs to, or undefined when open/unknown.
  *
  * Board disagreement (TASK-458 revision decision): boards are consulted in the
@@ -84,12 +102,16 @@ function backlogStatus(root: string, taskId: string): string | undefined {
  * never overrides it. So a stale copy can neither refuse a task the authority
  * board holds open, nor rescue one it holds Done; the lane's own board only
  * decides when the authority board does not know the task.
+ * TASK-465: each root is read through its main checkout first, so a worktree
+ * cwd is judged by the live board; the worktree's own copy only decides when
+ * the main checkout does not record the task.
  */
 export function terminalTaskOfSession(sessionFile: string, authorityRoots: readonly string[] = []): TerminalTask | undefined {
   const { brief, cwd } = sessionBrief(sessionFile);
   const taskId = brief ? TASK_NAME.exec(brief)?.[1]?.toUpperCase() : undefined;
   if (!taskId) return undefined;
-  for (const root of new Set([...authorityRoots, cwd].filter((r): r is string => Boolean(r)))) {
+  const roots = [...authorityRoots, cwd].filter((r): r is string => Boolean(r));
+  for (const root of new Set(roots.flatMap((r) => [mainCheckout(r), r]))) {
     const status = backlogStatus(root, taskId);
     if (status === undefined) continue;
     return status.toLowerCase() === "done" ? { taskId, status } : undefined;
