@@ -1185,8 +1185,11 @@ const sessionCtxs = runtime.sessionCtxs ??= new Map<string, ExtensionContext>();
  * it launched. Owner-less entries (hydrated from before this field) and an
  * owner-less viewer keep the process-wide view, so no lane is ever dropped.
  */
+function ownsLane(owner: string | undefined, running: Pick<RunningSubagent, "owner">): boolean {
+  return !owner || !running.owner || running.owner === owner;
+}
 function lanesOf(owner: string | undefined): RunningSubagent[] {
-  return Array.from(runningSubagents.values()).filter((running) => !owner || !running.owner || running.owner === owner);
+  return Array.from(runningSubagents.values()).filter((running) => ownsLane(owner, running));
 }
 const completionDelivery = runtime.delivery ??= new CompletionDelivery<ExtensionAPI>();
 
@@ -1235,11 +1238,14 @@ export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
 
 export function cleanupSubagentsForShutdown(
   reason: unknown,
-  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle" | "interruptGraceTimer">>,
+  agents: Map<string, Pick<RunningSubagent, "abortController" | "lifecycle" | "interruptGraceTimer" | "owner">>,
+  /** TASK-470: the shutting-down session; only its lanes (lanesOf semantics) are reaped. */
+  owner?: string,
 ): void {
   if (shouldPreserveSubagentsOnShutdown(reason)) return;
 
-  for (const agent of agents.values()) {
+  for (const [id, agent] of agents) {
+    if (!ownsLane(owner, agent)) continue;
     if (agent.interruptGraceTimer != null) {
       clearTimeout(agent.interruptGraceTimer);
       agent.interruptGraceTimer = undefined;
@@ -1248,8 +1254,8 @@ export function cleanupSubagentsForShutdown(
       agent.lifecycle = markDelivery(agent.lifecycle, "suppressed");
     }
     agent.abortController?.abort();
+    agents.delete(id);
   }
-  agents.clear();
 }
 
 export function shouldDeliverSubagentCompletion(
@@ -3044,7 +3050,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
 
-    cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
+    cleanupSubagentsForShutdown((event as any).reason, runningSubagents, boundOwner);
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
