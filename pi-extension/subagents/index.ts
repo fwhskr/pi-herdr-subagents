@@ -2062,6 +2062,7 @@ export const __test__ = {
   isRestorableOrphan,
   resumeOrphanedSubagents,
   runningSubagents,
+  startStatusRefresh,
   findActiveSessionRun,
   captureStderrTail,
   formatElapsed,
