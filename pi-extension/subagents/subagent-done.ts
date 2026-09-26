@@ -480,11 +480,24 @@ export default function (
     processExitHandler = (code: number) => {
       try {
         const exitCode = Number.isInteger(code) ? code : 1;
-        writeExitSidecar(buildCrashSidecar(crashIdentity, {
+        // TASK-458: a parent interrupt closes the pane (exit 129 on hangup) and
+        // leaves a marker first; record that deliberate context, never a bare crash.
+        let interrupt: { issuer?: unknown; interruptedAt?: unknown } | undefined;
+        try {
+          interrupt = JSON.parse(readFileSync(`${targetSessionFile}.interrupt`, "utf8"));
+        } catch {
+          interrupt = undefined;
+        }
+        const issuer = typeof interrupt?.issuer === "string" ? interrupt.issuer : undefined;
+        const sidecar = buildCrashSidecar(crashIdentity, {
           exitCode,
           lastPhase: recorder.currentPhase(),
-          message: `Subagent process exited before completing (exit code ${exitCode}).`,
-        }), targetSessionFile);
+          message: issuer
+            ? `Subagent process ended by a deliberate interrupt from ${issuer} at ${String(interrupt?.interruptedAt)} ` +
+              `(exit code ${exitCode}: the parent closed the pane after the interrupt grace). Not a crash.`
+            : `Subagent process exited before completing (exit code ${exitCode}).`,
+        });
+        writeExitSidecar(issuer ? { ...sidecar, interruptedBy: issuer } : sidecar, targetSessionFile);
       } catch {
         // Process exit is already in progress; sidecar publication is best effort.
       }

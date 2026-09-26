@@ -125,6 +125,7 @@ import {
   type OrphanResumeOutcome,
   type SpawnMetadataRecord,
 } from "./orphan-discovery.ts";
+import { formatTerminalTask, terminalTaskOfSession, type TerminalTask } from "./terminal-task.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -838,10 +839,16 @@ function resolveResultPresentationCore(
   // through to the bare exit-code wording ("failed (exit code 130)"). It is
   // rendered as interrupted and never as a provider failure.
   if (result.failureKind === "interrupted") {
-    return (
-      `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)}.\n\n` +
-      `The session remains on disk and can be resumed with subagent_resume.${sessionRef}`
-    );
+    // TASK-458: name the issuer so a session that did not issue the interrupt
+    // (or later reads the child's exit 129) cannot mistake it for a crash, and
+    // never invite a resume of a lane whose Backlog task is already terminal.
+    const issuer = result.interruptedBy
+      ? ` by ${result.interruptedBy} (deliberate subagent_interrupt, not a crash; the child's exit 129 is the pane close after the interrupt grace)`
+      : "";
+    const next = result.terminalTask
+      ? `${formatTerminalTask(result.terminalTask)}: do not resume it; subagent_resume refuses this session.`
+      : "The session remains on disk and can be resumed with subagent_resume.";
+    return `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)}${issuer}.\n\n${next}${sessionRef}`;
   }
 
   // TASK-326 AC6: a hard time-limit stop is a parent-initiated lifecycle stop
@@ -1055,6 +1062,10 @@ interface SubagentResult {
   ping?: { name: string; message: string };
   /** Child stderr evidence on process-start / no-result failures (TASK-330). */
   stderr?: StderrCapture;
+  /** TASK-458: who issued a deliberate interrupt. */
+  interruptedBy?: string;
+  /** TASK-458: the lane's Backlog task is already terminal; it must not be resumed. */
+  terminalTask?: TerminalTask;
 }
 
 /**
@@ -1080,7 +1091,9 @@ interface RunningSubagent {
   /** Timer waiting for an interrupted autonomous child to become terminal. */
   interruptGraceTimer?: ReturnType<typeof setTimeout>;
   /** Synthetic terminal result after the parent-owned interrupt grace expires. */
-  interrupted?: { errorMessage: string; interruptedAt: number };
+  interrupted?: { errorMessage: string; interruptedAt: number; issuer?: string };
+  /** TASK-458: the session that called subagent_interrupt. */
+  interruptIssuer?: string;
   recovery?: RecoveryState;
   recoveryKilled?: { errorMessage: string; killedAt: number };
   timeLimit?: TimeLimitConfig;
@@ -1601,9 +1614,21 @@ function finalizeInterruptedSubagent(
     return false;
   }
 
-  running.interrupted = { errorMessage: INTERRUPTED_ERROR, interruptedAt: now };
+  const issuer = running.interruptIssuer;
+  running.interrupted = { errorMessage: INTERRUPTED_ERROR, interruptedAt: now, ...(issuer ? { issuer } : {}) };
   running.lifecycle = markFailed(lifecycle, INTERRUPTED_ERROR, now, INTERRUPTED_EXIT_CODE);
   persistPaneTailBeforeClose(running);
+  // TASK-458: the pane close below ends the child with a hangup (exit 129).
+  // Leave the child's crash hook the deliberate-interrupt context to record.
+  try {
+    writeFileSync(`${running.sessionFile}.interrupt`, JSON.stringify({
+      issuer: issuer ?? "the parent session",
+      interruptedAt: new Date(now).toISOString(),
+      runId: running.id,
+    }));
+  } catch {
+    // Best effort: without the marker the sidecar keeps its plain exit wording.
+  }
   try {
     operations.closePane(running.surface);
   } catch {
@@ -1732,6 +1757,8 @@ function buildInterruptedResult(running: RunningSubagent, now: number): Subagent
     exitCode: INTERRUPTED_EXIT_CODE,
     elapsed: Math.floor(Math.max(0, now - running.startTime) / 1000),
     error: "interrupted",
+    ...(interrupted.issuer ? { interruptedBy: interrupted.issuer } : {}),
+    ...terminalTaskField(running.sessionFile),
     // TASK-326 AC5: assigned at construction so every early return of this
     // result is classified without depending on a later code path.
     failureKind: "interrupted",
@@ -1844,6 +1871,8 @@ function handleSubagentInterrupt(
     closePane?: (surface: string) => void;
     abortWatcher?: (controller: AbortController | undefined) => void;
     graceMs?: number;
+    /** TASK-458: the session issuing the interrupt, named in the result and the child's exit sidecar. */
+    issuer?: string;
   } = {},
 ) {
   const resolved = resolveInterruptTarget(params);
@@ -1883,6 +1912,7 @@ function handleSubagentInterrupt(
   }
 
   running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
+  if (options.issuer) running.interruptIssuer = options.issuer;
   if (!running.interactive && running.abortController) {
     scheduleInterruptedFinalization(
       running,
@@ -1975,10 +2005,30 @@ function startStatusRefresh(pi: ExtensionAPI) {
 }
 
 function clearResumeExitSidecar(sessionFile: string): void {
+  // The interrupt marker (TASK-458) belongs to the old run like its sidecar.
+  for (const path of [`${sessionFile}.exit`, `${sessionFile}.interrupt`]) {
+    try {
+      unlinkSync(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+/** TASK-458: roots whose Backlog board can prove a lane's task terminal, besides the lane's own cwd. */
+function terminalTaskField(sessionFile: string, cwd?: string): { terminalTask?: TerminalTask } {
+  const roots = [cwd, runtime.latestCtx?.cwd].filter((root): root is string => Boolean(root));
+  const terminalTask = terminalTaskOfSession(sessionFile, roots);
+  return terminalTask ? { terminalTask } : {};
+}
+
+function interruptIssuer(ctx: any): string | undefined {
   try {
-    unlinkSync(`${sessionFile}.exit`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const id = ctx?.sessionManager?.getSessionId?.();
+    if (typeof id !== "string" || !id.trim()) return undefined;
+    return `${process.env.SULA_DESKTOP_AGENT?.trim() || "parent"} session ${id}`;
+  } catch {
+    return undefined;
   }
 }
 
@@ -3227,8 +3277,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
       }),
 
-      async execute(_toolCallId, params) {
-        return handleSubagentInterrupt(params);
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const issuer = interruptIssuer(ctx);
+        return handleSubagentInterrupt(params, interruptPane, issuer ? { issuer } : {});
       },
 
       renderCall(args, theme) {
@@ -3352,6 +3403,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
           }),
         ),
+        allowTerminalTask: Type.Optional(
+          Type.Boolean({
+            description:
+              "Resume even though the lane's Backlog task is already Done. Only for deliberate post-Done work (e.g. an interrupted save-work lane); never to re-run a gate.",
+          }),
+        ),
       }),
 
       renderCall(args, theme) {
@@ -3404,6 +3461,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               sessionPath: params.sessionPath,
               activeRunId: active.id,
               activeRunName: active.name,
+            },
+          };
+        }
+        // TASK-458: never resume a lane whose Backlog task is already terminal
+        // into re-running its gate. This executor is also the harness restore
+        // path's auto-resume, so the guard covers every resume source.
+        const terminal = params.allowTerminalTask ? undefined : terminalTaskField(params.sessionPath, ctx?.cwd).terminalTask;
+        if (terminal) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                `Refused to resume ${params.sessionPath}: ${formatTerminalTask(terminal).replace(/^Its/, "its")}. ` +
+                `Resuming would re-run a finished lane's gate. If deliberate post-Done work needs this ` +
+                `session (e.g. an interrupted save-work lane), call subagent_resume with allowTerminalTask: true.`,
+            }],
+            details: {
+              error: "terminal task",
+              status: "refused",
+              sessionPath: params.sessionPath,
+              taskId: terminal.taskId,
+              taskStatus: terminal.status,
             },
           };
         }
