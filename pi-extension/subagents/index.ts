@@ -2026,6 +2026,20 @@ function terminalTaskField(sessionFile: string, cwd?: string): { terminalTask?: 
   return terminalTask ? { terminalTask } : {};
 }
 
+/**
+ * Key of the session that owns a child's completion. One CompletionDelivery
+ * serves every session in the pi process; keying by session id keeps each
+ * completion in its owner's transcript (TASK-462). No id: the shared slot.
+ */
+function deliveryOwner(ctx: any): string {
+  try {
+    const id = ctx?.sessionManager?.getSessionId?.();
+    return typeof id === "string" ? id.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 function interruptIssuer(ctx: any): string | undefined {
   try {
     const id = ctx?.sessionManager?.getSessionId?.();
@@ -2782,6 +2796,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   let spawnToolExecutor: RegisteredToolExecutor | undefined;
   let resumeToolExecutor: RegisteredToolExecutor | undefined;
   let restoreInFlight = false;
+  // The session this extension load delivers completions for (TASK-462).
+  let boundOwner = "";
 
   function currentSessionFile(ctx: any): string | null {
     try {
@@ -2970,7 +2986,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startStatusRefresh(pi);
       updateWidget();
     }
-    completionDelivery.bind(pi);
+    boundOwner = deliveryOwner(ctx);
+    completionDelivery.bind(pi, boundOwner);
     reportOrphansAtSessionStart(ctx);
   });
 
@@ -2979,7 +2996,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     // Watchers survive reload, but the old context does not. Poll callbacks can
     // run between teardown and session_start; skip UI until the new ctx binds.
     runtime.latestCtx = undefined;
-    completionDelivery.detach(shouldPreserveSubagentsOnShutdown((event as any).reason));
+    completionDelivery.detach(shouldPreserveSubagentsOnShutdown((event as any).reason), boundOwner);
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -3084,7 +3101,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
+        // Fire-and-forget: start watching in background. The completion goes
+        // back to THIS session, never to a sibling bound later (TASK-462).
+        const owner = deliveryOwner(ctx);
         watchSubagent(running, watcherAbort.signal)
           .then((result) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
@@ -3148,7 +3167,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          }))
+          }, owner))
           .catch((err) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
@@ -3169,7 +3188,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          }))
+          }, owner))
           .catch(() => { /* Error delivery is best-effort; never reject a detached watcher. */ });
 
         // Return immediately
@@ -3670,6 +3689,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
+        const owner = deliveryOwner(ctx);
         watchSubagent(running, watcherAbort.signal, entryCountBefore)
           .then((result) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
@@ -3740,7 +3760,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          }))
+          }, owner))
           .catch((err) => completionDelivery.enqueue((completionApi) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
@@ -3760,7 +3780,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          }))
+          }, owner))
           .catch(() => { /* Error delivery is best-effort; never reject a detached watcher. */ });
 
         return {
