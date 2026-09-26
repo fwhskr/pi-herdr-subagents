@@ -373,3 +373,119 @@ describe("F-111.2 restore flow", () => {
     assert.equal(existsSync(phantom), false, "the original phantom path is not materialized by resume");
   });
 });
+
+// TASK-464: the phantom-relaunch restore route goes to the SPAWN executor, so it
+// needs its own terminal-task guard (TASK-458's lives in subagent_resume).
+describe("TASK-464 phantom relaunch terminal-task guard", () => {
+  async function phantomRestore(brief: string, boardStatus?: string) {
+    const root = mkdtempSync(join(tmpdir(), "task464-phantom-"));
+    tempRoots.add(root);
+    if (boardStatus) {
+      mkdirSync(join(root, "backlog", "tasks"), { recursive: true });
+      writeFileSync(join(root, "backlog", "tasks", "task-464 - Phantom-lane.md"),
+        `---\nid: TASK-464\ntitle: Phantom lane\nstatus: ${boardStatus}\n---\n`, "utf8");
+    }
+    const parent = join(root, "parent.jsonl");
+    const entries: object[] = [header("parent-id", root)];
+    writeJsonl(parent, entries);
+    const phantom = join(root, "phantom.jsonl");
+    sidecar(parent, "parent-id", phantom, "Phantom", brief);
+    const { log } = fakeHerdr(root, []);
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "parent-pane";
+    process.env.HERDR_TAB_ID = "parent-tab";
+    process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    __herdrTest__.clearCommandAvailability();
+
+    const built = contextFor(parent, root, entries);
+    subagentsExtension(built.api);
+    built.handlers.get("session_start")![0]({}, built.ctx);
+    assert.match(built.messages[0].content, /Phantom/, "the phantom is reported at startup");
+    const input = built.handlers.get("input")![0];
+    assert.deepEqual(await input({ text: "resume", source: "interactive" }, built.ctx), { action: "handled" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const scriptsDir = join(root, "artifacts", "parent-id", "subagent-scripts");
+    const scripts = existsSync(scriptsDir) ? readdirSync(scriptsDir).map((file) => readFileSync(join(scriptsDir, file), "utf8")) : [];
+    const markers = entries.filter((entry: any) => entry.customType === "subagent_restore_handled").map((entry: any) => entry.data);
+    return { root, parent, phantom, entries, built, log, scripts, markers };
+  }
+
+  function assertRelaunched(run: Awaited<ReturnType<typeof phantomRestore>>, brief: string): void {
+    assert.equal(run.scripts.length, 1, "exactly one launch script");
+    assert.match(run.scripts[0], /Subagent launch script/);
+    assert.doesNotMatch(run.scripts[0], /Subagent resume script/);
+    const contextDir = join(run.root, "artifacts", "parent-id", "context");
+    assert.ok(readdirSync(contextDir).some((file) => readFileSync(join(contextDir, file), "utf8").includes(brief)),
+      "the recorded brief is relaunched verbatim");
+    assert.match(readFileSync(run.log, "utf8"), /pane run/);
+    assert.equal(existsSync(run.phantom), false, "the phantom path is not materialized");
+    assert.deepEqual(run.markers.map((marker: any) => marker.action), ["relaunch"]);
+  }
+
+  it("TASK-464 AC2 refuses a phantom relaunch whose brief names a Done task", async () => {
+    const brief = "Task name: TASK-464 — finished lane\n\nRe-run the gate.";
+    const run = await phantomRestore(brief, "Done");
+    assert.equal(run.scripts.length, 0, "no launch script may be created for a terminal task's brief");
+    assert.doesNotMatch(readFileSync(run.log, "utf8"), /pane run|tab create/, "no child may be launched");
+    assert.equal(existsSync(join(run.root, "artifacts", "parent-id", "context")), false, "no child run artifact");
+    assert.equal(existsSync(run.phantom), false);
+    const refusal = run.built.notifications.find((note) => /TASK-464/.test(note.message));
+    assert.ok(refusal, `refusal must be surfaced: ${JSON.stringify(run.built.notifications)}`);
+    assert.match(refusal.message, /TASK-464 is already terminal \(status: Done\)/);
+    assert.equal(run.markers.length, 1);
+    assert.equal(run.markers[0].action, "refused-terminal-task", "durable trace distinguishes the refusal from a relaunch");
+    assert.equal(run.markers[0].taskId, "TASK-464");
+    assert.equal(run.markers[0].taskStatus, "Done");
+    assert.equal(run.markers[0].classification, "phantom");
+
+    const again = contextFor(run.parent, run.root, run.entries);
+    subagentsExtension(again.api);
+    again.handlers.get("session_start")![0]({}, again.ctx);
+    assert.equal(again.messages.length, 0, "a refused phantom is not re-reported on restart");
+  });
+
+  it("TASK-464 AC3 relaunches a phantom whose brief names an open task", async () => {
+    const brief = "Task name: TASK-464 — open lane\n\nDo the work.";
+    assertRelaunched(await phantomRestore(brief, "In Progress"), brief);
+  });
+
+  it("TASK-464 AC3 relaunches a phantom whose brief names no task", async () => {
+    const brief = "No task header here; just do the work.";
+    assertRelaunched(await phantomRestore(brief, "Done"), brief);
+  });
+
+  it("TASK-464 AC3 relaunches a phantom whose brief names a task no board knows", async () => {
+    const brief = "Task name: TASK-999999 — unknown lane\n\nDo the work.";
+    assertRelaunched(await phantomRestore(brief, "Done"), brief);
+  });
+
+  it("TASK-464 AC4 an explicit subagent spawn for a Done task's brief is not blocked", async () => {
+    const root = mkdtempSync(join(tmpdir(), "task464-explicit-"));
+    tempRoots.add(root);
+    mkdirSync(join(root, "backlog", "tasks"), { recursive: true });
+    writeFileSync(join(root, "backlog", "tasks", "task-464 - Phantom-lane.md"),
+      "---\nid: TASK-464\nstatus: Done\n---\n", "utf8");
+    const parent = join(root, "parent.jsonl");
+    const entries: object[] = [header("parent-id", root)];
+    writeJsonl(parent, entries);
+    const { log } = fakeHerdr(root, []);
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "parent-pane";
+    process.env.HERDR_TAB_ID = "parent-tab";
+    process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    __herdrTest__.clearCommandAvailability();
+    const built = contextFor(parent, root, entries);
+    subagentsExtension(built.api);
+    built.handlers.get("session_start")![0]({}, built.ctx);
+    const tool = built.tools.find((candidate) => candidate.name === "subagent");
+    const brief = "Task name: TASK-464 — deliberate post-Done save-work\n\nPublish.";
+    const result = await tool.execute("explicit", { name: "Explicit", task: brief, interactive: false }, undefined, undefined, built.ctx);
+    assert.equal(result?.details?.status, "started", JSON.stringify(result?.content));
+    assert.match(readFileSync(log, "utf8"), /pane run/);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  });
+});

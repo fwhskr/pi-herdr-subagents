@@ -2831,7 +2831,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
   }
 
-  function appendRestoreHandled(child: DiscoveredOrphan, action: "resume" | "relaunch" | "report"): void {
+  function appendRestoreHandled(
+    child: DiscoveredOrphan,
+    action: "resume" | "relaunch" | "report" | "refused-terminal-task",
+    extra: Record<string, unknown> = {},
+  ): void {
     const appendEntry = (pi as any).appendEntry;
     if (typeof appendEntry !== "function") return;
     try {
@@ -2839,6 +2843,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         childSessionFile: child.sessionFile,
         classification: child.classification,
         action,
+        ...extra,
         handledAt: new Date().toISOString(),
       });
     } catch {
@@ -2931,6 +2936,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         },
         relaunch: async (child) => {
           if (!spawnToolExecutor) throw new Error("subagent is unavailable");
+          // TASK-464: a phantom relaunch goes to the spawn executor, which TASK-458's
+          // subagent_resume guard never sees. Refuse a brief whose Backlog task is
+          // already terminal here, on the restore route only: an explicit subagent
+          // spawn stays the caller's deliberate choice. The marker records the
+          // refusal durably (and marks the phantom handled so it is not retried).
+          const terminal = terminalTaskField(child.sessionFile, ctx?.cwd).terminalTask;
+          if (terminal) {
+            appendRestoreHandled(child, "refused-terminal-task", { taskId: terminal.taskId, taskStatus: terminal.status });
+            ctx?.ui?.notify?.(
+              `Refused to relaunch phantom subagent ${child.name}: ${formatTerminalTask(terminal).replace(/^Its/, "its")}. ` +
+                `Relaunching would re-run a finished lane. Spawn it explicitly with subagent if that is deliberate.`,
+              "warning",
+            );
+            return { details: { status: "refused", taskId: terminal.taskId, taskStatus: terminal.status } };
+          }
           const result = await spawnToolExecutor(
             `restore-relaunch-${child.name}`,
             {
@@ -2951,14 +2971,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         },
       });
       const failed = outcomes.filter((outcome) => !outcome.ok);
+      const started = outcomes.filter((outcome) => outcome.ok && (outcome.result as any)?.details?.status !== "refused").length;
       if (failed.length > 0) {
         ctx?.ui?.notify?.(
-          `Restore started ${outcomes.length - failed.length} subagent${outcomes.length - failed.length === 1 ? "" : "s"}; ${failed.length} failed to start.`,
+          `Restore started ${started} subagent${started === 1 ? "" : "s"}; ${failed.length} failed to start.`,
           "warning",
         );
       } else {
         ctx?.ui?.notify?.(
-          `Restore started ${outcomes.length} orphaned subagent${outcomes.length === 1 ? "" : "s"}.`,
+          `Restore started ${started} orphaned subagent${started === 1 ? "" : "s"}.`,
           "info",
         );
       }
