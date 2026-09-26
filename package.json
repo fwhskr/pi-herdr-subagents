@@ -14,7 +14,7 @@
   "type": "module",
   "scripts": {
     "lint": "oxlint pi-extension test",
-    "test": "node --test test/test.ts test/subagent-done-autoexit.test.ts test/f108-interrupted-resume.test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/spawn-grants.test.ts test/recovery-ladder.test.ts test/time-limits.test.ts test/stale-active-stall.test.ts test/orphan-discovery.test.ts test/f111-restore-flow.test.ts test/task330-run-identity.test.ts test/task337-reportless-admission.test.ts test/task236-pending-child-yield.test.ts test/task395-pending-child-guard.test.ts test/task450-resume-tools-allowlist.test.ts test/task452-idle-lane-signal.test.ts test/task454-cwdless-spawn.test.ts",
+    "test": "node --test test/test.ts test/subagent-done-autoexit.test.ts test/f108-interrupted-resume.test.ts test/runtime-routing.test.ts test/release-workflow.test.ts test/harness-drivers.test.ts test/spawn-grants.test.ts test/recovery-ladder.test.ts test/time-limits.test.ts test/stale-active-stall.test.ts test/orphan-discovery.test.ts test/f111-restore-flow.test.ts test/task330-run-identity.test.ts test/task337-reportless-admission.test.ts test/task236-pending-child-yield.test.ts test/task395-pending-child-guard.test.ts test/task450-resume-tools-allowlist.test.ts test/task452-idle-lane-signal.test.ts test/task454-cwdless-spawn.test.ts test/task460-error-path-identity.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

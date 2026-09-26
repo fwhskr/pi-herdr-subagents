@@ -2713,6 +2713,7 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((now - startTime) / 1000),
       error: err?.message ?? String(err),
+      sessionFile,
     };
   } finally {
     clearInterruptGraceTimer(running);
@@ -3109,7 +3110,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
+                // TASK-460: the failure names its session like the success path, so it correlates.
+                details: { name: running.name, task: running.task, agent: running.agent, sessionFile: running.sessionFile, error: err?.message },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -3671,7 +3673,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name, error: err?.message },
+                details: { name, task: running.task, sessionFile: running.sessionFile, error: err?.message },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );

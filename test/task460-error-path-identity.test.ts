@@ -14,7 +14,7 @@ import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 // nova-notify-watch.ts extension.
 //
 // Run: timeout 60 node --test --test-name-pattern='<selector>' test/task460-error-path-identity.test.ts
-// Selectors: "spawn-error", "resume-error", "unmatched", "success-identity"
+// Selectors: "spawn-error", "resume-error", "watcher-throw", "unmatched", "success-identity"
 
 const EXT = join(homedir(), ".pi", "agent", "extensions", "nova-notify-watch.ts");
 const NO_MATCH = "completion lacks a matching child session/run and original task identity";
@@ -74,7 +74,7 @@ type Captured = { customType: string; content: string; details: Record<string, a
  * the UI starts throwing inside the watcher after launch, so the detached watcher's promise chain
  * rejects (the TASK-460 trigger) and the `.catch` error completion is sent.
  */
-async function launch(kind: "spawn" | "resume", failWatcher: boolean, task: string): Promise<{ root: string; message: Captured; childSession: string }> {
+async function launch(kind: "spawn" | "resume", failWatcher: boolean | "once", task: string): Promise<{ root: string; message: Captured; childSession: string }> {
   const root = mkdtempSync(join(tmpdir(), "task460-"));
   roots.push(root);
   const agentDir = join(root, "agent");
@@ -112,7 +112,12 @@ async function launch(kind: "spawn" | "resume", failWatcher: boolean, task: stri
     ui: {
       notify() {},
       // Only the detached watcher's frames fail; the widget refresh timer stays healthy.
-      setWidget() { if (uiBroken && new Error().stack!.includes("watchSubagent")) throw new Error("task460 injected watcher failure"); },
+      // "once": only the first throws, so watchSubagent's own catch returns an error result.
+      setWidget() {
+        if (!uiBroken || !new Error().stack!.includes("watchSubagent")) return;
+        if (failWatcher === "once") uiBroken = false;
+        throw new Error("task460 injected watcher failure");
+      },
       setStatus() {},
     },
   } as any;
@@ -134,7 +139,7 @@ async function launch(kind: "spawn" | "resume", failWatcher: boolean, task: stri
       const result = await tool.execute("task460", { sessionPath: childSession, name: "task460resume", message: task }, undefined, undefined, ctx);
       assert.match(result.content[0].text, /resumed/);
     }
-    uiBroken = failWatcher;
+    uiBroken = Boolean(failWatcher);
     const deadline = Date.now() + 8_000;
     while (!sent.some((m) => m.customType === "subagent_result") && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -194,8 +199,8 @@ describe("TASK-460 error-path subagent_result carries session identity", { skip:
     const nova = await throughNova(root, message, { id: "deep:TASK-460", sessionPath: childSession });
     assert.equal(message.details.sessionFile, childSession, "error completion names the child session file");
     assert.equal(nova.envelopeAfterLive.childSessionFile, childSession, "retained with the child session identity");
-    assert.equal(nova.settled.length, 1, "delivered exactly one settle wake");
-    assert.equal(nova.settled[0].details.outcome, "matched");
+    // Live ingestion settles it; the unacknowledged envelope replays as the existing duplicate wake.
+    assert.deepEqual(nova.settled.map((s) => s.details.outcome), ["matched", "duplicate"], "delivered as a settle wake");
     assert.equal(nova.state.delegation_statuses["deep:TASK-460"], "failed");
     assert.notEqual(nova.envelope.retiredReason, NO_MATCH, "never retired as NO_MATCHING_DELEGATION");
   });
@@ -210,6 +215,16 @@ describe("TASK-460 error-path subagent_result carries session identity", { skip:
     assert.ok(!nova.envelope.retiredReason, "not retired");
     assert.deepEqual(nova.state.open_delegations, ["general:TASK-901-resume"]);
     assert.equal(nova.sends.length, 0);
+  });
+
+  it("watcher-throw: watchSubagent's own error result keeps the session identity", async () => {
+    const { root, message, childSession } = await launch("spawn", "once", "Task name: TASK-460 — do the thing\n\nYou are the lane.");
+    assert.equal(message.details.exitCode, 1);
+    assert.match(message.content, /Subagent error: task460 injected watcher failure/);
+    const nova = await throughNova(root, message, { id: "deep:TASK-460", sessionPath: childSession });
+    assert.equal(message.details.sessionFile, childSession, "error result names the child session file");
+    assert.equal(nova.envelopeAfterLive.childSessionFile, childSession);
+    assert.equal(nova.settled[0]?.details.outcome, "matched");
   });
 
   it("unmatched: an error completion for a session no open delegation holds is still retired with zero sends", async () => {
@@ -228,7 +243,7 @@ describe("TASK-460 error-path subagent_result carries session identity", { skip:
     assert.equal(message.details.sessionFile, childSession);
     assert.equal(message.details.agent, "task460worker");
     const nova = await throughNova(root, message, { id: "deep:TASK-460", sessionPath: childSession });
-    assert.equal(nova.settled.length, 1);
+    assert.deepEqual(nova.settled.map((s) => s.details.outcome), ["matched", "duplicate"]);
     assert.equal(nova.state.delegation_statuses["deep:TASK-460"], "completed");
   });
 });
