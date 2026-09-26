@@ -50,6 +50,7 @@ import {
   getHarnessDriver,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
+  resolveResumeToolAllowlist,
 } from "./harness/index.ts";
 import { isPaneAbsenceSummary } from "./harness/pane-summary.ts";
 import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
@@ -2009,6 +2010,7 @@ export const __test__ = {
   resolveTimeLimitConfig,
   parseAgentDefinition,
   buildSubagentToolAllowlist,
+  resolveResumeToolAllowlist,
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
@@ -2265,6 +2267,11 @@ async function launchSubagent(
       childSessionFile: running.sessionFile,
       name: params.name,
       agent: params.agent ?? null,
+      // The requested tools the launch passes to `--tools` (control tools are
+      // added by buildSubagentToolAllowlist on both sides). TASK-450: the
+      // resume path replays this value so a resumed worker keeps the same
+      // allowlist — and the same close tools — as at spawn.
+      tools: params.tools ?? agentDefs?.tools ?? null,
       task: params.task,
       launchedAt: new Date(startTime).toISOString(),
     });
@@ -3457,6 +3464,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Load subagent-done extension so the agent can self-terminate if needed
         parts.push("-e", shellQuote(subagentDonePath));
 
+        // TASK-450: replay the spawn-time tools allowlist. Without it the
+        // resumed pi has no allowed-tool set, the lazy-tools session_start
+        // strip of the active loadout is never re-pushed, and the worker loses
+        // its close tools ("Tool subagent_done not found").
+        const resumeMetadata = readSpawnMetadata(params.sessionPath);
+        const resumeTools = resolveResumeToolAllowlist(
+          resumeMetadata?.tools,
+          resumeMetadata?.agent ? loadAgentDefaults(resumeMetadata.agent)?.tools : undefined,
+        );
+        if (resumeTools) {
+          parts.push("--tools", shellQuote(resumeTools));
+        }
+
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -3499,7 +3519,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Spawn rights on resume are clamped to what the first launch recorded:
         // missing metadata ⇒ 0 (deny); never larger than first launch.
         const resumeSpawn = clampResumeSpawn(
-          readSpawnMetadata(params.sessionPath),
+          resumeMetadata,
           parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH),
         );
         if (!resumeSpawn.maySpawn) {

@@ -22,6 +22,8 @@ export interface SpawnMetadataRecord {
   childSessionFile?: string;
   name?: string;
   agent?: string | null;
+  /** Requested tools recorded at spawn; null ⇒ that spawn passed no --tools. */
+  tools?: string | null;
   task?: string;
   taskArtifactPath?: string;
   launchedAt?: string;

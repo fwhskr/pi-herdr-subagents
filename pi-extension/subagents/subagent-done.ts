@@ -11,6 +11,26 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createSubagentActivityRecorder, readCurrentProcessIdentity } from "./activity.ts";
 import { consumeWrapupDirective } from "./time-limits.ts";
+import { SUBAGENT_CONTROL_TOOLS } from "./harness/drivers/pi.ts";
+
+/**
+ * Re-assert the close tools in the active loadout (TASK-450). The lazy-tools
+ * user extension resets the active tools to its eager set in its own
+ * session_start handler; without this, a resumed worker loses subagent_done
+ * and has no close path at all. Only tools that are actually registered are
+ * re-activated, so a denied control tool stays denied.
+ */
+export function assertControlToolsActive(pi: {
+  getAllTools: () => Array<{ name: string }>;
+  getActiveTools?: () => string[];
+  setActiveTools?: (names: string[]) => void;
+}): void {
+  if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
+  const active = pi.getActiveTools();
+  const registered = new Set(pi.getAllTools().map((tool) => tool.name));
+  const missing = SUBAGENT_CONTROL_TOOLS.filter((name) => registered.has(name) && !active.includes(name));
+  if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -614,6 +634,7 @@ export default function (
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
+    assertControlToolsActive(pi);
 
     renderWidget(ctx, null);
   });
@@ -638,6 +659,9 @@ export default function (
 
   pi.on("before_agent_start", () => {
     recorder.beforeAgentStart();
+    // A deferral that ran after session_start must never reach a provider
+    // request without the close tools.
+    assertControlToolsActive(pi);
   });
 
   pi.on("agent_start", () => {

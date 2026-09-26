@@ -9,7 +9,7 @@ import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
 import { resolveSpawnTrustFlag } from "../../spawn-trust.ts";
 
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+export const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
 export function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   const requested = (effectiveTools ?? "")
@@ -25,6 +25,25 @@ export function buildSubagentToolAllowlist(effectiveTools?: string): string | nu
   }
 
   return [...allow].join(",");
+}
+
+/**
+ * Resolve the `--tools` value for a resumed worker (TASK-450).
+ *
+ * `recordedTools` is the requested-tools value the spawn recorded in its
+ * sidecar: `undefined` means no metadata recorded it (old or missing sidecar),
+ * so resolution falls back to the agent's frontmatter defaults; a recorded
+ * `null`/blank means that spawn deliberately passed no allowlist and is
+ * authoritative. The control tools are always added, exactly as at spawn.
+ * Pure: no fs, no pane — spawn-side recording and resume-side resolution share
+ * `buildSubagentToolAllowlist`, so both sides produce the identical string.
+ */
+export function resolveResumeToolAllowlist(
+  recordedTools: string | null | undefined,
+  agentDefaultTools?: string | null,
+): string | null {
+  const requested = recordedTools === undefined ? agentDefaultTools ?? undefined : recordedTools;
+  return buildSubagentToolAllowlist(requested && requested.trim() ? requested : undefined);
 }
 
 export function buildPiPromptArgs(params: {
