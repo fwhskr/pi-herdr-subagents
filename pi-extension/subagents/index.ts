@@ -1132,6 +1132,8 @@ interface RunningSubagent {
   artifactDir?: string;
   /** Reference to the persisted pre-close scrollback, when one was written. */
   paneScrollback?: PaneScrollbackRef;
+  /** TASK-469: session id (deliveryOwner) of the session that launched this lane. */
+  owner?: string;
 }
 
 interface RecoveryPaneOperations {
@@ -1161,6 +1163,8 @@ interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
   delivery?: CompletionDelivery<ExtensionAPI>;
   latestCtx?: ExtensionContext;
+  /** TASK-469: every live session's context, keyed by session id, for per-session widgets. */
+  sessionCtxs?: Map<string, ExtensionContext>;
   modelCatalog?: string;
   agentCatalog?: string;
 }
@@ -1174,6 +1178,16 @@ const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
 const runningSubagents = runtime.runningSubagents;
+const sessionCtxs = runtime.sessionCtxs ??= new Map<string, ExtensionContext>();
+
+/**
+ * TASK-469: the registry is process-wide, but each session sees only the lanes
+ * it launched. Owner-less entries (hydrated from before this field) and an
+ * owner-less viewer keep the process-wide view, so no lane is ever dropped.
+ */
+function lanesOf(owner: string | undefined): RunningSubagent[] {
+  return Array.from(runningSubagents.values()).filter((running) => !owner || !running.owner || running.owner === owner);
+}
 const completionDelivery = runtime.delivery ??= new CompletionDelivery<ExtensionAPI>();
 
 /**
@@ -1398,31 +1412,27 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 }
 
 function updateWidget() {
-  const latestCtx = runtime.latestCtx;
-  if (!latestCtx?.hasUI) return;
+  for (const [owner, ctx] of sessionCtxs) {
+    if (!ctx.hasUI) continue;
+    ctx.ui.setWidget(
+      "subagent-status",
+      lanesOf(owner).length === 0 ? undefined : (_tui: any, _theme: any) => ({
+        invalidate() {},
+        render(width: number) {
+          return renderSubagentWidgetLines(lanesOf(owner), width);
+        },
+      }),
+      { placement: "aboveEditor" },
+    );
+  }
 
   if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
       (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
-    return;
   }
-
-  latestCtx.ui.setWidget(
-    "subagent-status",
-    (_tui: any, _theme: any) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
-        },
-      };
-    },
-    { placement: "aboveEditor" },
-  );
 }
 
 /**
@@ -1512,7 +1522,7 @@ function observeRunningSubagent(
   running.lifecycle = observeActivity(ensureLifecycle(running), read, observedAt);
 }
 
-function resolveInterruptTarget(params: { id?: string; name?: string }):
+function resolveInterruptTarget(params: { id?: string; name?: string }, owner?: string):
   | { running: RunningSubagent }
   | { error: string } {
   const requestedId = params.id?.trim();
@@ -1526,7 +1536,7 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
     return { error: "Provide a running subagent id or exact display name." };
   }
 
-  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  const matches = lanesOf(owner).filter((running) => running.name === requestedName);
   if (matches.length === 1) return { running: matches[0] };
   if (matches.length === 0) {
     return { error: `No running subagent named "${requestedName}".` };
@@ -1873,9 +1883,11 @@ function handleSubagentInterrupt(
     graceMs?: number;
     /** TASK-458: the session issuing the interrupt, named in the result and the child's exit sidecar. */
     issuer?: string;
+    /** TASK-469: the calling session; name lookup sees only its lanes. */
+    owner?: string;
   } = {},
 ) {
-  const resolved = resolveInterruptTarget(params);
+  const resolved = resolveInterruptTarget(params, options.owner);
   if ("error" in resolved) {
     return {
       content: [{ type: "text" as const, text: resolved.error }],
@@ -2329,6 +2341,7 @@ async function launchSubagent(
     lifecycle: !driver.hasActivitySnapshots
       ? markProcessRunning(createLifecycle(startTime), Date.now())
       : createLifecycle(startTime),
+    owner: deliveryOwner(ctx),
   };
 
   // First-launch spawn metadata is durable lineage as well as the authoritative
@@ -2993,6 +3006,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // subagents whose watchers survived a reload.
   pi.on("session_start", (_event, ctx) => {
     runtime.latestCtx = ctx;
+    sessionCtxs.set(deliveryOwner(ctx), ctx);
     runtime.modelCatalog = buildAuthenticatedModelCatalog(wrapPiModelRegistry(ctx.modelRegistry));
     runtime.agentCatalog = buildAvailableAgentCatalog(
       discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation),
@@ -3017,6 +3031,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     // Watchers survive reload, but the old context does not. Poll callbacks can
     // run between teardown and session_start; skip UI until the new ctx binds.
     runtime.latestCtx = undefined;
+    sessionCtxs.delete(boundOwner);
     completionDelivery.detach(shouldPreserveSubagentsOnShutdown((event as any).reason), boundOwner);
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -3323,7 +3338,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const issuer = interruptIssuer(ctx);
-        return handleSubagentInterrupt(params, interruptPane, issuer ? { issuer } : {});
+        return handleSubagentInterrupt(params, interruptPane, { ...(issuer ? { issuer } : {}), owner: deliveryOwner(ctx) });
       },
 
       renderCall(args, theme) {
@@ -3701,6 +3716,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           interactive,
           runtimePlan: undefined,
           lifecycle: createLifecycle(startTime),
+          owner: deliveryOwner(ctx),
         };
         runningSubagents.set(id, running);
         startWidgetRefresh();
