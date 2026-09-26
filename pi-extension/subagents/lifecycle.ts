@@ -53,6 +53,13 @@ export type PaneObservation =
   | { kind: "missing"; detectedAt: number; consecutiveMissing: number; error?: string };
 
 export const MISSING_PANE_DEBOUNCE_MS = 500;
+/**
+ * TASK-452: a lane that settled with no close (no completion, worker still
+ * alive) is surfaced as "idle" once it has waited this long. Same scale as the
+ * active-tool stall window; long enough to absorb non-terminal agent_end
+ * windows (compaction, auto-retry, fallback grace, pending-child polling).
+ */
+export const DEFAULT_IDLE_LANE_MS = DEFAULT_ACTIVE_TOOL_STALL_MS;
 export const MISSING_PANE_ERROR = "Subagent pane disappeared before completion evidence was recorded.";
 
 export type CompletionDelivery = "pending" | "delivered" | "suppressed";
@@ -71,7 +78,7 @@ export interface SubagentLifecycle {
 }
 
 export interface LifecycleProjection {
-  kind: "starting" | "running" | "active" | "blocked" | "waiting" | "interrupted" | "stalled" | "finalizing" | "completed" | "failed";
+  kind: "starting" | "running" | "active" | "blocked" | "waiting" | "idle" | "interrupted" | "stalled" | "finalizing" | "completed" | "failed";
   label?: string;
   runtimeEndedAt?: number;
   stateDurationSince?: number;
@@ -248,8 +255,26 @@ export function observeActivity(
 
   if (!detail) {
     // Reading succeeded but no enrichable detail; clear any stale label.
+    // Without an authoritative Herdr status, a fresh Pi "waiting" snapshot
+    // (agent_end, no close) is the only evidence the lane went idle.
+    const activity = read.activity;
+    const idleFallback = activity.phase === "waiting" &&
+      (lifecycle.lastActivitySequence == null || activity.sequence >= lifecycle.lastActivitySequence) &&
+      lifecycle.turn.kind !== "interrupted" &&
+      (lifecycle.pane.kind === "unknown" || lifecycle.pane.kind === "read-error");
     return {
       ...lifecycle,
+      ...(idleFallback
+        ? {
+            hasWorked: true,
+            turn: {
+              kind: "waiting" as const,
+              startedAt: lifecycle.turn.kind === "waiting"
+                ? lifecycle.turn.startedAt
+                : activity.waitingSince ?? observedAt,
+            },
+          }
+        : {}),
       activityDetail: null,
       activityHealth: { kind: "healthy", observedAt },
       lastActivitySequence: Math.max(lifecycle.lastActivitySequence ?? -1, read.activity.sequence),
@@ -405,7 +430,7 @@ export function markDelivery(lifecycle: SubagentLifecycle, delivery: CompletionD
 export function projectLifecycle(
   lifecycle: SubagentLifecycle,
   now: number,
-  opts?: { activeToolStallMs?: number },
+  opts?: { activeToolStallMs?: number; idleLaneMs?: number },
 ): LifecycleProjection {
   const process = lifecycle.process;
   if (process.kind === "finalizing") return { kind: "finalizing", runtimeEndedAt: process.detectedAt };
@@ -461,8 +486,13 @@ export function projectLifecycle(
     }
     case "blocked":
       return { kind: "blocked", stateDurationSince: turn.startedAt };
-    case "waiting":
+    case "waiting": {
+      const idleLaneMs = opts?.idleLaneMs ?? DEFAULT_IDLE_LANE_MS;
+      if (idleLaneMs > 0 && now - turn.startedAt >= idleLaneMs) {
+        return { kind: "idle", stateDurationSince: turn.startedAt };
+      }
       return { kind: "waiting", stateDurationSince: turn.startedAt };
+    }
     case "starting":
       return { kind: "starting", stateDurationSince: turn.observedAt };
     case "unknown":
@@ -470,13 +500,15 @@ export function projectLifecycle(
   }
 }
 
-export type LifecycleTransition = "stalled" | "recovered" | null;
+export type LifecycleTransition = "stalled" | "idle" | "recovered" | null;
 
 export function lifecycleTransition(
   previous: LifecycleProjection["kind"] | undefined,
   next: LifecycleProjection["kind"],
 ): LifecycleTransition {
   if (previous !== "stalled" && next === "stalled") return "stalled";
+  // One-shot per idle episode: only the edge into idle wakes the delegator.
+  if (previous !== "idle" && next === "idle") return "idle";
   if (
     previous === "stalled" &&
     (next === "active" ||
@@ -505,6 +537,10 @@ export function formatLifecycleTransitionLine(
     : ` ${formatElapsed(now - projection.stateDurationSince)}`;
   if (transition === "stalled") {
     return `${name} running ${runtime}, stalled${duration}.`;
+  }
+  if (transition === "idle") {
+    return `${name} running ${runtime}, idle${duration} with no close: ` +
+      "its turn ended without subagent_done or caller_ping. Resume, interrupt, or close it.";
   }
   if (projection.kind === "waiting") {
     return `${name} running ${runtime}, recovered; waiting${duration}.`;

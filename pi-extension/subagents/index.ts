@@ -1322,6 +1322,7 @@ function formatLifecycleWidgetLabel(
   if (projection.kind === "blocked") return ` blocked${duration} `;
   if (projection.kind === "running") return " running… ";
   if (projection.kind === "waiting") return ` waiting${duration} `;
+  if (projection.kind === "idle") return ` idle${duration} `;
   if (projection.kind === "interrupted") return ` interrupted${duration} `;
   if (projection.kind === "stalled") return ` stalled${duration} `;
   // completed/failed exist as lifecycle projections for delivery bookkeeping,
@@ -1900,6 +1901,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
   const recoveryDelays = parseRecoveryDelays(process.env.PI_SUBAGENT_RECOVERY_DELAYS_MS);
   const activeToolStallMs = parseActiveToolStallMs(process.env.PI_SUBAGENT_ACTIVE_TOOL_STALL_MS);
+  // Same parse contract and 600 s default as the tool stall window; 0 disables.
+  const idleLaneMs = parseActiveToolStallMs(process.env.PI_SUBAGENT_IDLE_LANE_MS);
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1920,7 +1923,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       observeRunningSubagent(running, now);
       const projection = reconcileProjectedFailure(
         running,
-        projectLifecycle(ensureLifecycle(running), now, { activeToolStallMs }),
+        projectLifecycle(ensureLifecycle(running), now, { activeToolStallMs, idleLaneMs }),
       );
       const recovery = advanceRunningRecovery(running, projection, now, recoveryDelays);
       if (recovery.action) shouldRefreshWidget = true;
