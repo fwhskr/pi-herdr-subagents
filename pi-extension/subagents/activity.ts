@@ -49,6 +49,12 @@ export interface SubagentActivityState {
   activeScope?: SubagentActivityScope;
   activeSince?: number;
   waitingSince?: number;
+  /**
+   * TASK-557: set only by agent_settled when the worker stays open with no
+   * close and no outstanding child (auto-exit off or disarmed). Any later
+   * event clears it, so its presence means "idle for good, nobody will wake it".
+   */
+  settledAt?: number;
   turnIndex?: number;
   messageEventType?: string;
   toolCallId?: string;
@@ -73,6 +79,8 @@ export interface SubagentActivityRecorder {
   agentStart(): void;
   agentEndWaiting(): void;
   agentEndDone(): void;
+  /** TASK-557: the turn settled with no close, no exit and no outstanding child. */
+  agentSettledIdle(): void;
   turnStart(turnIndex?: number): void;
   turnEnd(turnIndex?: number): void;
   beforeProviderRequest(): void;
@@ -269,6 +277,7 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateBoolean(object, "toolActive"),
     validateOptionalFiniteNumber(object, "activeSince"),
     validateOptionalFiniteNumber(object, "waitingSince"),
+    validateOptionalFiniteNumber(object, "settledAt"),
     validateOptionalInteger(object, "turnIndex"),
     validateOptionalFiniteNumber(object, "toolStartedAt"),
     validateOptionalFiniteNumber(object, "toolEndedAt"),
@@ -329,6 +338,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     agentStart() {},
     agentEndWaiting() {},
     agentEndDone() {},
+    agentSettledIdle() {},
     turnStart() {},
     turnEnd() {},
     beforeProviderRequest() {},
@@ -477,6 +487,7 @@ export function createSubagentActivityRecorder(params: {
     activity.latestEvent = latestEvent;
     activity.updatedAt = observedAt;
     activity.sequence += 1;
+    delete activity.settledAt;
     update(activity, observedAt);
 
     if (flush === "immediate") flushNow();
@@ -524,6 +535,15 @@ export function createSubagentActivityRecorder(params: {
     },
     agentEndDone() {
       markDone("agent_end");
+    },
+    agentSettledIdle() {
+      // Reuses the agent_end event name so older parent validators still accept the file.
+      record("agent_end", (current, observedAt) => {
+        clearActiveState(current);
+        current.phase = "waiting";
+        current.waitingSince ??= observedAt;
+        current.settledAt = observedAt;
+      }, "immediate");
     },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {

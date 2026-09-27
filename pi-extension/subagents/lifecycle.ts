@@ -60,6 +60,12 @@ export const MISSING_PANE_DEBOUNCE_MS = 500;
  * windows (compaction, auto-retry, fallback grace, pending-child polling).
  */
 export const DEFAULT_IDLE_LANE_MS = DEFAULT_ACTIVE_TOOL_STALL_MS;
+/**
+ * TASK-557: a child that itself reported agent_settled with no close and no
+ * outstanding child cannot be in a non-terminal agent_end window, so it is
+ * surfaced after this short grace instead of DEFAULT_IDLE_LANE_MS (< 60 s).
+ */
+export const DEFAULT_SETTLED_IDLE_MS = 30_000;
 export const MISSING_PANE_ERROR = "Subagent pane disappeared before completion evidence was recorded.";
 
 export type CompletionDelivery = "pending" | "delivered" | "suppressed";
@@ -75,6 +81,8 @@ export interface SubagentLifecycle {
   hasWorked: boolean;
   lastActivitySequence: number | null;
   delivery: CompletionDelivery;
+  /** TASK-557: the child's latest activity snapshot says it settled with no close (see activity.settledAt). */
+  settledAt?: number;
 }
 
 export interface LifecycleProjection {
@@ -258,8 +266,10 @@ export function observeActivity(
     // Without an authoritative Herdr status, a fresh Pi "waiting" snapshot
     // (agent_end, no close) is the only evidence the lane went idle.
     const activity = read.activity;
+    const fresh = lifecycle.lastActivitySequence == null || activity.sequence >= lifecycle.lastActivitySequence;
+    const settledAt = !fresh ? lifecycle.settledAt : activity.phase === "waiting" ? activity.settledAt : undefined;
     const idleFallback = activity.phase === "waiting" &&
-      (lifecycle.lastActivitySequence == null || activity.sequence >= lifecycle.lastActivitySequence) &&
+      fresh &&
       lifecycle.turn.kind !== "interrupted" &&
       (lifecycle.pane.kind === "unknown" || lifecycle.pane.kind === "read-error");
     return {
@@ -278,6 +288,7 @@ export function observeActivity(
       activityDetail: null,
       activityHealth: { kind: "healthy", observedAt },
       lastActivitySequence: Math.max(lifecycle.lastActivitySequence ?? -1, read.activity.sequence),
+      settledAt,
     };
   }
 
@@ -337,6 +348,7 @@ export function observeActivity(
     activityDetail: detail,
     activityHealth: { kind: "healthy", observedAt },
     lastActivitySequence: detail.sequence,
+    settledAt: undefined,
   };
 }
 
@@ -430,7 +442,7 @@ export function markDelivery(lifecycle: SubagentLifecycle, delivery: CompletionD
 export function projectLifecycle(
   lifecycle: SubagentLifecycle,
   now: number,
-  opts?: { activeToolStallMs?: number; idleLaneMs?: number },
+  opts?: { activeToolStallMs?: number; idleLaneMs?: number; settledIdleMs?: number },
 ): LifecycleProjection {
   const process = lifecycle.process;
   if (process.kind === "finalizing") return { kind: "finalizing", runtimeEndedAt: process.detectedAt };
@@ -490,6 +502,10 @@ export function projectLifecycle(
       const idleLaneMs = opts?.idleLaneMs ?? DEFAULT_IDLE_LANE_MS;
       if (idleLaneMs > 0 && now - turn.startedAt >= idleLaneMs) {
         return { kind: "idle", stateDurationSince: turn.startedAt };
+      }
+      const settledIdleMs = opts?.settledIdleMs ?? DEFAULT_SETTLED_IDLE_MS;
+      if (lifecycle.settledAt != null && settledIdleMs > 0 && now - lifecycle.settledAt >= settledIdleMs) {
+        return { kind: "idle", stateDurationSince: Math.min(turn.startedAt, lifecycle.settledAt) };
       }
       return { kind: "waiting", stateDurationSince: turn.startedAt };
     }

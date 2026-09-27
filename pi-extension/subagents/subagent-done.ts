@@ -768,6 +768,11 @@ export default function (
       performExit(ctx);
       return;
     }
+
+    // TASK-557: the worker stays open (auto-exit off or disarmed) with no close
+    // and nothing outstanding that would steer a new turn in. Nobody will wake
+    // it, so tell the parent now instead of after the long idle-lane window.
+    if (!wrapupInProgress && countOutstandingChildren() === 0) recorder.agentSettledIdle();
   });
 
   pi.on("turn_start", (event) => {
