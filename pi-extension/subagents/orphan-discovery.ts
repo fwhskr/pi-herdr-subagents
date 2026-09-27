@@ -60,6 +60,13 @@ export interface OrphanDiscoveryOptions {
   paneSessions?: readonly PaneSessionReference[];
   /** Alias accepted by fixture callers. */
   panes?: readonly PaneSessionReference[];
+  /**
+   * Session files of lanes the process-wide running registry still tracks
+   * (TASK-587). A tracked lane is live across an in-process /reload — even
+   * when it has a pane reference — so it is never an orphan. After a real
+   * process restart the registry is empty and discovery behaves as before.
+   */
+  liveSessionFiles?: readonly string[];
 }
 
 interface Candidate {
@@ -585,7 +592,12 @@ export function discoverOrphanedSubagents(
   }
 
   const result: DiscoveredOrphan[] = [];
+  // TASK-587: lanes the process-wide running registry still tracks are live
+  // across an in-process /reload, even with a pane reference — never orphans.
+  // An empty set (real restart) leaves genuine-orphan behavior unchanged.
+  const live = new Set((options.liveSessionFiles ?? []).map((path) => canonicalPath(path)));
   for (const candidate of candidates.values()) {
+    if (live.has(candidate.sessionFile)) continue;
     const fileExists = sessionExists(candidate.sessionFile);
     const entries = fileExists ? readJsonl(candidate.sessionFile) : [];
     const hasOwnEntries = fileExists && hasChildEntries(entries, parentEntries);

@@ -13,7 +13,6 @@ import { tmpdir } from "node:os";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { discoverOrphanedSubagents } from "../pi-extension/subagents/orphan-discovery.ts";
 import { createLifecycle } from "../pi-extension/subagents/lifecycle.ts";
-import { isActionableOrphan } from "../pi-extension/subagents/orphan-discovery.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 
 const originalEnv = new Map([

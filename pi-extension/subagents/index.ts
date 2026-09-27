@@ -2844,9 +2844,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     } catch {
       // Herdr may be restarting during parent restore; disk discovery remains useful.
     }
+    // TASK-587: the registry is process-wide and survives /reload, so every
+    // lane it still tracks is live — exclude them from both the report and the
+    // restore path. After a real restart the registry is empty: unchanged.
+    const liveSessionFiles = Array.from(runningSubagents.values(), (running) => running.sessionFile);
     return discoverOrphanedSubagents(sessionFile, {
       ...(sessionId ? { parentSessionId: sessionId } : {}),
       paneSessions,
+      liveSessionFiles,
     });
   }
 
