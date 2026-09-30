@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import subagentDoneExtension, {
   resolveAutoExit,
   resolveFallbackAwareExit,
+  deriveFallbackRecovery,
+  isFailoverEligibleError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { readCurrentProcessIdentity } from "../pi-extension/subagents/activity.ts";
 
@@ -659,6 +661,92 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       assert.equal(decide("none", true, true), "grace");
       assert.equal(decide("none", true, false), "exit");
       assert.equal(decide("none", false, true), "exit");
+    });
+
+    // TASK-60 — the producer's real queued-recovery shapes must read as pending,
+    // and the producer's real stall text must read as failover-eligible. These
+    // failed before the fix (recovery=none, eligible=false -> exit on a queued
+    // recovery); the precedence/supersede pins lock untouched rules.
+    describe("TASK-60 queued recovery contract", () => {
+      const rotateEntry = { type: "custom", customType: "agent-fallback-rotate", data: {} };
+      const retryEntry = { type: "custom", customType: "agent-fallback-retry", data: {} };
+      const continuationEntry = {
+        type: "custom_message",
+        customType: "agent-fallback-continuation",
+        data: {},
+      };
+      const stallError =
+        "OpenCode Go timeout: streaming stalled after 4m 18s (1m 31s idle, last HTTP 200); rotated to frost; retrying.";
+
+      it("rotate + continuation entries are pending", () => {
+        assert.equal(
+          deriveFallbackRecovery([assistantEntry(errorMessage), rotateEntry, continuationEntry]),
+          "pending",
+        );
+      });
+
+      it("a retry entry is pending", () => {
+        assert.equal(deriveFallbackRecovery([assistantEntry(errorMessage), retryEntry]), "pending");
+      });
+
+      it("a custom_message continuation alone is pending", () => {
+        assert.equal(
+          deriveFallbackRecovery([assistantEntry(errorMessage), continuationEntry]),
+          "pending",
+        );
+      });
+
+      it("the real watchdog stall text is failover-eligible", () => {
+        assert.equal(isFailoverEligibleError(stallError), true);
+      });
+
+      it("bare streaming-stall text is failover-eligible", () => {
+        assert.equal(
+          isFailoverEligibleError("streaming stalled: no chunk for 120000ms after HTTP 200"),
+          true,
+        );
+      });
+
+      it("reasoning-state exclusion stays ahead of transport matching", () => {
+        assert.equal(
+          isFailoverEligibleError(
+            "400 invalid_request_error ... Upstream request failed: reasoning encrypted_content was not issued to this caller",
+          ),
+          false,
+        );
+      });
+
+      it("terminal after rotate stays exhausted (precedence)", () => {
+        assert.equal(
+          deriveFallbackRecovery([
+            assistantEntry(errorMessage),
+            rotateEntry,
+            { type: "custom", customType: "agent-fallback-terminal", data: {} },
+          ]),
+          "exhausted",
+        );
+      });
+
+      it("a rotate before the last assistant is superseded", () => {
+        assert.equal(
+          deriveFallbackRecovery([
+            assistantEntry("done"),
+            rotateEntry,
+            assistantEntry(errorMessage),
+          ]),
+          "none",
+        );
+      });
+
+      it("agent-fallback-return queues no continuation and stays non-pending", () => {
+        assert.equal(
+          deriveFallbackRecovery([
+            assistantEntry(errorMessage),
+            { type: "custom", customType: "agent-fallback-return", data: {} },
+          ]),
+          "none",
+        );
+      });
     });
   });
 });
