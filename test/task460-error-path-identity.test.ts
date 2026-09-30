@@ -169,9 +169,10 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
     delegation_evidence: { [delegation.id]: { status: "running", sessionPath: delegation.sessionPath } },
   }));
   const sends: any[] = [];
+  const deliveries: Array<{ message: any; options?: any }> = [];
   const start = async (event?: unknown) => {
     const handlers: Record<string, Function> = {};
-    watch.default({ on: (name: string, h: Function) => { handlers[name] = h; }, sendMessage: (m: any) => { sends.push(m); } });
+    watch.default({ on: (name: string, h: Function) => { handlers[name] = h; }, sendMessage: (m: any, options?: any) => { sends.push(m); deliveries.push({ message: m, options }); } });
     handlers.session_start({}, { cwd: project, sessionManager: { getSessionFile: () => undefined, getSessionId: () => "nova-460" } });
     await new Promise((resolve) => setTimeout(resolve, 300)); // deferred replay
     if (event) handlers.message_end(event);
@@ -189,7 +190,7 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
   console.log(`   [nova] live.childSessionFile=${envelopeAfterLive.childSessionFile} status=${envelope.status} ` +
     `delivery=${envelope.delivery}${envelope.retiredReason ? ` retiredReason="${envelope.retiredReason}"` : ""} ` +
     `open=${JSON.stringify(state.open_delegations)} envelopes=${envelopes.length} sends=${JSON.stringify(sends.map((s) => `${s.customType}:${s.details?.outcome ?? ""}`))}`);
-  return { envelopeAfterLive, envelope, state, settled, sends };
+  return { envelopeAfterLive, envelope, state, settled, sends, deliveries };
 }
 
 describe("TASK-460 error-path subagent_result carries session identity", { skip: !existsSync(EXT) && "live nova-notify-watch.ts not installed" }, () => {
@@ -199,8 +200,21 @@ describe("TASK-460 error-path subagent_result carries session identity", { skip:
     const nova = await throughNova(root, message, { id: "deep:TASK-460", sessionPath: childSession });
     assert.equal(message.details.sessionFile, childSession, "error completion names the child session file");
     assert.equal(nova.envelopeAfterLive.childSessionFile, childSession, "retained with the child session identity");
-    // Live ingestion settles it; the unacknowledged envelope replays as the existing duplicate wake.
-    assert.deepEqual(nova.settled.map((s) => s.details.outcome), ["matched", "duplicate"], "delivered as a settle wake");
+    // Live ingestion delivers the per-lane matched settle; the replacement session's
+    // replay coalesces the already-reconciled envelope into ONE summary that reports
+    // "duplicate" and must not wake the delegating session (no double delivery).
+    // Coalesced replay shape: nova-notify-watch.ts a00a450 ("coalesce restart replay").
+    assert.equal(nova.settled[0]?.details.outcome, "matched", "live ingestion delivers the matched settle");
+    assert.deepEqual(
+      nova.settled[1]?.details.settled?.map((s: any) => [s.id, s.outcome]),
+      [["deep:TASK-460", "duplicate"]],
+      "the replay reports the completion as an already-reconciled duplicate",
+    );
+    assert.equal(
+      nova.deliveries.filter((d) => d.message.customType === "nova-delegation-settled")[1]?.options?.triggerTurn,
+      false,
+      "a duplicate replay never wakes the delegating session",
+    );
     assert.equal(nova.state.delegation_statuses["deep:TASK-460"], "failed");
     assert.notEqual(nova.envelope.retiredReason, NO_MATCH, "never retired as NO_MATCHING_DELEGATION");
   });
@@ -243,7 +257,17 @@ describe("TASK-460 error-path subagent_result carries session identity", { skip:
     assert.equal(message.details.sessionFile, childSession);
     assert.equal(message.details.agent, "task460worker");
     const nova = await throughNova(root, message, { id: "deep:TASK-460", sessionPath: childSession });
-    assert.deepEqual(nova.settled.map((s) => s.details.outcome), ["matched", "duplicate"]);
+    assert.equal(nova.settled[0]?.details.outcome, "matched", "live ingestion delivers the matched settle");
+    assert.deepEqual(
+      nova.settled[1]?.details.settled?.map((s: any) => [s.id, s.outcome]),
+      [["deep:TASK-460", "duplicate"]],
+      "the replayed completion is an already-reconciled duplicate",
+    );
+    assert.equal(
+      nova.deliveries.filter((d) => d.message.customType === "nova-delegation-settled")[1]?.options?.triggerTurn,
+      false,
+      "a duplicate replay never wakes the delegating session",
+    );
     assert.equal(nova.state.delegation_statuses["deep:TASK-460"], "completed");
   });
 });
