@@ -86,7 +86,14 @@ export function runScriptInPane(
     );
   mkdirSync(dirname(scriptPath), { recursive: true });
 
-  const scriptLines = ["#!/bin/bash"];
+  // L-334: replace inherited prompt-capable transport settings before any
+  // preamble/worker command, for every harness and the separate resume path.
+  // Child-process backstop only: this does not change the pane's parent shell.
+  const scriptLines = [
+    "#!/bin/bash",
+    "export GIT_SSH_COMMAND='/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0'",
+    "export SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never DISPLAY=",
+  ];
   if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
   // Capture the child's stderr to a per-run file while still showing it in the
   // pane (tee). TASK-330 AC3: a process-start death otherwise leaves only the
