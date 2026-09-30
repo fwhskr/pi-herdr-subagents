@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { assertSpawnCodeFresh } from "./staleness-tripwire.ts";
 import {
   closeHerdrSurface,
   createHerdrSurface,
@@ -77,6 +78,9 @@ export function runScriptInPane(
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string; stderrFile?: string },
 ): string {
+  // L-357: refuse loudly when this spawner loaded pre-drift extension code —
+  // before any launch script is written, so no un-neutralised pane can result.
+  assertSpawnCodeFresh(`runScriptInPane(${paneId})`);
   const scriptPath =
     options?.scriptPath ??
     join(

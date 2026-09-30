@@ -1,5 +1,6 @@
 import { execFile, execSync, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
+import { assertSpawnCodeFresh } from "./staleness-tripwire.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -175,6 +176,8 @@ function buildPaneSplitArgs(parentPaneId: string, direction: "right" | "down", c
 }
 
 export function createHerdrSurface(name: string): string {
+  // L-357: refuse loudly when this spawner loaded pre-drift extension code.
+  assertSpawnCodeFresh(`createHerdrSurface(${name})`);
   // Create a new tab per subagent so parallel spawns each get a full tab
   // instead of ever-narrower splits of the parent pane. Target the current
   // workspace explicitly because Herdr's implicit default may be another space.
@@ -193,6 +196,8 @@ export function createHerdrSurfaceSplit(
   name: string,
   direction: "right" | "down",
 ): string {
+  // L-357: refuse loudly when this spawner loaded pre-drift extension code.
+  assertSpawnCodeFresh(`createHerdrSurfaceSplit(${name})`);
   const parentPaneId = getHerdrParentPaneId();
   const output = herdrExec(buildPaneSplitArgs(parentPaneId, direction, process.cwd()));
   const paneId = extractHerdrPaneId(output, "pane split");
