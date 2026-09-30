@@ -160,8 +160,11 @@ export type FallbackExitDecision = "exit" | "defer" | "grace";
  * Derive fallback recovery state from session entries.
  *
  * Contract owned by the live agent-fallback-chain extension: it appends
- * `agent-fallback` / `agent-fallback-deferred` once a recovery continuation is
- * queued, and `agent-fallback-terminal` once recovery is exhausted. Only
+ * `agent-fallback-rotate` / `agent-fallback-retry` / `agent-fallback` once a
+ * recovery continuation is queued (the continuation itself arrives via
+ * sendMessage as `custom_message` `agent-fallback-continuation`; the dead
+ * `agent-fallback-deferred` token is kept for compatibility), and
+ * `agent-fallback-terminal` once recovery is exhausted. Only
  * entries appended AFTER the last assistant message belong to the attempt that
  * just settled; once a recovered turn produces a new assistant message, its
  * fallback entry is superseded.
@@ -181,9 +184,15 @@ export function deriveFallbackRecovery(
   if (lastAssistant === -1) return "none";
   for (let i = entries.length - 1; i > lastAssistant; i--) {
     const entry: any = entries[i];
-    if (entry?.type !== "custom") continue;
+    if (entry?.type !== "custom" && entry?.type !== "custom_message") continue;
     if (entry.customType === "agent-fallback-terminal") return "exhausted";
-    if (entry.customType === "agent-fallback" || entry.customType === "agent-fallback-deferred") {
+    if (
+      entry.customType === "agent-fallback" ||
+      entry.customType === "agent-fallback-deferred" ||
+      entry.customType === "agent-fallback-rotate" ||
+      entry.customType === "agent-fallback-retry" ||
+      entry.customType === "agent-fallback-continuation"
+    ) {
       return "pending";
     }
   }
@@ -218,7 +227,7 @@ export function resolveFallbackAwareExit(params: {
 const FALLBACK_LIMIT_ERROR_RE =
   /\b429\b|rate[ _-]?limit|too many requests|quota|usage[ _-]?limit|usage_limit_reached|usage_not_included|insufficient_quota|out of budget|available balance|billing hard limit|monthly usage limit|freeusagelimiterror|gousagelimiterror/i;
 const FALLBACK_TRANSPORT_ERROR_RE =
-  /upstream request failed|bad gateway|service unavailable|internal server error|gateway time-?out|connection (?:error|reset|refused|closed)|socket hang ?up|fetch failed|network error|temporarily unavailable|\b(?:404|500|502|503|504)\b|<!doctype html|<html\b/i;
+  /upstream request failed|bad gateway|service unavailable|internal server error|gateway time-?out|connection (?:error|reset|refused|closed)|socket hang ?up|fetch failed|network error|temporarily unavailable|stream stalled|streaming stalled|timed? ?out|\btimeout\b|\b(?:404|500|502|503|504)\b|<!doctype html|<html\b/i;
 const FALLBACK_REASONING_STATE_RE =
   /encrypted_content|was not issued to this caller|thinking_?signature|reasoning (?:content |state )?(?:is )?not (?:issued|found|present)|invalid_request_error.*reasoning/i;
 
