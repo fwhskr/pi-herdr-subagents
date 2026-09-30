@@ -36,7 +36,7 @@ import {
   setPaneTask,
   listPaneSessionReferences,
 } from "./terminal.ts";
-import { waitForCompletion } from "./completion.ts";
+import { waitForCompletion, type CompletionResult } from "./completion.ts";
 import type { HerdrReadSource } from "./herdr.ts";
 import {
   buildAuthenticatedModelCatalog,
@@ -808,7 +808,7 @@ const modelConfig = loadModelConfig();
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "stderr"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "stderr" | "finishedWithoutClose"
   >,
   name: string,
 ): string {
@@ -826,7 +826,7 @@ function formatStderrCapture(stderr: StderrCapture | undefined): string {
 function resolveResultPresentationCore(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "finishedWithoutClose"
   >,
   name: string,
 ): string {
@@ -869,6 +869,18 @@ function resolveResultPresentationCore(
       `${result.summary}\n\n` +
       `The subagent exited successfully but reported nothing. You can retry by ` +
       `spawning a new subagent or resume the session with subagent_resume.${sessionRef}`
+    );
+  }
+
+  // TASK-1350: a lane that ended its turn with a report but never closed is a
+  // completion recovered from its own session, not a lost lane.
+  if (result.finishedWithoutClose) {
+    return (
+      `Sub-agent "${name}" finished without closing after ${formatElapsed(result.elapsed)} ` +
+      `(its last turn ended with a report but no subagent_done or caller_ping).\n\n` +
+      `${result.summary}\n\n` +
+      `Its completion was recovered from its own session.` +
+      `${sessionRef}`
     );
   }
 
@@ -1002,6 +1014,42 @@ function classifyResumeCompletion(
 }
 
 /**
+ * TASK-1350: a delegated lane that ended its turn with a final assistant
+ * report but never called subagent_done/caller_ping and stayed open (auto-exit
+ * off or disarmed) must not be reported as a lost lane. Its own session is the
+ * completion: once the lane has settled past the bounded grace and its
+ * post-resume transcript ends in a terminal report on a normal stop, the
+ * watcher concludes with that report.
+ *
+ * Returns null for every other shape — no settled marker, a provider-error or
+ * mid-turn cut-off stop, or no terminal report — so a genuine mid-work death
+ * keeps the existing lost-lane paths (TASK-426/TASK-1343 guard behaviour is
+ * unchanged).
+ */
+export function settledNoCloseCompletion(
+  running: Pick<RunningSubagent, "sessionFile" | "interactive" | "lifecycle">,
+  now: number,
+  resumeFromEntryCount = 0,
+  settledIdleMs?: number,
+): CompletionResult | null {
+  if (running.interactive) return null;
+  const lifecycle = running.lifecycle;
+  if (lifecycle.settledAt == null || isTerminalLifecycle(lifecycle)) return null;
+  if (projectLifecycle(lifecycle, now, { settledIdleMs }).kind !== "idle") return null;
+  if (!existsSync(running.sessionFile)) return null;
+
+  const entries = getNewEntries(running.sessionFile, resumeFromEntryCount);
+  const lastAssistant = [...entries].reverse().find(
+    (entry) => entry.type === "message" && (entry as any).message?.role === "assistant",
+  ) as { message?: { stopReason?: unknown } } | undefined;
+  const stopReason = lastAssistant?.message?.stopReason;
+  if (stopReason === "error" || stopReason === "aborted" || stopReason === "toolUse") return null;
+  if (findTerminalReport(entries) === null) return null;
+
+  return { reason: "settled-no-close", exitCode: 0 };
+}
+
+/**
  * Bounded child-stderr evidence attached to process-start / no-result
  * failures. `tail` is the last captured bytes; `reason` explains why nothing
  * could be captured so the parent report never silently omits the evidence.
@@ -1058,6 +1106,12 @@ interface SubagentResult {
   failureKind?: SubagentFailureKind;
   /** A normal completion produced by the one-shot time-limit report continuation. */
   partial?: boolean;
+  /**
+   * TASK-1350: the lane ended its turn with a terminal report but never closed
+   * with subagent_done/caller_ping; the report was recovered from its own
+   * session instead of being reported as a lost lane.
+   */
+  finishedWithoutClose?: boolean;
   timeout?: "warned-wrapup" | "hard-stop";
   ping?: { name: string; message: string };
   /** Child stderr evidence on process-start / no-result failures (TASK-330). */
@@ -2136,6 +2190,7 @@ export const __test__ = {
   resolveResultPresentation,
   isReportlessCompletion,
   classifyResumeCompletion,
+  settledNoCloseCompletion,
   watchSubagent,
   resolveResumeLaunchBehavior,
   clearResumeExitSidecar,
@@ -2554,6 +2609,8 @@ async function watchSubagent(
       readWorkerActivity: running.activityFile
         ? () => readSubagentActivityFile(running.activityFile!, running.id)
         : undefined,
+      readSettledNoCloseCompletion: () =>
+        settledNoCloseCompletion(running, Date.now(), resumeFromEntryCount),
       onWorkerActivity: (read: ActivityReadResult, observedAt: number) => {
         observeRunningSubagent(running, observedAt, read);
       },
@@ -2741,6 +2798,7 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
+      ...(result.reason === "settled-no-close" ? { finishedWithoutClose: true as const } : {}),
       ...(enriched.error ? { error: enriched.error } : {}),
       ...(stderr ? { stderr } : {}),
       ...(reportless ? { failureKind } : {}),

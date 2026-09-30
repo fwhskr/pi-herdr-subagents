@@ -89,7 +89,7 @@ function terminalCompletion(exitCode: number): CompletionResult {
 }
 
 export interface CompletionResult {
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ping" | "sentinel" | "error" | "settled-no-close";
   exitCode: number;
   /** The child completed its one-shot report-only continuation after a time warning. */
   wrapup?: boolean;
@@ -121,6 +121,13 @@ export interface CompletionOptions {
   sessionFile?: string;
   sentinelFile?: string;
   onTick?: (elapsedSeconds: number) => void;
+  /**
+   * TASK-1350: returns a completion when a lane's turn ended with a terminal
+   * report but without subagent_done/caller_ping and it stays open. The caller
+   * owns the bounded-grace and report-presence admission; a null result keeps
+   * the normal wait so a genuine mid-work death is never over-suppressed.
+   */
+  readSettledNoCloseCompletion?: () => CompletionResult | null;
 }
 
 export interface SidecarWriterIdentity {
@@ -357,6 +364,19 @@ export async function waitForCompletion(
           // Status enrichment must never prevent completion detection.
         }
       }
+    }
+
+    // TASK-1350: a settled-with-no-close lane with a terminal report concludes
+    // here, after the activity read has refreshed the lifecycle, and before any
+    // pane probe so a report-bearing lane is never reclassified as lost.
+    if (options.readSettledNoCloseCompletion) {
+      let settled: CompletionResult | null = null;
+      try {
+        settled = options.readSettledNoCloseCompletion();
+      } catch {
+        settled = null;
+      }
+      if (settled) return settled;
     }
 
     if (options.inspectPane) {
