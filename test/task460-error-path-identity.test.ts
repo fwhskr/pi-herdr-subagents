@@ -174,8 +174,13 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
     const handlers: Record<string, Function> = {};
     watch.default({ on: (name: string, h: Function) => { handlers[name] = h; }, sendMessage: (m: any, options?: any) => { sends.push(m); deliveries.push({ message: m, options }); } });
     handlers.session_start({}, { cwd: project, sessionManager: { getSessionFile: () => undefined, getSessionId: () => "nova-460" } });
+    const before = sends.length;
     await new Promise((resolve) => setTimeout(resolve, 300)); // deferred replay
+    const replayed = sends.slice(before);
     if (event) handlers.message_end(event);
+    // pi loops a custom message back through message_end; acknowledge the replay
+    // summary exactly as the live pane does, so a later replay is a real no-op.
+    for (const replayMessage of replayed) handlers.message_end({ message: replayMessage });
     handlers.session_shutdown?.();
   };
   await start({ message: { role: "custom", ...message } }); // live ingestion (message_end)
@@ -190,7 +195,7 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
   console.log(`   [nova] live.childSessionFile=${envelopeAfterLive.childSessionFile} status=${envelope.status} ` +
     `delivery=${envelope.delivery}${envelope.retiredReason ? ` retiredReason="${envelope.retiredReason}"` : ""} ` +
     `open=${JSON.stringify(state.open_delegations)} envelopes=${envelopes.length} sends=${JSON.stringify(sends.map((s) => `${s.customType}:${s.details?.outcome ?? ""}`))}`);
-  return { envelopeAfterLive, envelope, state, settled, sends, deliveries };
+  return { envelopeAfterLive, envelope, state, settled, sends, deliveries, start };
 }
 
 describe("TASK-460 error-path subagent_result carries session identity", { skip: !existsSync(EXT) && "live nova-notify-watch.ts not installed" }, () => {
@@ -217,6 +222,11 @@ describe("TASK-460 error-path subagent_result carries session identity", { skip:
     );
     assert.equal(nova.state.delegation_statuses["deep:TASK-460"], "failed");
     assert.notEqual(nova.envelope.retiredReason, NO_MATCH, "never retired as NO_MATCHING_DELEGATION");
+    // No real completion is suppressed (the matched wake above), and the duplicate
+    // replay summary was acknowledged through pi's message_end loopback, so one more
+    // replacement-session replay is a no-op on the delegating session.
+    await nova.start();
+    assert.equal(nova.sends.length, 2, "an acknowledged duplicate replay is never re-delivered");
   });
 
   it("resume-error: a rejected resume watcher's failure is held for its open delegation, never retired", async () => {
