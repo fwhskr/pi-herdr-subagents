@@ -132,6 +132,45 @@ function buildTabCreateArgs(name: string, cwd: string, workspaceId: string): str
     "--cwd",
     cwd,
     "--no-focus",
+    // L-339: seed the delegated-launch transport neutraliser BEFORE the PTY
+    // shell is created, so the guarantee holds for the pane shell itself and
+    // not merely for processes a worker script starts. Agent-origin only:
+    // owner panes never pass through this builder. Values carry no quotes or
+    // escapes — the pane shell re-parses them on launch.
+    ...delegatedPaneEnvArgs(),
+  ];
+}
+
+/**
+ * argv fragments seeding the delegated-launch transport neutraliser into an
+ * agent-origin pane at creation time (L-339). Passed as argv (never through
+ * a shell), so the spaces in GIT_SSH_COMMAND need no quoting.
+ */
+function delegatedPaneEnvArgs(): string[] {
+  return [
+    "--env",
+    "GIT_SSH_COMMAND=/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0",
+    "--env",
+    "SSH_ASKPASS=/bin/false",
+    "--env",
+    "SSH_ASKPASS_REQUIRE=never",
+    "--env",
+    "DISPLAY=",
+  ];
+}
+
+function buildPaneSplitArgs(parentPaneId: string, direction: "right" | "down", cwd: string): string[] {
+  return [
+    "pane",
+    "split",
+    parentPaneId,
+    "--direction",
+    direction,
+    "--no-focus",
+    "--cwd",
+    cwd,
+    // L-339: same pane-wide neutraliser as tab create (see above).
+    ...delegatedPaneEnvArgs(),
   ];
 }
 
@@ -155,16 +194,7 @@ export function createHerdrSurfaceSplit(
   direction: "right" | "down",
 ): string {
   const parentPaneId = getHerdrParentPaneId();
-  const output = herdrExec([
-    "pane",
-    "split",
-    parentPaneId,
-    "--direction",
-    direction,
-    "--no-focus",
-    "--cwd",
-    process.cwd(),
-  ]);
+  const output = herdrExec(buildPaneSplitArgs(parentPaneId, direction, process.cwd()));
   const paneId = extractHerdrPaneId(output, "pane split");
   try {
     herdrExec(["pane", "rename", paneId, name]);
@@ -473,6 +503,7 @@ export function reportHerdrPaneTask(
 export const __herdrTest__ = {
   clearCommandAvailability: () => commandAvailability.clear(),
   buildTabCreateArgs,
+  buildPaneSplitArgs,
   buildPaneReportTaskArgs,
   buildPaneReadArgs,
   parseHerdrJson,

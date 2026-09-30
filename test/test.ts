@@ -4508,6 +4508,36 @@ describe("herdr.ts", () => {
         "--cwd",
         "/repo",
         "--no-focus",
+        // L-339: pane-wide transport neutraliser, seeded before PTY creation.
+        "--env",
+        "GIT_SSH_COMMAND=/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0",
+        "--env",
+        "SSH_ASKPASS=/bin/false",
+        "--env",
+        "SSH_ASKPASS_REQUIRE=never",
+        "--env",
+        "DISPLAY=",
+      ]);
+    });
+
+    it("seeds the transport neutraliser when splitting a subagent pane", () => {
+      assert.deepEqual(__herdrTest__.buildPaneSplitArgs("w1:p1", "right", "/repo"), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "right",
+        "--no-focus",
+        "--cwd",
+        "/repo",
+        "--env",
+        "GIT_SSH_COMMAND=/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0",
+        "--env",
+        "SSH_ASKPASS=/bin/false",
+        "--env",
+        "SSH_ASKPASS_REQUIRE=never",
+        "--env",
+        "DISPLAY=",
       ]);
     });
 
