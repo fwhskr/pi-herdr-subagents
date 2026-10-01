@@ -316,22 +316,32 @@ export function extractTerminalReportFromMessage(lastMsg: any): string | null {
   const lastTexts = lastContent
     .filter((block: any) => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
     .map((block: any) => block.text as string);
-  if (lastTexts.length > 0 && lastTexts.join("").trim()) return lastTexts.join("\n");
+  const sameMessageText =
+    lastTexts.length > 0 && lastTexts.join("").trim() ? lastTexts.join("\n") : null;
 
   // (2) final subagent_done toolCall arguments.report (non-empty string)
   const reportFromContent = extractSubagentDoneReport(lastContent);
-  if (reportFromContent !== null) return reportFromContent;
+  let reportArg = reportFromContent;
 
   // Also check alternative message-level tool-call arrays (defensive: some Pi builds store tool calls outside content).
   const altArrays: any[] = [];
   if (Array.isArray(lastMsg.toolCalls)) altArrays.push(...lastMsg.toolCalls);
   if (Array.isArray(lastMsg.tool_calls)) altArrays.push(...lastMsg.tool_calls);
   if (Array.isArray(lastMsg.toolCall)) altArrays.push(...lastMsg.toolCall);
-  if (altArrays.length > 0) {
-    const altReport = extractSubagentDoneReport(altArrays);
-    if (altReport !== null) return altReport;
+  if (reportArg === null && altArrays.length > 0) {
+    reportArg = extractSubagentDoneReport(altArrays);
   }
-  return null;
+
+  // TASK-391: the child's contract makes the report argument the deliverable.
+  // Never discard a substantive report argument in favour of a shorter
+  // same-message status line. Measured live: 91 of 364 settled lanes lost up
+  // to 4.4 KB this way (166 B text vs 4571 B report, session 6ac362fa).
+  // ponytail: length is the heuristic; a report argument strictly longer than
+  // the same-message text wins, otherwise the text wins.
+  if (reportArg !== null && (sameMessageText === null || reportArg.length > sameMessageText.length)) {
+    return reportArg;
+  }
+  return sameMessageText;
 }
 
 /**
