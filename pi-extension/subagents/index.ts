@@ -3721,7 +3721,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts: string[] = [];
+        // and neutralize any pane persona the resumed child would otherwise
+        // inherit (see the pi harness driver for why `env -u`, not an empty
+        // assignment).
+        const resumeEnvParts: string[] = ["env -u PI_HERDR_PERSONA -u SULA_DESKTOP_AGENT"];
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }

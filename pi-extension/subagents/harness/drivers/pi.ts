@@ -148,7 +148,13 @@ export class PiHarnessDriver implements HarnessDriver {
       parts.push("--tools", shellQuote(toolAllowlist));
     }
 
-    const envParts: string[] = [];
+    // A child must never inherit the pane's identity. This driver prefixes the
+    // child command with these env assignments, so a persona exported by the
+    // parent pane (PI_HERDR_PERSONA / SULA_DESKTOP_AGENT) would otherwise be
+    // inherited and resolve before the child's own PI_SUBAGENT_AGENT. `env -u`
+    // is a true unset: an empty assignment would still count as present to any
+    // reader that tests the key with `!== undefined`.
+    const envParts: string[] = ["env -u PI_HERDR_PERSONA -u SULA_DESKTOP_AGENT"];
     if (localAgentDir && existsSync(localAgentDir)) {
       envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(localAgentDir)}`);
     } else if (process.env.PI_CODING_AGENT_DIR) {
