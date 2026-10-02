@@ -20,8 +20,10 @@ const EXT = join(homedir(), ".pi", "agent", "extensions", "nova-notify-watch.ts"
 const NO_MATCH = "completion lacks a matching child session/run and original task identity";
 const ENV_NAMES = [
   "HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_LOG", "PATH",
-  "PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_SHELL_READY_DELAY_MS",
-  "PI_SESSION_FILE", "SULA_DESKTOP_AGENT",
+  "PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_SUBAGENT_NAME", "PI_SUBAGENT_SESSION",
+  "PI_SUBAGENT_SPAWN_DEPTH", "PI_SUBAGENT_SURFACE", "PI_SUBAGENT_ACTIVITY_FILE",
+  "PI_SUBAGENT_AGENT", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "SULA_DESKTOP_PARENT_THREAD_ID",
+  "PI_SESSION_FILE", "PI_SESSION_ID", "SULA_DESKTOP_AGENT", "PI_HERDR_PERSONA",
 ] as const;
 const originalEnv = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
 const roots: string[] = [];
@@ -156,8 +158,16 @@ async function launch(kind: "spawn" | "resume", failWatcher: boolean | "once", t
 
 /** Feed the captured completion into the REAL live Nova watcher, then replay it on a fresh session_start. */
 async function throughNova(root: string, message: Captured, delegation: { id: string; sessionPath: string }) {
+  // TASK-665/673: the live watcher only binds when the process does NOT look
+  // like a delegated child. This fixture runs inside a lane pane that carries
+  // delegated markers, so clear them here (restored by afterEach) — otherwise
+  // resolveAgentIdentity() returns the lane persona instead of Nova and
+  // session_start stays silent, so no completion envelope is ever retained.
+  for (const name of ENV_NAMES) {
+    if (name === "SULA_DESKTOP_AGENT" || name === "PATH") continue;
+    delete process.env[name];
+  }
   process.env.SULA_DESKTOP_AGENT = "Nova";
-  delete process.env.PI_SESSION_FILE;
   const watch = await import(EXT);
   const project = join(root, "project");
   mkdirSync(project);
