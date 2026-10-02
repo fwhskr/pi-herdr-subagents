@@ -1127,6 +1127,8 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   id: string;
+  /** Immutable delivery identity of this launch, never the shared session. */
+  completionId: string;
   name: string;
   task: string;
   agent?: string;
@@ -2384,6 +2386,7 @@ async function launchSubagent(
 
   const running: RunningSubagent = {
     id,
+    completionId: randomUUID(),
     name: params.name,
     task: params.task,
     agent: params.agent,
@@ -3258,6 +3261,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 display: true,
                 details: {
                   name: running.name,
+                  completionId: running.completionId,
                   task: running.task,
                   agent: running.agent,
                   exitCode: result.exitCode,
@@ -3289,7 +3293,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
                 display: true,
                 // TASK-460: the failure names its session like the success path, so it correlates.
-                details: { name: running.name, task: running.task, agent: running.agent, sessionFile: running.sessionFile, error: err?.message },
+                details: { name: running.name, completionId: running.completionId, task: running.task, agent: running.agent, sessionFile: running.sessionFile, error: err?.message },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -3750,6 +3754,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
+        // Refresh only an explicitly named task; generic follow-ups must not
+        // erase terminal-task identity. Preserve the first-launch capability cap,
+        // tools, agent and parent lineage verbatim, and publish before launching.
+        if (resumeMetadata && params.message && /^Task name:\s*TASK-\d+/im.test(params.message)) {
+          writeSpawnMetadata(params.sessionPath, { ...resumeMetadata, task: params.message });
+        }
+
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
@@ -3776,6 +3787,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
+          completionId: randomUUID(),
           name,
           task: params.message ?? "resumed session",
           surface,
@@ -3857,6 +3869,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 display: true,
                 details: {
                   name,
+                  completionId: running.completionId,
                   task: params.message ?? "resumed session",
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
@@ -3885,7 +3898,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name, task: running.task, sessionFile: running.sessionFile, error: err?.message },
+                details: { name, completionId: running.completionId, task: running.task, sessionFile: running.sessionFile, error: err?.message },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
