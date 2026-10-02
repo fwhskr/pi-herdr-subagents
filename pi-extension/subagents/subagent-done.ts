@@ -300,7 +300,14 @@ const FALLBACK_GUARD_POLL_MS = 200;
 // (`scheduleResume`). The runtime only has to keep the pane process alive for
 // that timer; the wait is bounded by a cumulative per-lane budget so a distant
 // horizon or a genuine outage still ends the lane.
-const FALLBACK_COOLING_TERMINAL_RE = /every chain model is cooling down/i;
+//
+// TASK-26 CROSS-REPO CONTRACT: the producer is the live stack's
+// /home/kris/.pi/agent/extensions/agent-fallback-chain.ts (a DIFFERENT
+// repository, installed at ~/.pi/agent/extensions/), which emits the terminal
+// reason starting "every chain model is cooling down". Guarded by
+// test/task26-fallback-cooling-contract.test.ts — reword either side and that
+// fixture fails.
+export const FALLBACK_COOLING_TERMINAL_RE = /every chain model is cooling down/i;
 const DEFAULT_FALLBACK_COOLING_BUDGET_MS = 30 * 60_000;
 const FALLBACK_COOLING_BUDGET_CEILING_MS = 60 * 60_000;
 const FALLBACK_COOLING_POLL_MS = 2000;
