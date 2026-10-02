@@ -88,6 +88,7 @@ import {
   markFailed,
   MISSING_PANE_DEBOUNCE_MS,
   MISSING_PANE_ERROR,
+  DEFAULT_SETTLED_IDLE_MS,
   markInterruptRequested,
   markProcessRunning,
   observeActivity,
@@ -1050,6 +1051,42 @@ export function settledNoCloseCompletion(
 }
 
 /**
+ * TASK-19: a lane the parent asked to interrupt can end its turn with
+ * `stopReason` error/aborted and stay open — Escape disarms the child's
+ * auto-exit, so no sidecar is written and `settledNoCloseCompletion`
+ * deliberately declines the error stop. Without a terminal conclusion the
+ * orchestrator sees only a quiet pane and resumes a lane the parent itself
+ * stopped (the TASK-615 shape: nudge -> "Command aborted" -> stopReason
+ * error -> exit 129 on the later pane replacement). Once the parent has asked
+ * for the stop, the lane has settled, the bounded grace elapsed, and the last
+ * turn is an aborted/error stop, the stopped wait is itself the terminal
+ * outcome.
+ */
+export function settledInterruptedState(
+  running: Pick<RunningSubagent, "sessionFile" | "interactive" | "lifecycle" | "interruptNudgedAt">,
+  now: number,
+  resumeFromEntryCount = 0,
+  settledIdleMs?: number,
+): { errorMessage: string; interruptedAt: number } | null {
+  if (running.interactive) return null;
+  if (running.interruptNudgedAt == null) return null;
+  const lifecycle = running.lifecycle;
+  if (lifecycle.settledAt == null || isTerminalLifecycle(lifecycle)) return null;
+  const grace = settledIdleMs ?? DEFAULT_SETTLED_IDLE_MS;
+  if (grace > 0 && now - lifecycle.settledAt < grace) return null;
+  if (!existsSync(running.sessionFile)) return null;
+
+  const entries = getNewEntries(running.sessionFile, resumeFromEntryCount);
+  const lastAssistant = [...entries].reverse().find(
+    (entry) => entry.type === "message" && (entry as any).message?.role === "assistant",
+  ) as { message?: { stopReason?: unknown } } | undefined;
+  const stopReason = lastAssistant?.message?.stopReason;
+  if (stopReason !== "error" && stopReason !== "aborted") return null;
+
+  return { errorMessage: INTERRUPTED_ERROR, interruptedAt: running.interruptNudgedAt };
+}
+
+/**
  * Bounded child-stderr evidence attached to process-start / no-result
  * failures. `tail` is the last captured bytes; `reason` explains why nothing
  * could be captured so the parent report never silently omits the evidence.
@@ -1150,6 +1187,14 @@ interface RunningSubagent {
   interrupted?: { errorMessage: string; interruptedAt: number; issuer?: string };
   /** TASK-458: the session that called subagent_interrupt. */
   interruptIssuer?: string;
+  /**
+   * TASK-19: when the parent last asked this lane to stop (recovery nudge,
+   * time-limit wrap-up, or an explicit interrupt). Escape leaves the child
+   * open with auto-exit disarmed, so a later aborted settle has no sidecar;
+   * this marker lets the watcher conclude it as an interrupted terminal
+   * outcome instead of a quiet, lost pane.
+   */
+  interruptNudgedAt?: number;
   recovery?: RecoveryState;
   recoveryKilled?: { errorMessage: string; killedAt: number };
   timeLimit?: TimeLimitConfig;
@@ -1614,6 +1659,9 @@ function requestSubagentInterrupt(
 ): { ok: true } | { error: string } {
   try {
     interruptPaneKey(running.surface);
+    // TASK-19: remember that the parent asked this lane to stop so a later
+    // aborted settle is concluded as an interrupted terminal outcome.
+    running.interruptNudgedAt ??= Date.now();
     return { ok: true };
   } catch (error: any) {
     return {
@@ -2193,6 +2241,7 @@ export const __test__ = {
   isReportlessCompletion,
   classifyResumeCompletion,
   settledNoCloseCompletion,
+  settledInterruptedState,
   watchSubagent,
   resolveResumeLaunchBehavior,
   clearResumeExitSidecar,
@@ -2612,8 +2661,16 @@ async function watchSubagent(
       readWorkerActivity: running.activityFile
         ? () => readSubagentActivityFile(running.activityFile!, running.id)
         : undefined,
-      readSettledNoCloseCompletion: () =>
-        settledNoCloseCompletion(running, Date.now(), resumeFromEntryCount),
+      readSettledNoCloseCompletion: () => {
+        const settled = settledNoCloseCompletion(running, Date.now(), resumeFromEntryCount);
+        if (settled) return settled;
+        // TASK-19: a parent-interrupted lane that settled on an aborted turn
+        // gets a terminal interrupted completion instead of a quiet pane.
+        const interrupted = settledInterruptedState(running, Date.now(), resumeFromEntryCount);
+        if (!interrupted) return null;
+        running.interrupted = interrupted;
+        return { reason: "settled-no-close", exitCode: INTERRUPTED_EXIT_CODE };
+      },
       onWorkerActivity: (read: ActivityReadResult, observedAt: number) => {
         observeRunningSubagent(running, observedAt, read);
       },
