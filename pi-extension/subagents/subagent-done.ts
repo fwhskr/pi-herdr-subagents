@@ -154,7 +154,53 @@ export function resolveAutoExit(
 /** Fallback recovery state derived from the agent-fallback-chain session contract. */
 export type FallbackRecoveryState = "none" | "pending" | "exhausted";
 
-export type FallbackExitDecision = "exit" | "defer" | "grace";
+export type FallbackExitDecision = "exit" | "defer" | "grace" | "cooling-wait";
+
+interface FallbackRecoveryScan {
+  state: FallbackRecoveryState;
+  /** The `agent-fallback-terminal` reason, when that entry is the deciding one. */
+  terminalReason?: string;
+}
+
+/**
+ * Scan the entries after the last assistant message for the live
+ * agent-fallback-chain extension's recovery contract. Kept as one scan so the
+ * recovery state and the terminal reason can never disagree.
+ */
+function scanFallbackRecovery(
+  entries: Array<{ type?: string; customType?: string; message?: { role?: string }; data?: { reason?: string } }> | undefined,
+): FallbackRecoveryScan {
+  if (!entries || entries.length === 0) return { state: "none" };
+  let lastAssistant = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry: any = entries[i];
+    if (entry?.type === "message" && entry.message?.role === "assistant") {
+      lastAssistant = i;
+      break;
+    }
+  }
+  if (lastAssistant === -1) return { state: "none" };
+  for (let i = entries.length - 1; i > lastAssistant; i--) {
+    const entry: any = entries[i];
+    if (entry?.type !== "custom" && entry?.type !== "custom_message") continue;
+    if (entry.customType === "agent-fallback-terminal") {
+      return {
+        state: "exhausted",
+        terminalReason: typeof entry.data?.reason === "string" ? entry.data.reason : undefined,
+      };
+    }
+    if (
+      entry.customType === "agent-fallback" ||
+      entry.customType === "agent-fallback-deferred" ||
+      entry.customType === "agent-fallback-rotate" ||
+      entry.customType === "agent-fallback-retry" ||
+      entry.customType === "agent-fallback-continuation"
+    ) {
+      return { state: "pending" };
+    }
+  }
+  return { state: "none" };
+}
 
 /**
  * Derive fallback recovery state from session entries.
@@ -172,31 +218,7 @@ export type FallbackExitDecision = "exit" | "defer" | "grace";
 export function deriveFallbackRecovery(
   entries: Array<{ type?: string; customType?: string; message?: { role?: string } }> | undefined,
 ): FallbackRecoveryState {
-  if (!entries || entries.length === 0) return "none";
-  let lastAssistant = -1;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry: any = entries[i];
-    if (entry?.type === "message" && entry.message?.role === "assistant") {
-      lastAssistant = i;
-      break;
-    }
-  }
-  if (lastAssistant === -1) return "none";
-  for (let i = entries.length - 1; i > lastAssistant; i--) {
-    const entry: any = entries[i];
-    if (entry?.type !== "custom" && entry?.type !== "custom_message") continue;
-    if (entry.customType === "agent-fallback-terminal") return "exhausted";
-    if (
-      entry.customType === "agent-fallback" ||
-      entry.customType === "agent-fallback-deferred" ||
-      entry.customType === "agent-fallback-rotate" ||
-      entry.customType === "agent-fallback-retry" ||
-      entry.customType === "agent-fallback-continuation"
-    ) {
-      return "pending";
-    }
-  }
-  return "none";
+  return scanFallbackRecovery(entries).state;
 }
 
 /**
@@ -204,7 +226,9 @@ export function deriveFallbackRecovery(
  *
  * - "pending": a recovery continuation is queued -> defer the exit and let the
  *   recovered turn run (the caller keeps it bounded).
- * - "exhausted": the chain already gave up -> exit with the original error.
+ * - "exhausted": the chain already gave up. TASK-23: when the terminal reason
+ *   is the cooling-chain marker, the live extension has an in-process
+ *   auto-resume armed, so wait (bounded) instead of exiting under it.
  * - "none": grace only when the failure is failover-eligible AND the profile
  *   declares a fallback chain, covering the async setModel race; otherwise
  *   exit exactly as before.
@@ -213,9 +237,13 @@ export function resolveFallbackAwareExit(params: {
   recovery: FallbackRecoveryState;
   failoverEligible: boolean;
   hasDeclaredFallback: boolean;
+  /** TASK-23: the exhausted terminal names a scheduled cooling auto-resume. */
+  coolingScheduled?: boolean;
 }): FallbackExitDecision {
+  if (params.recovery === "exhausted") {
+    return params.coolingScheduled ? "cooling-wait" : "exit";
+  }
   if (params.recovery === "pending") return "defer";
-  if (params.recovery === "exhausted") return "exit";
   return params.failoverEligible && params.hasDeclaredFallback ? "grace" : "exit";
 }
 
@@ -266,6 +294,16 @@ export function agentDeclaresFallbackChain(cwd: string): boolean {
 
 const DEFAULT_FALLBACK_GUARD_MS = 5000;
 const FALLBACK_GUARD_POLL_MS = 200;
+// TASK-23 — an all-cooling chain is not a dead end. The live
+// agent-fallback-chain extension appends `agent-fallback-terminal` with this
+// reason AND arms its own in-process resume timer at the soonest cooldown
+// (`scheduleResume`). The runtime only has to keep the pane process alive for
+// that timer; the wait is bounded by a cumulative per-lane budget so a distant
+// horizon or a genuine outage still ends the lane.
+const FALLBACK_COOLING_TERMINAL_RE = /every chain model is cooling down/i;
+const DEFAULT_FALLBACK_COOLING_BUDGET_MS = 30 * 60_000;
+const FALLBACK_COOLING_BUDGET_CEILING_MS = 60 * 60_000;
+const FALLBACK_COOLING_POLL_MS = 2000;
 
 // Pending-child yield (TASK-395; Sade agent-identity LLA §5A). The parent-side
 // extension (index.ts) keeps its delegated children in a process-global
@@ -292,6 +330,13 @@ function fallbackGuardMs(): number {
   const raw = Number(process.env.PI_SUBAGENT_FALLBACK_GUARD_MS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_FALLBACK_GUARD_MS;
   return Math.min(raw, 10_000);
+}
+
+/** Cumulative per-lane budget for waiting out an all-cooling provider chain. */
+function fallbackCoolingBudgetMs(): number {
+  const raw = Number(process.env.PI_SUBAGENT_FALLBACK_COOLING_WAIT_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_FALLBACK_COOLING_BUDGET_MS;
+  return Math.min(raw, FALLBACK_COOLING_BUDGET_CEILING_MS);
 }
 
 function uncaughtExceptionMessage(error: unknown): string {
@@ -538,6 +583,10 @@ export default function (
 
   let fallbackGuardTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingChildTimer: ReturnType<typeof setTimeout> | undefined;
+  // TASK-23: cumulative cooling-wait time spent this session, and when the
+  // active cooling wait was armed (for accounting on clear/exit).
+  let coolingWaitSpentMs = 0;
+  let coolingWaitArmedAt: number | undefined;
 
   function clearPendingChildGuard(): void {
     if (pendingChildTimer) {
@@ -547,6 +596,10 @@ export default function (
   }
 
   function clearFallbackGuard(): void {
+    if (coolingWaitArmedAt !== undefined) {
+      coolingWaitSpentMs += Date.now() - coolingWaitArmedAt;
+      coolingWaitArmedAt = undefined;
+    }
     if (fallbackGuardTimer) {
       clearTimeout(fallbackGuardTimer);
       fallbackGuardTimer = undefined;
@@ -589,20 +642,45 @@ export default function (
    * ("pending") or racing the async setModel ("none"). It never waits
    * unbounded: on the deadline it exits with the original provider error
    * exactly as before. `turn_start` cancels it once the recovered turn starts.
+   *
+   * TASK-23 cooling mode: the chain is entirely cooling and the live extension
+   * has armed its own in-process auto-resume timer at the soonest cooldown, so
+   * the recovery state stays `exhausted` until that timer fires. Stay alive
+   * until `turn_start` (the resume started) or the cumulative budget expires.
+   * This is a wait on the extension's own timer, never a retry loop: the
+   * runtime never contacts a cooling provider itself.
    */
-  function armFallbackGuard(ctx: any): void {
+  function armFallbackGuard(ctx: any, opts: { cooling?: boolean } = {}): void {
     clearFallbackGuard();
-    const deadline = Date.now() + fallbackGuardMs();
-    const tick = () => {
-      fallbackGuardTimer = undefined;
-      const recovery = deriveFallbackRecovery(sessionEntries(ctx));
-      if (recovery === "exhausted" || Date.now() >= deadline) {
+    let deadline: number;
+    if (opts.cooling) {
+      const remaining = fallbackCoolingBudgetMs() - coolingWaitSpentMs;
+      if (remaining <= 0) {
         performExit(ctx);
         return;
       }
-      fallbackGuardTimer = setTimeout(tick, FALLBACK_GUARD_POLL_MS);
+      coolingWaitArmedAt = Date.now();
+      deadline = coolingWaitArmedAt + remaining;
+    } else {
+      deadline = Date.now() + fallbackGuardMs();
+    }
+    const pollMs = opts.cooling ? FALLBACK_COOLING_POLL_MS : FALLBACK_GUARD_POLL_MS;
+    const nextDelay = () => Math.min(pollMs, Math.max(0, deadline - Date.now()));
+    const tick = () => {
+      fallbackGuardTimer = undefined;
+      const expired = Date.now() >= deadline;
+      if (opts.cooling) {
+        if (expired) {
+          performExit(ctx);
+          return;
+        }
+      } else if (expired || deriveFallbackRecovery(sessionEntries(ctx)) === "exhausted") {
+        performExit(ctx);
+        return;
+      }
+      fallbackGuardTimer = setTimeout(tick, nextDelay());
     };
-    fallbackGuardTimer = setTimeout(tick, FALLBACK_GUARD_POLL_MS);
+    fallbackGuardTimer = setTimeout(tick, nextDelay());
   }
 
   /**
@@ -653,6 +731,9 @@ export default function (
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    // TASK-23: a fresh (possibly resumed) lane gets a fresh cooling budget.
+    coolingWaitSpentMs = 0;
+    coolingWaitArmedAt = undefined;
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -752,13 +833,20 @@ export default function (
     // re-evaluates before any exit, so a missed recovery still reports the
     // original provider error.
     if (shouldExit && stopReason === "error") {
+      const scan = scanFallbackRecovery(sessionEntries(ctx));
       const decision = resolveFallbackAwareExit({
-        recovery: deriveFallbackRecovery(sessionEntries(ctx)),
+        recovery: scan.state,
         failoverEligible: isFailoverEligibleError(
           findLatestAssistantError(latestAgentMessages)?.errorMessage,
         ),
         hasDeclaredFallback: agentDeclaresFallbackChain(ctx?.cwd ?? process.cwd()),
+        coolingScheduled: scan.state === "exhausted"
+          && FALLBACK_COOLING_TERMINAL_RE.test(scan.terminalReason ?? ""),
       });
+      if (decision === "cooling-wait") {
+        armFallbackGuard(ctx, { cooling: true });
+        return;
+      }
       if (decision === "defer" || decision === "grace") {
         armFallbackGuard(ctx);
         return;
