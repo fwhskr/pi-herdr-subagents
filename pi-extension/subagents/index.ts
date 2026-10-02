@@ -2475,6 +2475,9 @@ async function launchSubagent(
       // allowlist — and the same close tools — as at spawn.
       tools: params.tools ?? agentDefs?.tools ?? null,
       task: params.task,
+      // TASK-13: publish this attempt's settlement identity before the pane runs.
+      completionId: running.completionId,
+      attemptTask: running.task,
       launchedAt: new Date(startTime).toISOString(),
     });
   } catch {
@@ -3373,6 +3376,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id: running.id,
             name: params.name,
             task: params.task,
+            completionId: running.completionId,
+            attemptTask: running.task,
             agent: params.agent,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
@@ -3679,6 +3684,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
+        // TASK-13: mint this attempt's settlement identity before the sidecar is
+        // published, so registration and the completion envelope carry one id.
+        const completionId = randomUUID();
 
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
@@ -3814,8 +3822,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Refresh only an explicitly named task; generic follow-ups must not
         // erase terminal-task identity. Preserve the first-launch capability cap,
         // tools, agent and parent lineage verbatim, and publish before launching.
-        if (resumeMetadata && params.message && /^Task name:\s*TASK-\d+/im.test(params.message)) {
-          writeSpawnMetadata(params.sessionPath, { ...resumeMetadata, task: params.message });
+        // TASK-13: publish the new attempt's completionId and effective brief
+        // before launching. The historical `task` is refreshed only for an
+        // explicitly named Backlog task, preserving its prior semantics.
+        if (resumeMetadata) {
+          const attemptTask = params.message ?? resumeMetadata.task;
+          writeSpawnMetadata(params.sessionPath, {
+            ...resumeMetadata,
+            ...(params.message && /^Task name:\s*TASK-\d+/im.test(params.message) ? { task: params.message } : {}),
+            completionId,
+            ...(attemptTask ? { attemptTask } : {}),
+          });
         }
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -3844,7 +3861,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
-          completionId: randomUUID(),
+          completionId,
           name,
           task: params.message ?? "resumed session",
           surface,
@@ -3968,6 +3985,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id,
             name,
             sessionPath: params.sessionPath,
+            completionId,
+            attemptTask: running.task,
             launchScriptFile,
             status: "started",
           },

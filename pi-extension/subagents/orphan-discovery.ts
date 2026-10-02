@@ -25,6 +25,10 @@ export interface SpawnMetadataRecord {
   /** Requested tools recorded at spawn; null ⇒ that spawn passed no --tools. */
   tools?: string | null;
   task?: string;
+  /** TASK-13: this attempt's durable settlement identity, minted before launch. */
+  completionId?: string;
+  /** TASK-13: the exact effective brief of this attempt (spawn task or resume message). */
+  attemptTask?: string;
   taskArtifactPath?: string;
   launchedAt?: string;
 }
