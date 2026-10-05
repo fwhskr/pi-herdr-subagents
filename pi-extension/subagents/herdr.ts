@@ -42,7 +42,9 @@ export function isHerdrAvailable(): boolean {
   return process.env.HERDR_ENV === "1" && hasCommand("herdr");
 }
 
-function parseHerdrJson(value: string): unknown {
+type HerdrJson = null | boolean | number | string | HerdrJson[] | { [key: string]: HerdrJson };
+
+function parseHerdrJson(value: string): HerdrJson {
   try {
     return JSON.parse(value);
   } catch {
@@ -70,7 +72,7 @@ function extractHerdrRootPaneId(output: string, context: string): string {
 }
 
 function herdrExec(args: string[]): string {
-  return execFileSync("herdr", args, { encoding: "utf8" });
+  return execFileSync("herdr", args, { encoding: "utf8", timeout: HERDR_COMMAND_TIMEOUT_MS });
 }
 
 async function herdrExecAsync(

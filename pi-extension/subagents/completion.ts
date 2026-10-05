@@ -95,6 +95,8 @@ export interface CompletionResult {
   wrapup?: boolean;
   /** Keep the live pane available for inspection after a hard worker exit. */
   preservePane?: boolean;
+  /** An identified autonomous run was forced terminal at a settled boundary. */
+  forcedExit?: true;
   ping?: { name: string; message: string };
   errorMessage?: string;
 }
@@ -177,6 +179,8 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
     message?: unknown;
     errorMessage?: unknown;
     wrapup?: unknown;
+    forcedExit?: unknown;
+    exitCode?: unknown;
   };
 
   if (payload?.type === "ping") {
@@ -195,7 +199,12 @@ export function interpretExitSidecar(data: unknown): CompletionResult {
       typeof payload.errorMessage === "string" && payload.errorMessage.trim()
         ? payload.errorMessage
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
+    return {
+      reason: "error",
+      exitCode: payload.forcedExit === true && payload.exitCode === 130 ? 130 : 1,
+      errorMessage,
+      ...(payload.forcedExit === true ? { forcedExit: true as const } : {}),
+    };
   }
 
   if (payload?.type === "done") {
@@ -222,6 +231,7 @@ function consumeExitSidecar(
     const payload = JSON.parse(readFileSync(exitFile, "utf8")) as {
       type?: unknown;
       stopReason?: unknown;
+      forcedExit?: unknown;
       runId?: unknown;
       workerPid?: unknown;
       workerStartTime?: unknown;
@@ -236,7 +246,7 @@ function consumeExitSidecar(
     }
     const result = interpretExitSidecar(payload);
     rmSync(exitFile, { force: true });
-    return payload.type === "error" && payload.stopReason !== "error"
+    return payload.type === "error" && payload.stopReason !== "error" && payload.forcedExit !== true
       ? { ...result, preservePane: true }
       : result;
   } catch {

@@ -827,7 +827,7 @@ function formatStderrCapture(stderr: StderrCapture | undefined): string {
 function resolveResultPresentationCore(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "finishedWithoutClose"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "finishedWithoutClose" | "interruptedBy" | "terminalTask"
   >,
   name: string,
 ): string {
@@ -1048,6 +1048,32 @@ export function settledNoCloseCompletion(
   if (findTerminalReport(entries) === null) return null;
 
   return { reason: "settled-no-close", exitCode: 0 };
+}
+
+/** Parent backstop for a legacy child that disarmed or lost its close path. */
+export function settledForcedExitCompletion(
+  running: Pick<RunningSubagent, "sessionFile" | "interactive" | "lifecycle">,
+  now: number,
+  resumeFromEntryCount = 0,
+): CompletionResult | null {
+  if (running.interactive || isTerminalLifecycle(running.lifecycle)) return null;
+  const settledAt = running.lifecycle.settledAt;
+  if (settledAt == null || now - settledAt < DEFAULT_SETTLED_IDLE_MS) return null;
+  const entries = existsSync(running.sessionFile) ? getNewEntries(running.sessionFile, resumeFromEntryCount) : [];
+  const lastAssistant = [...entries].reverse().find(
+    (entry) => entry.type === "message" && (entry as any).message?.role === "assistant",
+  ) as { message?: { stopReason?: string; errorMessage?: string } } | undefined;
+  const message = lastAssistant?.message;
+  const reason = message?.stopReason;
+  if (reason === "stop") return { reason: "settled-no-close", exitCode: 0 };
+  return {
+    reason: "settled-no-close",
+    exitCode: reason === "aborted" ? INTERRUPTED_EXIT_CODE : 1,
+    forcedExit: true,
+    errorMessage: reason === "error" && message?.errorMessage
+      ? message.errorMessage
+      : `Delegated turn settled without a terminal control signal (stopReason=${reason ?? "missing"}); forced exit.`,
+  };
 }
 
 /**
@@ -2241,6 +2267,7 @@ export const __test__ = {
   isReportlessCompletion,
   classifyResumeCompletion,
   settledNoCloseCompletion,
+  settledForcedExitCompletion,
   settledInterruptedState,
   watchSubagent,
   resolveResumeLaunchBehavior,
@@ -2670,7 +2697,7 @@ async function watchSubagent(
         // TASK-19: a parent-interrupted lane that settled on an aborted turn
         // gets a terminal interrupted completion instead of a quiet pane.
         const interrupted = settledInterruptedState(running, Date.now(), resumeFromEntryCount);
-        if (!interrupted) return null;
+        if (!interrupted) return settledForcedExitCompletion(running, Date.now(), resumeFromEntryCount);
         running.interrupted = interrupted;
         return { reason: "settled-no-close", exitCode: INTERRUPTED_EXIT_CODE };
       },
@@ -2690,8 +2717,19 @@ async function watchSubagent(
     });
 
     const detectedAt = Date.now();
+    if (result.reason === "settled-no-close") {
+      // The consumed completion sidecar is not a durable terminal record.
+      // Bind the backstop outcome to this attempt before tearing its pane down.
+      writeFileSync(`${sessionFile}.terminal.${encodeURIComponent(running.id)}.json`, JSON.stringify({
+        ...result, runId: running.id, sessionFile, detectedAt, forcedExit: true,
+      }));
+    }
     const interruptedResult = buildInterruptedResult(running, detectedAt);
     if (interruptedResult) {
+      // This early result used to skip the normal close/finalize path, leaving
+      // the interrupted child alive after its completion had been delivered.
+      closePaneQuietly(surface);
+      running.lifecycle = markFailed(running.lifecycle, interruptedResult.summary, detectedAt, INTERRUPTED_EXIT_CODE);
       updateWidget();
       return interruptedResult;
     }
@@ -2777,7 +2815,9 @@ async function watchSubagent(
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, resumeFromEntryCount);
       admissionEntries = allEntries;
-      failureKind = classifySessionFailure(allEntries);
+      // Exit 130 is an observed interrupt, not evidence the owner caused it.
+      failureKind = result.exitCode === INTERRUPTED_EXIT_CODE ? "interrupted" : classifySessionFailure(allEntries);
+      if (result.forcedExit && failureKind === "operator") failureKind = "no-result";
       if (running.runtimePlan) {
         const observation = classifyRuntimeObservation(allEntries, running.runtimePlan.model);
         const observedThinking =

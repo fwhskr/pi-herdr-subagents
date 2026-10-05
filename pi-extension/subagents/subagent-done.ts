@@ -400,6 +400,24 @@ export function buildCompletionSidecar(messages: any[] | undefined, wrapup = fal
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done", ...(wrapup ? { wrapup: true } : {}) };
 }
 
+/** A settled autonomous delegation must not silently become an operator session. */
+export function buildForcedCompletionSidecar(messages: any[] | undefined, wrapup = false) {
+  const stopReason = latestAssistantStopReason(messages);
+  if (stopReason === "stop" || stopReason === "error") {
+    const completion = buildCompletionSidecar(messages, wrapup);
+    return { ...completion, forcedExit: true, exitCode: completion.type === "error" ? 1 : 0 };
+  }
+  return {
+    type: "error" as const,
+    forcedExit: true,
+    stopReason,
+    exitCode: stopReason === "aborted" ? 130 : 1,
+    errorMessage: stopReason === "aborted"
+      ? "Delegated turn was aborted without a terminal control signal; forced exit (interrupt source unknown)."
+      : `Delegated turn settled without a terminal assistant response (stopReason=${stopReason ?? "missing"}); forced exit.`,
+  };
+}
+
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -432,6 +450,9 @@ export default function (
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
   const runId = process.env.PI_SUBAGENT_ID?.trim() || undefined;
+  // The parent explicitly launched this identified run as a one-shot. Legacy
+  // standalone/operator sessions retain their existing takeover semantics.
+  const delegatedTerminalRequired = autoExit && Boolean(runId);
   const processIdentity = readCurrentProcessIdentity();
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
@@ -504,6 +525,11 @@ export default function (
   ): void {
     if (exitSidecarWritten) return;
     if (!targetSessionFile) return;
+    if (data.forcedExit === true && runId) {
+      // Unlike .exit (consumed by the parent), this identity-bound outcome is
+      // durable even when the parent is restarted or delivery races shutdown.
+      writeFileSync(`${targetSessionFile}.terminal.${encodeURIComponent(runId)}.json`, JSON.stringify(data));
+    }
     writeFileSync(`${targetSessionFile}.exit`, JSON.stringify(data));
     exitSidecarWritten = true;
   }
@@ -622,16 +648,19 @@ export default function (
   }
 
   function performExit(ctx: any): void {
+    if (exitSidecarWritten) return;
     clearFallbackGuard();
     clearPendingChildGuard();
     const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
     if (targetSessionFile) {
       try {
-        const completion = buildCompletionSidecar(latestAgentMessages, wrapupInProgress);
+        const completion = delegatedTerminalRequired
+          ? buildForcedCompletionSidecar(latestAgentMessages, wrapupInProgress)
+          : buildCompletionSidecar(latestAgentMessages, wrapupInProgress);
         writeExitSidecar(stampedSidecar(
           completion,
           completion.type === "error"
-            ? { exitCode: 1, message: completion.errorMessage }
+            ? { exitCode: "exitCode" in completion ? completion.exitCode : 1, message: completion.errorMessage }
             : { exitCode: 0, message: "completed" },
         ));
       } catch {
@@ -710,7 +739,7 @@ export default function (
         pendingChildTimer = setTimeout(tick, pendingChildPollMs());
         return;
       }
-      if (!resolveAutoExit({ disarmed, oneShotReArm }, stopReason)) return;
+      if (!delegatedTerminalRequired && !resolveAutoExit({ disarmed, oneShotReArm }, stopReason)) return;
       oneShotReArm = false;
       performExit(ctx);
     };
@@ -724,6 +753,7 @@ export default function (
   // auto-exit for this session. The warning is latched so it is emitted
   // exactly once no matter how often the operator interacts afterwards.
   function disarmAutoExit(cause: string, ctx: any): void {
+    if (delegatedTerminalRequired) return;
     disarmed = true;
     clearPendingChildGuard();
     if (!autoExit || warnedOperatorTakeover) return;
@@ -789,6 +819,7 @@ export default function (
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    if (exitSidecarWritten) return;
     // A newer settled turn supersedes any pending-child wait from an earlier one.
     clearPendingChildGuard();
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
@@ -812,7 +843,7 @@ export default function (
 
     // An Escape-triggered abort is operator takeover too: permanently disarm
     // (single warning above) and leave the session open for inspection.
-    if (stopReason === "aborted") {
+    if (stopReason === "aborted" && !delegatedTerminalRequired) {
       disarmAutoExit("Escape", ctx);
     }
 
@@ -821,7 +852,7 @@ export default function (
     // operator had disarmed auto-exit earlier. The one-shot re-arm is consumed
     // only when the auto-exit branch itself decided the exit (L-95 rule).
     const autoExitShouldFire = autoExit
-      && resolveAutoExit({ disarmed, oneShotReArm }, stopReason);
+      && (delegatedTerminalRequired || resolveAutoExit({ disarmed, oneShotReArm }, stopReason));
     const shouldExit = autoExitShouldFire
       || (wrapupInProgress && isTerminalAutoExitStopReason(stopReason));
 
