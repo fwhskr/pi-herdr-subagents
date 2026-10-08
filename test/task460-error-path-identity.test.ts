@@ -176,7 +176,9 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
   writeFileSync(statePath, JSON.stringify({
     batch_id: "B-460", task_ids: [], statuses: {}, open_delegations: [delegation.id], notes: [], ts: new Date().toISOString(),
     run_id: "run-460", run_generation: 1,
-    delegation_evidence: { [delegation.id]: { status: "running", sessionPath: delegation.sessionPath } },
+    // TASK-13 AC8: the producer durably registers the current attempt (completionId + effective brief)
+    // before launch; settlement only correlates a completion against that registration.
+    delegation_evidence: { [delegation.id]: { status: "running", sessionPath: delegation.sessionPath, completionId: message.details.completionId, attemptTask: message.details.task } },
   }));
   const sends: any[] = [];
   const deliveries: Array<{ message: any; options?: any }> = [];
@@ -187,10 +189,10 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
     const before = sends.length;
     await new Promise((resolve) => setTimeout(resolve, 300)); // deferred replay
     const replayed = sends.slice(before);
-    if (event) handlers.message_end(event);
+    if (event) await handlers.message_end(event);
     // pi loops a custom message back through message_end; acknowledge the replay
     // summary exactly as the live pane does, so a later replay is a real no-op.
-    for (const replayMessage of replayed) handlers.message_end({ message: replayMessage });
+    for (const replayMessage of replayed) await handlers.message_end({ message: replayMessage });
     handlers.session_shutdown?.();
   };
   await start({ message: { role: "custom", ...message } }); // live ingestion (message_end)
