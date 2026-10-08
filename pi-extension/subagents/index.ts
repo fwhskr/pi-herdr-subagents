@@ -10,6 +10,7 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   renameSync,
@@ -3901,6 +3902,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, { encoding: "utf8", flag: "wx" });
+          chmodSync(resumeMsgFile, 0o444);
           promptSha256 = createHash("sha256").update(params.message, "utf8").digest("hex");
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }

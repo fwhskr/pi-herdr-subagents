@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
@@ -41,6 +42,10 @@ beforeEach(() => {
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
 });
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
 
 function writeJsonl(path: string, entries: object[]): void {
   writeFileSync(path, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
@@ -165,6 +170,10 @@ describe("TASK-134 same-name concurrent resumes keep per-attempt artifacts", () 
         undefined, undefined, built.ctx,
       );
       assert.equal(result.details.status, "started", JSON.stringify(result.details));
+      assert.ok(typeof result.details.promptFile === "string", "receipt names the prompt file");
+      assert.equal(result.details.promptSha256, sha256(attempt.message), "receipt names the effective prompt hash");
+      assert.equal(statSync(result.details.promptFile).mode & 0o222, 0, "prompt artifact is immutable");
+      assert.equal(readFileSync(result.details.promptFile, "utf8"), attempt.message, "receipt prompt file holds the attempt's own message");
     }
 
     const scriptDir = join(root, "artifacts", "parent-id", "subagent-scripts");
@@ -246,5 +255,60 @@ describe("TASK-134 explicit task requests are checked against the retained sessi
     for (const result of results) assert.equal(result.details.status, "started", JSON.stringify(result.details));
     assert.equal(scriptsFor(statistics.child).length, 1, "matching resume launches exactly once");
     assert.equal(scriptsFor(dashboard.child).length, 1, "independent matching resume launches exactly once");
+  });
+});
+describe("TASK-134 same-name resume orderings keep each attempt's binding", () => {
+  it("orderings: three same-name concurrent resumes in every start order each receive their own prompt, then serial success", { timeout: 40_000 }, async () => {
+    const orders = [[0, 1, 2], [2, 1, 0], [1, 2, 0]];
+    for (const order of orders) {
+      mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-08T14:00:00.250Z").getTime() });
+      const root = mkdtempSync(join(tmpdir(), "task134-order-"));
+      tempRoots.add(root);
+      fakeHerdr(root);
+      process.env.HERDR_ENV = "1";
+      process.env.HERDR_PANE_ID = "parent-pane";
+      process.env.HERDR_TAB_ID = "parent-tab";
+      process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+      process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      __herdrTest__.clearCommandAvailability();
+
+      const parent = join(root, "parent.jsonl");
+      const entries: object[] = [header("parent-id", root)];
+      writeJsonl(parent, entries);
+      const attempts = ["ORD-A", "ORD-B", "ORD-C", "ORD-D"].map((label) => {
+        const cwd = join(root, `cwd-${label}`);
+        mkdirSync(cwd, { recursive: true });
+        const child = join(root, `${label}.jsonl`);
+        writeJsonl(child, [header(`child-${label}`, cwd)]);
+        return { label, child, message: `Task name: ${label}\nbody for ${label} in order ${order.join("")}` };
+      });
+
+      const built = createApi(parent, entries);
+      built.ctx.cwd = root;
+      subagentsExtension(built.api);
+      built.handlers.get("session_start")?.[0]({}, built.ctx);
+      const tool = built.tools.find((candidate) => candidate.name === "subagent_resume");
+      assert.ok(tool, "subagent_resume tool registered");
+
+      // Start three concurrent attempts in the given order; the fourth runs serially afterwards.
+      const concurrent = order.map((index) => {
+        const attempt = attempts[index];
+        return tool.execute(`ord-${attempt.label}`, { name: "artist", sessionPath: attempt.child, message: attempt.message, autoExit: true }, undefined, undefined, built.ctx)
+          .then((result: any) => ({ attempt, result }));
+      });
+      const settled = await Promise.all(concurrent);
+      for (const { attempt, result } of settled) {
+        assert.equal(result.details.status, "started", `order ${order.join("")} ${attempt.label}: ${JSON.stringify(result.details)}`);
+        assert.equal(result.details.promptSha256, sha256(attempt.message), `order ${order.join("")} ${attempt.label}: receipt hash is its own prompt`);
+        assert.equal(readFileSync(result.details.promptFile, "utf8"), attempt.message, `order ${order.join("")} ${attempt.label}: prompt file is its own`);
+      }
+      assert.equal(new Set(settled.map(({ result }) => result.details.promptFile)).size, 3, "three distinct prompt artifacts");
+
+      const serial = await tool.execute("ord-serial", { name: "artist", sessionPath: attempts[3].child, message: attempts[3].message, autoExit: true }, undefined, undefined, built.ctx);
+      assert.equal(serial.details.status, "started", JSON.stringify(serial.details));
+      assert.equal(readFileSync(serial.details.promptFile, "utf8"), attempts[3].message, "serial attempt keeps its own prompt");
+      mock.timers.reset();
+    }
   });
 });
