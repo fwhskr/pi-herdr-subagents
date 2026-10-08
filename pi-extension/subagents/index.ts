@@ -3813,7 +3813,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          // TASK-134: key the prompt by this attempt's completionId (unique per
+          // attempt), never by name + clock second, so concurrent same-name resumes
+          // cannot overwrite each other's prompt. `wx` refuses any reuse outright.
           resumeMsgFile = join(
             artifactDir,
             "subagent-resume",
@@ -3822,10 +3824,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/[^a-z0-9\s-]/g, "")
               .replace(/\s+/g, "-")
               .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+              .replace(/^-|-$/g, "") || "resume"}-${completionId}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, params.message, "utf8");
+          writeFileSync(resumeMsgFile, params.message, { encoding: "utf8", flag: "wx" });
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
@@ -3884,7 +3886,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/[^a-z0-9\s-]/g, "")
             .replace(/\s+/g, "-")
             .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+            .replace(/^-|-$/g, "") || "resume"}-resume-${completionId}.sh`,
         );
         runScriptInPane(surface, command, {
           scriptPath: launchScriptFile,
