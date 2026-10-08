@@ -809,7 +809,7 @@ const modelConfig = loadModelConfig();
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "stderr" | "finishedWithoutClose"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "stderr" | "finishedWithoutClose" | "reportMissing"
   >,
   name: string,
 ): string {
@@ -827,7 +827,7 @@ function formatStderrCapture(stderr: StderrCapture | undefined): string {
 function resolveResultPresentationCore(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "finishedWithoutClose" | "interruptedBy" | "terminalTask"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "failureKind" | "partial" | "timeout" | "finishedWithoutClose" | "interruptedBy" | "terminalTask" | "reportMissing"
   >,
   name: string,
 ): string {
@@ -859,6 +859,10 @@ function resolveResultPresentationCore(
       `Sub-agent "${name}" was stopped at its hard time limit after ` +
       `${formatElapsed(result.elapsed)}.\n\n${result.summary}${sessionRef}`
     );
+  }
+
+  if (result.reportMissing) {
+    return `Sub-agent "${name}" exited successfully (${formatElapsed(result.elapsed)}), but supplied no terminal report.\n\n${result.summary}${sessionRef}`;
   }
 
   // TASK-337: an exit-0 completion with no terminal report is not a success.
@@ -977,6 +981,27 @@ export const REPORTLESS_COMPLETION_SUMMARY =
  * resumed-session delivery so both apply one admission rule; callers pass only
  * the entries that belong to the run being admitted.
  */
+const SUCCESSFUL_REPORT_MISSING_SUMMARY =
+  "The process exited 0 after its last successful tool result, but supplied no terminal report. " +
+  "Task completion is not verified; reconcile the existing work before deciding whether to resume it.";
+
+/** TASK-133: process success with a missing report is not an execution failure.
+ * Require a successful last tool result from THIS attempt; empty transcripts,
+ * explicit empty done reports, provider failures and interrupted exits keep
+ * their existing failure admission. Never infer that the task itself is done. */
+function successfulExitWithoutReport(
+  entries: ReturnType<typeof getNewEntries>,
+  result: Pick<SubagentResult, "exitCode" | "errorMessage" | "failureKind" | "ping"> & { forcedExit?: boolean },
+): boolean {
+  if (result.exitCode !== 0 || result.errorMessage || result.failureKind || result.ping || result.forcedExit || findTerminalReport(entries) !== null) return false;
+  const messages = entries.filter((entry: any) => entry.type === "message");
+  const last = (messages.at(-1) as any)?.message;
+  const assistant = [...messages].reverse().find((entry: any) => entry.message?.role === "assistant") as any;
+  return last?.role === "toolResult" && last.isError === false &&
+    last.toolName !== "subagent_done" && last.toolName !== "caller_ping" &&
+    assistant?.message?.stopReason === "toolUse";
+}
+
 function isReportlessCompletion(
   entries: ReturnType<typeof getNewEntries>,
   result: Pick<SubagentResult, "exitCode" | "errorMessage" | "ping">,
@@ -985,6 +1010,7 @@ function isReportlessCompletion(
     result.exitCode === 0 &&
     !result.errorMessage &&
     !result.ping &&
+    !successfulExitWithoutReport(entries, result) &&
     findTerminalReport(entries) === null
   );
 }
@@ -998,7 +1024,10 @@ function isReportlessCompletion(
 function classifyResumeCompletion(
   newEntries: ReturnType<typeof getNewEntries>,
   result: Pick<SubagentResult, "exitCode" | "errorMessage" | "failureKind" | "ping">,
-): { failureKind: SubagentFailureKind | undefined; summary: string } {
+): { failureKind: SubagentFailureKind | undefined; summary: string; reportMissing?: true } {
+  if (successfulExitWithoutReport(newEntries, result)) {
+    return { failureKind: undefined, summary: SUCCESSFUL_REPORT_MISSING_SUMMARY, reportMissing: true };
+  }
   if (isReportlessCompletion(newEntries, result)) {
     return { failureKind: "reportless", summary: REPORTLESS_COMPLETION_SUMMARY };
   }
@@ -1175,6 +1204,8 @@ interface SubagentResult {
    * session instead of being reported as a lost lane.
    */
   finishedWithoutClose?: boolean;
+  /** Clean process exit after successful tools, with task completion unverified. */
+  reportMissing?: true;
   timeout?: "warned-wrapup" | "hard-stop";
   ping?: { name: string; message: string };
   /** Child stderr evidence on process-start / no-result failures (TASK-330). */
@@ -2871,7 +2902,9 @@ async function watchSubagent(
     // TASK-337: a clean exit (0) with no terminal report is NOT a completion,
     // whether or not the child session file survives. Pings are not
     // completions and are delivered separately, so they keep their own path.
+    const reportMissing = successfulExitWithoutReport(admissionEntries, result);
     const reportless = isReportlessCompletion(admissionEntries, result);
+    if (reportMissing) summary = SUCCESSFUL_REPORT_MISSING_SUMMARY;
     if (reportless) {
       failureKind = "reportless";
       summary = REPORTLESS_COMPLETION_SUMMARY;
@@ -2902,6 +2935,7 @@ async function watchSubagent(
       elapsed,
       ping: result.ping,
       ...(result.reason === "settled-no-close" ? { finishedWithoutClose: true as const } : {}),
+      ...(reportMissing ? { reportMissing: true as const } : {}),
       ...(enriched.error ? { error: enriched.error } : {}),
       ...(stderr ? { stderr } : {}),
       ...(reportless ? { failureKind } : {}),
@@ -3367,6 +3401,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  ...(result.reportMissing ? { reportMissing: true } : {}),
                   ...buildResultTimeoutDetails(result),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.failureKind ? { failureKind: result.failureKind } : {}),
@@ -3795,6 +3830,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // strip of the active loadout is never re-pushed, and the worker loses
         // its close tools ("Tool subagent_done not found").
         const resumeMetadata = readSpawnMetadata(params.sessionPath);
+        // One effective brief for durable registration, ACK and settlement.
+        // A message-less resume continues the latest attempt, not the original task.
+        const attemptTask = params.message ?? resumeMetadata?.attemptTask ?? resumeMetadata?.task ?? "resumed session";
         const resumeTools = resolveResumeToolAllowlist(
           resumeMetadata?.tools,
           resumeMetadata?.agent ? loadAgentDefaults(resumeMetadata.agent)?.tools : undefined,
@@ -3868,12 +3906,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // before launching. The historical `task` is refreshed only for an
         // explicitly named Backlog task, preserving its prior semantics.
         if (resumeMetadata) {
-          const attemptTask = params.message ?? resumeMetadata.task;
           writeSpawnMetadata(params.sessionPath, {
             ...resumeMetadata,
             ...(params.message && /^Task name:\s*TASK-\d+/im.test(params.message) ? { task: params.message } : {}),
             completionId,
-            ...(attemptTask ? { attemptTask } : {}),
+            attemptTask,
+            launchedAt: new Date(startTime).toISOString(),
           });
         }
 
@@ -3905,7 +3943,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           id,
           completionId,
           name,
-          task: params.message ?? "resumed session",
+          task: attemptTask,
           surface,
           startTime,
           sessionFile: params.sessionPath,
@@ -3957,16 +3995,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const newEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            // TASK-337: only entries written after the resume may supply
-            // terminal evidence. A resumed run that exits 0 with no new
-            // terminal report is reportless, not completed — the pre-resume
-            // transcript must never stand in for this run's report. Kinds the
-            // watcher's lifecycle builders already assigned (interrupt,
-            // watchdog, time-limit) survive.
-            const { failureKind, summary } = classifyResumeCompletion(newEntries, result);
+            // The watcher already classified only this attempt's entries.
+            // Delivery can be deferred across reload; rereading the mutable
+            // session here would attach a later attempt's report to this ID.
+            const { failureKind, summary, reportMissing } = result;
             const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath, failureKind },
+              { ...result, summary, sessionFile: params.sessionPath, failureKind, reportMissing },
               name,
             );
             const runtimeNote = running.runtimePlan?.runtimeMismatch
@@ -3986,10 +4020,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: {
                   name,
                   completionId: running.completionId,
-                  task: params.message ?? "resumed session",
+                  task: running.task,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
+                  ...(reportMissing ? { reportMissing: true } : {}),
                   ...buildResultTimeoutDetails(result),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(failureKind ? { failureKind } : {}),
