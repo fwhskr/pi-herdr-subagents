@@ -312,3 +312,106 @@ describe("TASK-134 same-name resume orderings keep each attempt's binding", () =
     }
   });
 });
+
+describe("TASK-134 receipts name the exact dispatched target and prompt", () => {
+  it("receipt-target: each receipt names its own session, attempt task, prompt file and prompt hash, never another brief", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), "task134-receipt-"));
+    tempRoots.add(root);
+    fakeHerdr(root);
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "parent-pane";
+    process.env.HERDR_TAB_ID = "parent-tab";
+    process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    __herdrTest__.clearCommandAvailability();
+
+    const parent = join(root, "parent.jsonl");
+    const entries: object[] = [header("parent-id", root)];
+    writeJsonl(parent, entries);
+    const attempts = ["RCPT-A", "RCPT-B", "RCPT-C"].map((label) => {
+      const cwd = join(root, `cwd-${label}`);
+      mkdirSync(cwd, { recursive: true });
+      const child = join(root, `${label}.jsonl`);
+      writeJsonl(child, [header(`child-${label}`, cwd)]);
+      return { label, child, message: `Task name: TASK-${label}\nbrief for ${label}` };
+    });
+
+    const built = createApi(parent, entries);
+    built.ctx.cwd = root;
+    subagentsExtension(built.api);
+    built.handlers.get("session_start")?.[0]({}, built.ctx);
+    const tool = built.tools.find((candidate) => candidate.name === "subagent_resume");
+    assert.ok(tool, "subagent_resume tool registered");
+
+    const results = await Promise.all(attempts.map((attempt) =>
+      tool.execute(`rcpt-${attempt.label}`, { name: "artist", sessionPath: attempt.child, message: attempt.message, autoExit: true }, undefined, undefined, built.ctx),
+    ));
+    results.forEach((result, index) => {
+      const attempt = attempts[index];
+      const d = result.details;
+      assert.equal(d.status, "started", JSON.stringify(d));
+      assert.equal(d.sessionPath, attempt.child, "receipt names the dispatched session");
+      assert.ok(String(d.attemptTask).includes(`Task name: TASK-${attempt.label}`), "receipt names the attempt task");
+      assert.equal(d.promptSha256, sha256(attempt.message), "receipt hash is the effective prompt");
+      assert.equal(sha256(readFileSync(d.promptFile, "utf8")), d.promptSha256, "named prompt file hashes to the receipt hash");
+      const script = readFileSync(d.launchScriptFile, "utf8");
+      assert.ok(script.includes(`PI_SUBAGENT_SESSION='${attempt.child}'`), "launch script targets the receipt session");
+      assert.ok(script.includes(d.promptFile), "launch script dispatches the receipt prompt file");
+      for (const other of attempts) {
+        if (other !== attempt) assert.ok(!result.content[0].text.includes(other.label) && !script.includes(other.child), "ACK carries no other attempt's binding");
+      }
+    });
+  });
+});
+
+describe("TASK-134 independent resumes are not globally serialized", () => {
+  it("no-global-lock: resumes of distinct sessions overlap their launch window; only the same session is refused", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), "task134-lock-"));
+    tempRoots.add(root);
+    fakeHerdr(root);
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "parent-pane";
+    process.env.HERDR_TAB_ID = "parent-tab";
+    process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    const delayMs = 400;
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = String(delayMs);
+    __herdrTest__.clearCommandAvailability();
+
+    const parent = join(root, "parent.jsonl");
+    const entries: object[] = [header("parent-id", root)];
+    writeJsonl(parent, entries);
+    const sessions = ["LOCK-A", "LOCK-B", "LOCK-C"].map((label) => {
+      const cwd = join(root, `cwd-${label}`);
+      mkdirSync(cwd, { recursive: true });
+      const child = join(root, `${label}.jsonl`);
+      writeJsonl(child, [header(`child-${label}`, cwd)]);
+      return child;
+    });
+
+    const built = createApi(parent, entries);
+    built.ctx.cwd = root;
+    subagentsExtension(built.api);
+    built.handlers.get("session_start")?.[0]({}, built.ctx);
+    const tool = built.tools.find((candidate) => candidate.name === "subagent_resume");
+    assert.ok(tool, "subagent_resume tool registered");
+
+    const started = Date.now();
+    const results = await Promise.all(sessions.map((sessionPath, index) =>
+      tool.execute(`lock-${index}`, { name: "artist", sessionPath, message: `Task name: TASK-LOCK-${index}\nbrief`, autoExit: true }, undefined, undefined, built.ctx),
+    ));
+    const elapsed = Date.now() - started;
+    for (const result of results) assert.equal(result.details.status, "started", JSON.stringify(result.details));
+    // A global lock would run three launch windows back to back (>= 3 * delay).
+    assert.ok(elapsed < 2 * delayMs, `distinct sessions overlapped their launch window (elapsed ${elapsed}ms)`);
+
+    const fourth = join(root, "LOCK-D.jsonl");
+    writeJsonl(fourth, [header("child-LOCK-D", root)]);
+    const sameSession = await Promise.all([
+      tool.execute("same-a", { name: "artist", sessionPath: fourth, message: "Task name: TASK-LOCK-D\nagain", autoExit: true }, undefined, undefined, built.ctx),
+      tool.execute("same-b", { name: "artist", sessionPath: fourth, message: "Task name: TASK-LOCK-D\nagain", autoExit: true }, undefined, undefined, built.ctx),
+    ]);
+    assert.deepEqual(sameSession.map((result) => result.details.status).sort(), ["refused", "started"], "only the exact same session is guarded");
+  });
+});
