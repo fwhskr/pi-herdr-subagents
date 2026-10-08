@@ -161,18 +161,22 @@ describe("TASK-454 cwd-less subagent spawn", () => {
   });
 
   const guardPath = join(homedir(), ".pi", "agent", "extensions", "strict-agent-profiles.ts");
-  it("control: the name != agent guard keeps its exact refusal message", { skip: !existsSync(guardPath) && "live strict-agent-profiles.ts not installed" }, async () => {
+  // Live commit 0280405 ("subagent name/interactive are normalized, not blocked")
+  // deliberately replaced the name != agent refusal with normalization: the guard
+  // now rewrites name to agent and forces interactive=false instead of blocking.
+  // This control asserts that new behaviour; the old refusal message is gone by design.
+  it("control: the name != agent guard normalizes name to the approved agent (0280405)", { skip: !existsSync(guardPath) && "live strict-agent-profiles.ts not installed" }, async () => {
     const { default: strictAgentProfiles } = await import(guardPath);
     let handler: Function | undefined;
     strictAgentProfiles({ on(event: string, h: Function) { if (event === "tool_call") handler = h; } } as any);
     delete process.env.PI_SUBAGENT_ID;
-    const verdict = handler!(
-      { toolName: "subagent", input: { name: "probe-b45", agent: "small", task: "noop", interactive: false } },
-      {},
-    );
-    assert.deepEqual(verdict, {
-      block: true,
-      reason: "Subagent blocked: name and agent must be the same exact approved identity.",
-    });
+    const cwd = mkdtempSync(join(tmpdir(), "task454-guard-"));
+    roots.push(cwd);
+    const input = { name: "probe-b45", agent: "small", task: "noop", interactive: true };
+    const verdict = handler!({ toolName: "subagent", input }, { cwd });
+    assert.equal(verdict, undefined, "normalized call is allowed to proceed");
+    assert.equal(input.name, "small", "name is normalized to the approved agent");
+    assert.equal(input.agent, "small", "agent is unchanged");
+    assert.equal(input.interactive, false, "interactive is forced to false");
   });
 });
