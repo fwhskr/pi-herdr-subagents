@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
@@ -185,5 +185,66 @@ describe("TASK-134 same-name concurrent resumes keep per-attempt artifacts", () 
       assert.equal(readFileSync(promptFile, "utf8"), attempt.message, `prompt file for ${attempt.label} must hold only its own message`);
     }
     assert.equal(promptPaths.size, attempts.length, "each attempt owns a distinct prompt artifact");
+  });
+});
+
+describe("TASK-134 explicit task requests are checked against the retained session binding", () => {
+  it("binding-refusal: a request naming another lane's task is refused before dispatch; matching concurrent resumes succeed", { timeout: 20_000 }, async () => {
+    mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-08T14:00:00.250Z").getTime() });
+    const root = mkdtempSync(join(tmpdir(), "task134-binding-"));
+    tempRoots.add(root);
+    fakeHerdr(root);
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "parent-pane";
+    process.env.HERDR_TAB_ID = "parent-tab";
+    process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    __herdrTest__.clearCommandAvailability();
+
+    const parent = join(root, "parent.jsonl");
+    const entries: object[] = [header("parent-id", root)];
+    writeJsonl(parent, entries);
+
+    const lanes = ["136.21", "152.5", "136.24"].map((lane) => {
+      const cwd = join(root, ".worktrees", `task-${lane}`);
+      mkdirSync(cwd, { recursive: true });
+      const child = join(root, `lane-${lane}.jsonl`);
+      writeJsonl(child, [header(`child-${lane}`, cwd)]);
+      return { lane, cwd, child };
+    });
+
+    const built = createApi(parent, entries);
+    built.ctx.cwd = root;
+    subagentsExtension(built.api);
+    built.handlers.get("session_start")?.[0]({}, built.ctx);
+    const tool = built.tools.find((candidate) => candidate.name === "subagent_resume");
+    assert.ok(tool, "subagent_resume tool registered");
+
+    const [accounts, statistics, dashboard] = lanes;
+    const refused = await tool.execute(
+      "task134-mismatch",
+      { name: "artist", sessionPath: accounts.child, message: "Task name: TASK-152.5\nstatistics brief", autoExit: true },
+      undefined, undefined, built.ctx,
+    );
+    assert.equal(refused.details.status, "refused", JSON.stringify(refused.details));
+    assert.equal(refused.details.requestedTask, "TASK-152.5");
+    assert.equal(refused.details.retainedTask, "TASK-136.21");
+    assert.match(refused.content[0].text, /TASK-152\.5/);
+    assert.match(refused.content[0].text, /TASK-136\.21/);
+
+    const scriptDir = join(root, "artifacts", "parent-id", "subagent-scripts");
+    const scriptsFor = (session: string) => (existsSync(scriptDir) ? readdirSync(scriptDir) : []).filter((file) =>
+      readFileSync(join(scriptDir, file), "utf8").includes(`PI_SUBAGENT_SESSION='${session}'`),
+    );
+    assert.equal(scriptsFor(accounts.child).length, 0, "refused request launched nothing");
+
+    const results = await Promise.all([
+      tool.execute("task134-stat", { name: "artist", sessionPath: statistics.child, message: "Task name: TASK-152.5\nstatistics brief", autoExit: true }, undefined, undefined, built.ctx),
+      tool.execute("task134-dash", { name: "artist", sessionPath: dashboard.child, message: "Task name: TASK-136.24\ndashboard brief", autoExit: true }, undefined, undefined, built.ctx),
+    ]);
+    for (const result of results) assert.equal(result.details.status, "started", JSON.stringify(result.details));
+    assert.equal(scriptsFor(statistics.child).length, 1, "matching resume launches exactly once");
+    assert.equal(scriptsFor(dashboard.child).length, 1, "independent matching resume launches exactly once");
   });
 });

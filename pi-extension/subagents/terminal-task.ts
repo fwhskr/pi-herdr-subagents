@@ -27,6 +27,29 @@ function readJson(path: string): Record<string, unknown> | undefined {
   }
 }
 
+/** TASK-134: the `Task name: TASK-N` id named by a brief, uppercased, else undefined. */
+export function requestedTaskId(text: string | undefined): string | undefined {
+  return text ? TASK_NAME.exec(text)?.[1]?.toUpperCase() : undefined;
+}
+
+const LANE_WORKTREE = /[\\/]\.worktrees[\\/]task-(\d+(?:\.\d+)*)(?=[-\\/]|$)/i;
+
+/**
+ * TASK-134: the task a resumed session is bound to. `retained` is the latest
+ * registered attempt's `Task name` (sidecar attemptTask, else task, else the
+ * first user brief); `lane` is the task named by a `.worktrees/task-N` cwd.
+ * Either is undefined when the session names no such task.
+ */
+export function sessionTaskBinding(sessionFile: string): { retained?: string; lane?: string; cwd?: string } {
+  const sidecar = readJson(`${sessionFile}.spawn.json`);
+  const { brief, cwd } = sessionBrief(sessionFile);
+  const text = [sidecar?.attemptTask, sidecar?.task, brief].find(
+    (value): value is string => typeof value === "string" && TASK_NAME.test(value),
+  );
+  const laneNumber = cwd ? LANE_WORKTREE.exec(cwd)?.[1] : undefined;
+  return { retained: requestedTaskId(text), lane: laneNumber ? `TASK-${laneNumber}` : undefined, cwd };
+}
+
 /** Brief and cwd of a lane session: spawn sidecar task, else its first user message; header cwd. */
 function sessionBrief(sessionFile: string): { brief?: string; cwd?: string } {
   const spawnTask = readJson(`${sessionFile}.spawn.json`)?.task;

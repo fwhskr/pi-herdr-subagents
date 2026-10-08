@@ -126,7 +126,7 @@ import {
   type OrphanResumeOutcome,
   type SpawnMetadataRecord,
 } from "./orphan-discovery.ts";
-import { formatTerminalTask, terminalTaskOfSession, type TerminalTask } from "./terminal-task.ts";
+import { formatTerminalTask, requestedTaskId, sessionTaskBinding, terminalTaskOfSession, type TerminalTask } from "./terminal-task.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -422,6 +422,36 @@ function writeSpawnMetadata(sessionFile: string, metadata: SpawnMetadataRecord):
       // The rename succeeded, or the temporary file was never created.
     }
   }
+}
+
+/**
+ * TASK-134 AC2: an explicit `Task name` request that contradicts the session's
+ * retained binding (its latest attempt's task, or the task its worktree names)
+ * is refused before any pane, prompt artifact or child dispatch exists.
+ */
+export function resumeBindingRefusal(
+  sessionFile: string,
+  message: string | undefined,
+): { text: string; details: Record<string, unknown> } | undefined {
+  const requestedTask = requestedTaskId(message);
+  if (!requestedTask) return undefined;
+  const { retained, lane, cwd } = sessionTaskBinding(sessionFile);
+  const mismatch = [retained, lane].find((bound) => bound !== undefined && bound !== requestedTask);
+  if (!mismatch) return undefined;
+  const boundTo = retained ?? lane;
+  return {
+    text:
+      `Refused to resume ${sessionFile}: the request names ${requestedTask}, but this session is bound to ` +
+      `${boundTo} (${mismatch === retained ? "its retained attempt" : "its worktree"}${cwd ? `, cwd ${cwd}` : ""}). ` +
+      `Nothing was launched. Resume the session for ${boundTo}, or start a new subagent for ${requestedTask}.`,
+    details: {
+      error: "binding mismatch",
+      status: "refused",
+      sessionPath: sessionFile,
+      requestedTask,
+      retainedTask: boundTo,
+    },
+  };
 }
 
 type ResumeSessionCwdResult =
@@ -3755,6 +3785,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             },
           };
         }
+        const bindingRefusal = resumeBindingRefusal(params.sessionPath, params.message);
+        if (bindingRefusal) {
+          return { content: [{ type: "text", text: bindingRefusal.text }], details: bindingRefusal.details };
+        }
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -3850,6 +3884,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         mkdirSync(dirname(stderrFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
+        let promptSha256: string | undefined;
         if (params.message) {
           // TASK-134: key the prompt by this attempt's completionId (unique per
           // attempt), never by name + clock second, so concurrent same-name resumes
@@ -3866,6 +3901,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, { encoding: "utf8", flag: "wx" });
+          promptSha256 = createHash("sha256").update(params.message, "utf8").digest("hex");
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
@@ -4065,6 +4101,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             completionId,
             attemptTask: running.task,
             launchScriptFile,
+            ...(resumeMsgFile ? { promptFile: resumeMsgFile, promptSha256 } : {}),
             status: "started",
           },
         };
