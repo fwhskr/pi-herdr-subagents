@@ -397,14 +397,44 @@ describe("TASK-134 independent resumes are not globally serialized", () => {
     const tool = built.tools.find((candidate) => candidate.name === "subagent_resume");
     assert.ok(tool, "subagent_resume tool registered");
 
-    const started = Date.now();
-    const results = await Promise.all(sessions.map((sessionPath, index) =>
-      tool.execute(`lock-${index}`, { name: "artist", sessionPath, message: `Task name: TASK-LOCK-${index}\nbrief`, autoExit: true }, undefined, undefined, built.ctx),
-    ));
-    const elapsed = Date.now() - started;
+    // Record each launch window (the shell-ready delay that precedes a resume launch)
+    // as a start and an end event. Ends are held until all three launches have started,
+    // so the event order reflects scheduling only, not CPU load.
+    const launchEvents: string[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const held: Array<() => void> = [];
+    const releaseHeld = () => {
+      while (held.length > 0) held.shift()?.();
+    };
+    const timerSpy = ((handler: (...args: unknown[]) => void, timeout?: number, ...args: unknown[]) => {
+      if (timeout !== delayMs) return realSetTimeout(handler, timeout, ...args);
+      launchEvents.push("start");
+      held.push(() => {
+        launchEvents.push("end");
+        handler(...args);
+      });
+      if (held.length === sessions.length) realSetTimeout(releaseHeld, 0);
+      else realSetTimeout(releaseHeld, 10_000);
+      return realSetTimeout(() => {}, 0);
+    }) as typeof globalThis.setTimeout;
+    let results: Awaited<ReturnType<typeof tool.execute>>[];
+    globalThis.setTimeout = timerSpy;
+    try {
+      results = await Promise.all(sessions.map((sessionPath, index) =>
+        tool.execute(`lock-${index}`, { name: "artist", sessionPath, message: `Task name: TASK-LOCK-${index}\nbrief`, autoExit: true }, undefined, undefined, built.ctx),
+      ));
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      releaseHeld();
+    }
     for (const result of results) assert.equal(result.details.status, "started", JSON.stringify(result.details));
-    // A global lock would run three launch windows back to back (>= 3 * delay).
-    assert.ok(elapsed < 2 * delayMs, `distinct sessions overlapped their launch window (elapsed ${elapsed}ms)`);
+    // Three launch windows overlap iff every start precedes the first end; a global lock would
+    // run them back to back (start, end, start, end, ...).
+    const starts = launchEvents.filter((event) => event === "start").length;
+    const firstEnd = launchEvents.indexOf("end");
+    const lastStart = launchEvents.lastIndexOf("start");
+    assert.equal(starts, sessions.length, `each distinct session opened one launch window (events ${launchEvents.join(",")})`);
+    assert.ok(lastStart < firstEnd, `distinct sessions overlapped their launch window (events ${launchEvents.join(",")})`);
 
     const fourth = join(root, "LOCK-D.jsonl");
     writeJsonl(fourth, [header("child-LOCK-D", root)]);
