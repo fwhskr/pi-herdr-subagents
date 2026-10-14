@@ -427,8 +427,10 @@ function writeSpawnMetadata(sessionFile: string, metadata: SpawnMetadataRecord):
 
 /**
  * TASK-134 AC2: an explicit `Task name` request that contradicts the session's
- * retained binding (its latest attempt's task, or the task its worktree names)
- * is refused before any pane, prompt artifact or child dispatch exists.
+ * retained binding is refused before any pane, prompt artifact or dispatch.
+ * TASK-231: a retained nested task can live in its ancestor's worktree. That
+ * containment does not authorize switching the retained task, choosing an
+ * arbitrary descendant, or crossing an unrelated worktree task.
  */
 export function resumeBindingRefusal(
   sessionFile: string,
@@ -437,13 +439,16 @@ export function resumeBindingRefusal(
   const requestedTask = requestedTaskId(message);
   if (!requestedTask) return undefined;
   const { retained, lane, cwd } = sessionTaskBinding(sessionFile);
-  const mismatch = [retained, lane].find((bound) => bound !== undefined && bound !== requestedTask);
-  if (!mismatch) return undefined;
-  const boundTo = retained ?? lane;
+  const retainedMismatch = retained !== undefined && retained !== requestedTask;
+  const laneMismatch = lane !== undefined && lane !== requestedTask && !(
+    retained === requestedTask && requestedTask.startsWith(`${lane}.`)
+  );
+  const boundTo = retainedMismatch ? retained : laneMismatch ? lane : undefined;
+  if (!boundTo) return undefined;
   return {
     text:
       `Refused to resume ${sessionFile}: the request names ${requestedTask}, but this session is bound to ` +
-      `${boundTo} (${mismatch === retained ? "its retained attempt" : "its worktree"}${cwd ? `, cwd ${cwd}` : ""}). ` +
+      `${boundTo} (${retainedMismatch ? "its retained attempt" : "its worktree"}${cwd ? `, cwd ${cwd}` : ""}). ` +
       `Nothing was launched. Resume the session for ${boundTo}, or start a new subagent for ${requestedTask}.`,
     details: {
       error: "binding mismatch",

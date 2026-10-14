@@ -131,7 +131,7 @@ function createApi(parentSession: string, entries: object[]) {
 }
 
 describe("TASK-231 nested resume identity and provenance", () => {
-  it("equal retained nested identity resumes in its ancestor worktree without changing project", { timeout: 20_000 }, async () => {
+  it("equal retained nested identity resumes in its ancestor worktree without changing project", { timeout: 20_000 }, async (t) => {
     const root = mkdtempSync(join(tmpdir(), "task231-equal-"));
     tempRoots.add(root);
     fakeHerdr(root);
@@ -149,6 +149,7 @@ describe("TASK-231 nested resume identity and provenance", () => {
     built.ctx.cwd = root;
     subagentsExtension(built.api);
     built.handlers.get("session_start")?.[0]({}, built.ctx);
+    t.after(() => built.handlers.get("session_shutdown")?.[0]({ reason: "exit" }, built.ctx));
     const tool = built.tools.find((candidate) => candidate.name === "subagent_resume");
     assert.ok(tool);
 
@@ -168,8 +169,15 @@ describe("TASK-231 nested resume identity and provenance", () => {
         name: "artist", sessionPath: child, message, autoExit: true,
       }, undefined, undefined, built.ctx);
       assert.equal(result.details.status, "started", JSON.stringify(result.details));
-      assert.ok(readFileSync(result.details.launchScriptFile, "utf8").includes(cwd), "launch uses the target project's exact worktree");
-      assert.equal(JSON.parse(readFileSync(child, "utf8").split("\n")[0]).cwd, cwd);
+      // Pi --session takes cwd from the target session header, not the shell
+      // script's directory. Complete the fake child before restoring PATH.
+      writeFileSync(`${child}.exit`, JSON.stringify({ type: "done", runId: result.details.id }));
+      const deadline = performance.now() + 5_000;
+      const delivered = () => entries.some((entry: any) => entry.customType === "subagent_result" && entry.details?.sessionFile === child);
+      while (!delivered() && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(delivered(), `completion deadline exceeded for ${child}`);
+      assert.ok(readFileSync(result.details.launchScriptFile, "utf8").includes(`--session '${child}'`), "launch selects the exact target session");
+      assert.equal(JSON.parse(readFileSync(child, "utf8").split("\n")[0]).cwd, cwd, "target project cwd is unchanged");
       assert.equal(readFileSync(result.details.promptFile, "utf8"), message);
       const retained = JSON.parse(readFileSync(`${child}.spawn.json`, "utf8"));
       assert.equal(retained.attemptTask, message, "dispatch persists the exact effective identity");
