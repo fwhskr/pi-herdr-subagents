@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
+import subagentsExtension, { __test__ as subagentsTest, resumeBindingRefusal } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 
 // TASK-134: same-name exact-session resumes launched within one clock second
@@ -129,6 +129,98 @@ function createApi(parentSession: string, entries: object[]) {
     } as any,
   };
 }
+
+describe("TASK-231 nested resume identity and provenance", () => {
+  it("equal retained nested identity resumes in its ancestor worktree without changing project", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), "task231-equal-"));
+    tempRoots.add(root);
+    fakeHerdr(root);
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "parent-pane";
+    process.env.HERDR_TAB_ID = "parent-tab";
+    process.env.HERDR_WORKSPACE_ID = "parent-workspace";
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    __herdrTest__.clearCommandAvailability();
+    const parent = join(root, "parent.jsonl");
+    const entries: object[] = [header("parent-id", root)];
+    writeJsonl(parent, entries);
+    const built = createApi(parent, entries);
+    built.ctx.cwd = root;
+    subagentsExtension(built.api);
+    built.handlers.get("session_start")?.[0]({}, built.ctx);
+    const tool = built.tools.find((candidate) => candidate.name === "subagent_resume");
+    assert.ok(tool);
+
+    for (const [index, lane, task] of [[0, "775", "775.2"], [1, "775.2", "775.2.3"]] as const) {
+      // Distinct project roots may share numeric task IDs; the exact target's
+      // own cwd and sidecar must remain authoritative, not the caller's cwd.
+      const cwd = join(root, "target-project", ".worktrees", `task-${lane}-service-control`);
+      mkdirSync(cwd, { recursive: true });
+      const child = join(root, `child-${index}.jsonl`);
+      writeJsonl(child, [header(`child-${index}`, cwd)]);
+      writeFileSync(`${child}.spawn.json`, JSON.stringify({
+        task: `Task name: TASK-${lane}\noriginal task`,
+        attemptTask: `Task name: task-${task}\nlatest retained nested task`,
+      }));
+      const message = `Task name: TASK-${task} — finish wording before handoff`;
+      const result = await tool.execute(`task231-${index}`, {
+        name: "artist", sessionPath: child, message, autoExit: true,
+      }, undefined, undefined, built.ctx);
+      assert.equal(result.details.status, "started", JSON.stringify(result.details));
+      assert.ok(readFileSync(result.details.launchScriptFile, "utf8").includes(cwd), "launch uses the target project's exact worktree");
+      assert.equal(JSON.parse(readFileSync(child, "utf8").split("\n")[0]).cwd, cwd);
+      assert.equal(readFileSync(result.details.promptFile, "utf8"), message);
+      const retained = JSON.parse(readFileSync(`${child}.spawn.json`, "utf8"));
+      assert.equal(retained.attemptTask, message, "dispatch persists the exact effective identity");
+    }
+  });
+
+  it("sibling, parent, prefix and conflicting project lane identities still refuse", () => {
+    const root = mkdtempSync(join(tmpdir(), "task231-safety-"));
+    tempRoots.add(root);
+    const cases = [
+      { lane: "775", retained: "775.2", requested: "775.3", bound: "775.2", source: "retained attempt" },
+      { lane: "775", retained: "775.2", requested: "775", bound: "775.2", source: "retained attempt" },
+      { lane: "775.2", retained: "775.2.3", requested: "775.2", bound: "775.2.3", source: "retained attempt" },
+      { lane: "775", retained: "7752.2", requested: "7752.2", bound: "775", source: "worktree" },
+      { lane: "775.2", retained: "775.20.1", requested: "775.20.1", bound: "775.2", source: "worktree" },
+      { lane: "776", retained: "775.2", requested: "775.2", bound: "776", source: "worktree" },
+      // A generic session with no retained identity must not gain permission
+      // to choose any arbitrary descendant of the worktree's task.
+      { lane: "775", retained: undefined, requested: "775.2", bound: "775", source: "worktree" },
+    ];
+    for (const [index, test] of cases.entries()) {
+      const child = join(root, `child-${index}.jsonl`);
+      const cwd = join(root, "other-project", ".worktrees", `task-${test.lane}-service-control`);
+      writeJsonl(child, [header(`child-${index}`, cwd)]);
+      if (test.retained) writeFileSync(`${child}.spawn.json`, JSON.stringify({
+        attemptTask: `Task name: TASK-${test.retained}\nretained brief`,
+      }));
+      const refusal = resumeBindingRefusal(child, `Task name: TASK-${test.requested}\nresume`);
+      assert.ok(refusal, JSON.stringify(test));
+      assert.equal(refusal.details.status, "refused");
+      assert.equal(refusal.details.retainedTask, `TASK-${test.bound}`);
+      assert.ok(refusal.text.includes(`bound to TASK-${test.bound} (its ${test.source}, cwd ${cwd})`), refusal.text);
+    }
+  });
+
+  it("first-user provenance, exact tasks and generic follow-ups preserve their behavior", () => {
+    const root = mkdtempSync(join(tmpdir(), "task231-fallback-"));
+    tempRoots.add(root);
+    const child = join(root, "child.jsonl");
+    const cwd = join(root, ".worktrees", "task-775-service-control");
+    writeJsonl(child, [header("child", cwd), {
+      type: "message", message: { role: "user", content: [{ type: "text", text: "Task name: TASK-775.2\nnested task" }] },
+    }]);
+    assert.equal(resumeBindingRefusal(child, "Task name: TASK-775.2\ncontinue"), undefined);
+    assert.ok(resumeBindingRefusal(child, "Task name: TASK-775.3\nsibling"));
+    assert.equal(resumeBindingRefusal(child, "Continue the previous work"), undefined);
+    writeFileSync(`${child}.spawn.json`, JSON.stringify({ task: "Task name: TASK-775\nparent" }));
+    assert.equal(resumeBindingRefusal(child, "Task name: TASK-775\ncontinue"), undefined);
+    assert.ok(resumeBindingRefusal(child, "Task name: TASK-775.2\nnew nested task"));
+  });
+});
 
 describe("TASK-134 same-name concurrent resumes keep per-attempt artifacts", () => {
   it("distinct-artifacts: three same-name resumes in one frozen second get their own prompt and script", { timeout: 20_000 }, async () => {
