@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { allocateScratch, cancelUnstartedScratch, type LaunchScratch } from "./scratch-lifecycle.ts";
 import { assertSpawnCodeFresh } from "./staleness-tripwire.ts";
 import {
   closeHerdrSurface,
@@ -73,43 +74,83 @@ export function interruptPane(paneId: PaneId): void {
   sendHerdrEscape(paneId);
 }
 
+export interface LaunchScriptOptions {
+  scriptPath?: string;
+  scriptPreamble?: string;
+  stderrFile?: string;
+  sessionFile?: string;
+  /** Synthetic fixture seam; allocation still enforces the .pi boundary. */
+  scratchBase?: string;
+}
+
+/** Local launch preparation, separately testable without Herdr or a provider. */
+export function prepareLaunchScript(command: string, options: LaunchScriptOptions = {}): {
+  scriptPath: string; scratch: LaunchScratch;
+} {
+  // Existing drivers already supply this generated comment; no entrypoint widening.
+  const session = options.sessionFile ?? options.scriptPreamble?.match(/^# Session: (.+)$/m)?.[1];
+  const scratch = allocateScratch(session && isAbsolute(session) ? session : null, { scratchBase: options.scratchBase });
+  const scriptPath = options.scriptPath ?? join(scratch.scratchRoot, "launch.sh");
+  try {
+    mkdirSync(dirname(scriptPath), { recursive: true });
+
+    // L-334: replace inherited prompt-capable transport settings before any
+    // preamble/worker command, for every harness and the separate resume path.
+    // Child-process backstop only: this does not change the pane's parent shell.
+    const scriptLines = [
+      "#!/bin/bash",
+      "export GIT_SSH_COMMAND='/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0'",
+      "export SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never DISPLAY=",
+    ];
+    if (options.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
+    // Capture stderr outside ephemeral scratch while still showing it in the pane.
+    if (options.stderrFile) {
+      scriptLines.push(`exec 2> >(tee -a ${shellQuote(options.stderrFile)} >&2)`);
+    }
+    scriptLines.push(command);
+    const workerPath = join(scratch.scratchRoot, "worker.sh");
+    let delimiter = `__PI_WORKER_${scratch.launchId.replaceAll("-", "_")}__`;
+    while (scriptLines.join("\n").split("\n").includes(delimiter)) delimiter += "_";
+    const helper = `${shellQuote(process.execPath)} ${shellQuote(fileURLToPath(new URL("./scratch-lifecycle.ts", import.meta.url)))} --scratch-lifecycle`;
+    const close = `status=$?; ${helper} close ${shellQuote(scratch.leasePath)} "$$"; exit "$status"`;
+    // Keep custody in a supervisor: preamble exits/execs cannot replace the EXIT trap.
+    writeFileSync(scriptPath, [
+      "#!/bin/bash",
+      "export GIT_SSH_COMMAND='/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0'",
+      "export SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never DISPLAY=",
+      `export TMPDIR=${shellQuote(scratch.scratchRoot)}`,
+      `trap ${shellQuote(close)} EXIT`,
+      `${helper} start ${shellQuote(scratch.leasePath)} "$$"`,
+      // An explicitly retained launch script keeps session/command metadata;
+      // the executable worker copy is always ephemeral.
+      `cat > ${shellQuote(workerPath)} <<${shellQuote(delimiter)}`,
+      ...scriptLines,
+      delimiter,
+      `bash ${shellQuote(workerPath)}`,
+      "",
+    ].join("\n"), { mode: 0o700 });
+    return { scriptPath, scratch };
+  } catch (error) {
+    cancelUnstartedScratch(scratch);
+    throw error;
+  }
+}
+
 export function runScriptInPane(
   paneId: PaneId,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string; stderrFile?: string },
+  options?: LaunchScriptOptions,
 ): string {
-  // L-357: refuse loudly when this spawner loaded pre-drift extension code —
-  // before any launch script is written, so no un-neutralised pane can result.
+  // L-357: refuse pre-drift code before writing or allocating any launch data.
   assertSpawnCodeFresh(`runScriptInPane(${paneId})`);
-  const scriptPath =
-    options?.scriptPath ??
-    join(
-      tmpdir(),
-      "pi-herdr-subagent-scripts",
-      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-    );
-  mkdirSync(dirname(scriptPath), { recursive: true });
-
-  // L-334: replace inherited prompt-capable transport settings before any
-  // preamble/worker command, for every harness and the separate resume path.
-  // Child-process backstop only: this does not change the pane's parent shell.
-  const scriptLines = [
-    "#!/bin/bash",
-    "export GIT_SSH_COMMAND='/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0'",
-    "export SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never DISPLAY=",
-  ];
-  if (options?.scriptPreamble) scriptLines.push(options.scriptPreamble.trimEnd());
-  // Capture the child's stderr to a per-run file while still showing it in the
-  // pane (tee). TASK-330 AC3: a process-start death otherwise leaves only the
-  // pane scrollback, which herdr does not persist past close.
-  if (options?.stderrFile) {
-    scriptLines.push(`exec 2> >(tee -a ${shellQuote(options.stderrFile)} >&2)`);
+  const launch = prepareLaunchScript(command, options);
+  try {
+    runInPane(paneId, `TMPDIR=${shellQuote(launch.scratch.scratchRoot)} bash ${shellQuote(launch.scriptPath)}`);
+    return launch.scriptPath;
+  } catch (error) {
+    cancelUnstartedScratch(launch.scratch);
+    throw error;
   }
-  scriptLines.push(command);
-  writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
-
-  runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
-  return scriptPath;
 }
 
 export function readPane(
