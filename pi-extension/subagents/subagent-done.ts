@@ -439,7 +439,7 @@ function isHeldInputDeliveryFailure(value: unknown): value is HeldInputDeliveryF
   if (!value || typeof value !== "object") return false;
   const data = value as Record<string, unknown>;
   return data.version === 1 &&
-    typeof data.reason === "string" && data.reason.length <= 1024 &&
+    typeof data.reason === "string" && data.reason.trim().length > 0 && data.reason.length <= 1024 &&
     typeof data.holdId === "string" && data.holdId.trim().length > 0 && data.holdId.length <= 128 &&
     typeof data.queuedAt === "number" && Number.isFinite(data.queuedAt) &&
     typeof data.deadlineAt === "number" && Number.isFinite(data.deadlineAt);

@@ -72,7 +72,7 @@ it('held delivery failure reaches the real parent completion consumer without an
 
 it('malformed failures report a bounded warning without terminal effects', () => {
   const child = boot();
-  for (const data of [null, {}, { ...valid, version: 2 }, { ...valid, holdId: '' }, { ...valid, holdId: ' '.repeat(3) }, { ...valid, holdId: 'x'.repeat(129) }, { ...valid, reason: 'x'.repeat(1025) }, { ...valid, reason: 42 }, { ...valid, queuedAt: NaN }, { ...valid, deadlineAt: Infinity }, { ...valid, queuedAt: '1' }]) {
+  for (const data of [null, {}, { ...valid, version: 2 }, { ...valid, holdId: '' }, { ...valid, holdId: ' '.repeat(3) }, { ...valid, holdId: 'x'.repeat(129) }, { ...valid, reason: 'x'.repeat(1025) }, { ...valid, reason: 42 }, { ...valid, reason: '' }, { ...valid, reason: '   ' }, { ...valid, queuedAt: NaN }, { ...valid, deadlineAt: Infinity }, { ...valid, queuedAt: '1' }]) {
     child.emit(data);
     assert.equal(child.shutdowns(), 0);
     assert.equal(existsSync(`${child.file}.exit`), false);
