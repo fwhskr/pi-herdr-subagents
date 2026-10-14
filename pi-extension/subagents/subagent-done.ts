@@ -425,6 +425,26 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+export const HELD_INPUT_DELIVERY_FAILED_EVENT = "pi:held-input-delivery-failed:v1";
+
+interface HeldInputDeliveryFailure {
+  version: 1;
+  reason: string;
+  holdId: string;
+  queuedAt: number;
+  deadlineAt: number;
+}
+
+function isHeldInputDeliveryFailure(value: unknown): value is HeldInputDeliveryFailure {
+  if (!value || typeof value !== "object") return false;
+  const data = value as Record<string, unknown>;
+  return data.version === 1 &&
+    typeof data.reason === "string" && data.reason.length <= 1024 &&
+    typeof data.holdId === "string" && data.holdId.trim().length > 0 && data.holdId.length <= 128 &&
+    typeof data.queuedAt === "number" && Number.isFinite(data.queuedAt) &&
+    typeof data.deadlineAt === "number" && Number.isFinite(data.deadlineAt);
+}
+
 export interface SubagentDoneTestHooks {
   registerCrashHooks: (argv?: readonly string[]) => void;
   unregisterCrashHooks: () => void;
@@ -647,16 +667,19 @@ export default function (
     }
   }
 
-  function performExit(ctx: any): void {
+  function performExit(ctx: any, heldFailure?: HeldInputDeliveryFailure): void {
     if (exitSidecarWritten) return;
     clearFallbackGuard();
     clearPendingChildGuard();
     const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
     if (targetSessionFile) {
       try {
-        const completion = delegatedTerminalRequired
-          ? buildForcedCompletionSidecar(latestAgentMessages, wrapupInProgress)
-          : buildCompletionSidecar(latestAgentMessages, wrapupInProgress);
+        const completion = heldFailure
+          ? { type: "error" as const, forcedExit: true, exitCode: 1, errorMessage: heldFailure.reason,
+              holdId: heldFailure.holdId, queuedAt: heldFailure.queuedAt, deadlineAt: heldFailure.deadlineAt }
+          : delegatedTerminalRequired
+            ? buildForcedCompletionSidecar(latestAgentMessages, wrapupInProgress)
+            : buildCompletionSidecar(latestAgentMessages, wrapupInProgress);
         writeExitSidecar(stampedSidecar(
           completion,
           completion.type === "error"
@@ -664,6 +687,10 @@ export default function (
             : { exitCode: 0, message: "completed" },
         ));
       } catch {
+        if (heldFailure) {
+          ctx.ui.notify("Could not publish held-input failure to the parent supervisor.", "error");
+          return;
+        }
         // Best effort — the watcher can still detect the terminal sentinel
         // after shutdown if the completion sidecar cannot be written.
       }
@@ -765,8 +792,27 @@ export default function (
     );
   }
 
+  // Shared extension events have no context argument. Bind the consumer only
+  // after startup confirms this is the parent's identified one-shot process,
+  // not an owner/main session that inherited worker environment variables.
+  let unsubscribeHeldFailure: (() => void) | undefined;
+
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    unsubscribeHeldFailure?.();
+    unsubscribeHeldFailure = undefined;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (delegatedTerminalRequired && shouldRegisterCrashHooks(sessionFile) &&
+        ctx.sessionManager.getSessionFile() === sessionFile) {
+      unsubscribeHeldFailure = pi.events?.on(HELD_INPUT_DELIVERY_FAILED_EVENT, (data) => {
+        if (exitSidecarWritten) return;
+        if (!isHeldInputDeliveryFailure(data)) {
+          ctx.ui.notify("Ignored malformed held-input delivery failure (expected version 1).", "warning");
+          return;
+        }
+        performExit(ctx, data);
+      });
+    }
     recorder.sessionStart();
     // TASK-23: a fresh (possibly resumed) lane gets a fresh cooling budget.
     coolingWaitSpentMs = 0;
@@ -955,6 +1001,8 @@ export default function (
   });
 
   pi.on("session_shutdown", (event) => {
+    unsubscribeHeldFailure?.();
+    unsubscribeHeldFailure = undefined;
     clearFallbackGuard();
     clearPendingChildGuard();
     recorder.sessionShutdown((event as any).reason);
