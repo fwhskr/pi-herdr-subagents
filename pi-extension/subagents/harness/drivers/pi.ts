@@ -8,6 +8,7 @@ import type {
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
 import { resolveSpawnTrustFlag } from "../../spawn-trust.ts";
+import { bindVerifierScope, VERIFIER_TOOLS, VERIFIER_EXCLUSIONS } from "../../verifier-scope.ts";
 
 export const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -143,7 +144,9 @@ export class PiHarnessDriver implements HarnessDriver {
     }
 
     const effectiveTools = params.tools ?? agentDefs?.tools;
-    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+    const verifierScope = bindVerifierScope(params.task, subagentSessionFile);
+    const toolAllowlist = verifierScope ? VERIFIER_TOOLS : buildSubagentToolAllowlist(effectiveTools);
+    if (verifierScope) parts.push("--exclude-tools", shellQuote(VERIFIER_EXCLUSIONS));
     if (toolAllowlist) {
       parts.push("--tools", shellQuote(toolAllowlist));
     }
@@ -161,6 +164,7 @@ export class PiHarnessDriver implements HarnessDriver {
       envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
     }
 
+    if (verifierScope) envParts.push(`PI_VERIFIER_SCOPE_AUTH=${shellQuote(verifierScope.auth_id)}`);
     if (denySet && denySet.size > 0) {
       envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
     }

@@ -125,9 +125,11 @@ import {
   resumeOrphanedSubagents,
   type DiscoveredOrphan,
   type OrphanResumeOutcome,
-  type SpawnMetadataRecord,
+  type SpawnMetadataRecord as BaseSpawnMetadataRecord,
 } from "./orphan-discovery.ts";
 import { formatTerminalTask, requestedTaskId, sessionTaskBinding, terminalTaskOfSession, type TerminalTask } from "./terminal-task.ts";
+import { bindVerifierScope, resumeVerifierScope, VERIFIER_TOOLS, VERIFIER_EXCLUSIONS, type VerifierScopeMetadata } from "./verifier-scope.ts";
+type SpawnMetadataRecord = BaseSpawnMetadataRecord & VerifierScopeMetadata;
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -318,13 +320,14 @@ function decrementSpawnDepth(allowance: number | null): number | null {
 function resolveDenyTools(
   agentDefs: AgentDefaults | null,
   spawnAllowance: number | null = null,
+  verifierScoped = false,
 ): Set<string> {
   const denied = new Set<string>();
 
   // Deny-by-default: only spawning:true + remaining depth keeps the tools.
   const spawnGranted =
     agentDefs?.spawning === true && (spawnAllowance === null || spawnAllowance > 0);
-  if (!spawnGranted) {
+  if (verifierScoped || !spawnGranted) {
     for (const t of SPAWNING_TOOLS) denied.add(t);
   }
 
@@ -1255,7 +1258,7 @@ interface SubagentResult {
 /**
  * State for a launched (but not yet completed) subagent.
  */
-interface RunningSubagent {
+interface RunningSubagent extends VerifierScopeMetadata {
   id: string;
   /** Immutable delivery identity of this launch, never the shared session. */
   completionId: string;
@@ -2480,8 +2483,9 @@ async function launchSubagent(
   // generation ceiling for our direct children; they receive one less so
   // mutual spawning terminates.
   const launcherAllowance = parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH);
-  const spawnGranted = agentDefs?.spawning === true;
-  const denySet = resolveDenyTools(agentDefs, launcherAllowance);
+  const verifierScope = driver.id === "pi" ? bindVerifierScope(params.task, subagentSessionFile) : undefined;
+  const spawnGranted = !verifierScope && agentDefs?.spawning === true;
+  const denySet = resolveDenyTools(agentDefs, launcherAllowance, !!verifierScope);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -2529,6 +2533,7 @@ async function launchSubagent(
 
   const running: RunningSubagent = {
     id,
+    ...(verifierScope ? { verifierScope } : {}),
     completionId: randomUUID(),
     name: params.name,
     task: params.task,
@@ -2567,7 +2572,8 @@ async function launchSubagent(
       // added by buildSubagentToolAllowlist on both sides). TASK-450: the
       // resume path replays this value so a resumed worker keeps the same
       // allowlist — and the same close tools — as at spawn.
-      tools: params.tools ?? agentDefs?.tools ?? null,
+      tools: verifierScope ? VERIFIER_TOOLS : params.tools ?? agentDefs?.tools ?? null,
+      ...(verifierScope ? { verifierScope } : {}),
       task: params.task,
       // TASK-13: publish this attempt's settlement identity before the pane runs.
       completionId: running.completionId,
@@ -3477,6 +3483,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text:
+                (running.verifierScope?.error ? `Verifier scope error (restricted, zero entries): ${running.verifierScope.error}. ` : "") +
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
@@ -3495,6 +3502,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             model: running.runtimePlan?.model,
             thinking: running.runtimePlan?.thinking,
             runtimePlan: running.runtimePlan,
+            ...(running.verifierScope ? { verifierScope: running.verifierScope } : {}),
             status: "started",
           },
         };
@@ -3873,13 +3881,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // One effective brief for durable registration, ACK and settlement.
         // A message-less resume continues the latest attempt, not the original task.
         const attemptTask = params.message ?? resumeMetadata?.attemptTask ?? resumeMetadata?.task ?? "resumed session";
-        const resumeTools = resolveResumeToolAllowlist(
+        const verifierScope = resumeVerifierScope(resumeMetadata, params.sessionPath);
+        const resumeTools = verifierScope ? VERIFIER_TOOLS : resolveResumeToolAllowlist(
           resumeMetadata?.tools,
           resumeMetadata?.agent ? loadAgentDefaults(resumeMetadata.agent)?.tools : undefined,
         );
         if (resumeTools) {
           parts.push("--tools", shellQuote(resumeTools));
         }
+        if (verifierScope) parts.push("--exclude-tools", shellQuote(VERIFIER_EXCLUSIONS));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -3934,7 +3944,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeMetadata,
           parseSpawnDepth(process.env.PI_SUBAGENT_SPAWN_DEPTH),
         );
-        if (!resumeSpawn.maySpawn) {
+        if (verifierScope) resumeEnvParts.push(`PI_VERIFIER_SCOPE_AUTH=${shellQuote(verifierScope.auth_id)}`);
+        if (verifierScope || !resumeSpawn.maySpawn) {
           resumeEnvParts.push(`PI_DENY_TOOLS=${shellQuote([...SPAWNING_TOOLS].join(","))}`);
         }
         if (resumeSpawn.childEnvDepth !== null) {
@@ -3951,6 +3962,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (resumeMetadata) {
           writeSpawnMetadata(params.sessionPath, {
             ...resumeMetadata,
+            ...(verifierScope ? { verifierScope } : {}),
             ...(params.message && /^Task name:\s*TASK-\d+/im.test(params.message) ? { task: params.message } : {}),
             completionId,
             attemptTask,
@@ -4100,7 +4112,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .catch(() => { /* Error delivery is best-effort; never reject a detached watcher. */ });
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
+          content: [{ type: "text", text: `Session "${name}" resumed.` + (verifierScope?.error ? ` Verifier scope error (restricted, zero entries): ${verifierScope.error}` : "") }],
           details: {
             id,
             name,
@@ -4109,6 +4121,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             attemptTask: running.task,
             launchScriptFile,
             ...(resumeMsgFile ? { promptFile: resumeMsgFile, promptSha256 } : {}),
+            ...(verifierScope ? { verifierScope } : {}),
             status: "started",
           },
         };
