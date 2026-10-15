@@ -118,13 +118,9 @@ function mainCheckout(root: string): string {
 /**
  * The terminal Backlog task a lane session belongs to, or undefined when open/unknown.
  *
- * Board disagreement (TASK-458 revision decision): boards are consulted in the
- * order given — `authorityRoots` first (the resuming session's project), then
- * the lane's own session cwd, which may be a stale worktree copy — and the
- * FIRST board that records the task decides, open or terminal. A later board
- * never overrides it. So a stale copy can neither refuse a task the authority
- * board holds open, nor rescue one it holds Done; the lane's own board only
- * decides when the authority board does not know the task.
+ * TASK-239: the lane's session cwd binds the lookup to its own project, not
+ * the caller's board where the same numeric task ID can name another task.
+ * `authorityRoots` remain a fallback only when the session has no cwd.
  * TASK-465: each root is read through its main checkout first, so a worktree
  * cwd is judged by the live board; the worktree's own copy only decides when
  * the main checkout does not record the task.
@@ -133,7 +129,7 @@ export function terminalTaskOfSession(sessionFile: string, authorityRoots: reado
   const { brief, cwd } = sessionBrief(sessionFile);
   const taskId = brief ? TASK_NAME.exec(brief)?.[1]?.toUpperCase() : undefined;
   if (!taskId) return undefined;
-  const roots = [...authorityRoots, cwd].filter((r): r is string => Boolean(r));
+  const roots = cwd ? [cwd] : authorityRoots;
   for (const root of new Set(roots.flatMap((r) => [mainCheckout(r), r]))) {
     const status = backlogStatus(root, taskId);
     if (status === undefined) continue;
