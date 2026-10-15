@@ -66,14 +66,19 @@ export function bindVerifierScope(task: string, sessionFile: string): VerifierSc
     return { auth_id: auth.auth_id };
   } catch (cause) { error = cause instanceof Error ? cause.message : "Invalid verifier scope"; }
   try { publish({ schema: 1, auth_id: fallbackId, candidate: { repo_realpath: "/home/kris/.pi", commit_sha: "0".repeat(40) }, entries: [] }); }
-  catch (cause) { error += `; empty authorization unavailable: ${cause instanceof Error ? cause.message : String(cause)}`; }
+  catch (cause) {
+    error += `; empty authorization unavailable: ${cause instanceof Error ? cause.message : String(cause)}`;
+    // An invalid marker is deliberately non-runnable in the existing runner;
+    // never bind a malformed request to a conflicting record's entries.
+    return { auth_id: `unavailable!${fallbackId}`, error };
+  }
   return { auth_id: fallbackId, error };
 }
 /** Resume reuses only the original binding, never a follow-up's scope fence. */
 export function resumeVerifierScope(metadata: VerifierScopeMetadata & { task?: string } | null, sessionFile: string): VerifierScopeBinding | undefined {
   if (metadata?.verifierScope) {
     const scope = metadata.verifierScope;
-    if (typeof scope.auth_id === "string" && ID.test(scope.auth_id)) return scope;
+    if (typeof scope.auth_id === "string" && (ID.test(scope.auth_id) || /^unavailable!invalid-[a-f0-9]{48}$/.test(scope.auth_id))) return scope;
     return bindVerifierScope("```verifier-scope\ninvalid\n```", sessionFile);
   }
   return metadata?.task ? bindVerifierScope(metadata.task, sessionFile) : undefined;
