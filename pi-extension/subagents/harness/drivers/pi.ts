@@ -12,6 +12,15 @@ import { bindVerifierScope, VERIFIER_TOOLS, VERIFIER_EXCLUSIONS } from "../../ve
 
 export const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
+/**
+ * Tools whose registrations a lazy-loading child must be able to discover (TASK-256). Core keeps a
+ * tool in the child's catalogue only when `--tools` names or matches it, so a child allowed
+ * `lazy_load_tools` could otherwise never load them. They are admitted as a dependency of that
+ * discovery tool only: a list without `lazy_load_tools`, the scoped-verifier list and any
+ * `--exclude-tools` entry are unaffected, and a parent's own activation grants a child nothing.
+ */
+export const LAZY_CATALOG_TOOLS = ["donsetch_web_*"] as const;
+
 export function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   const requested = (effectiveTools ?? "")
     .split(",")
@@ -23,6 +32,9 @@ export function buildSubagentToolAllowlist(effectiveTools?: string): string | nu
   const allow = new Set(requested);
   for (const tool of SUBAGENT_CONTROL_TOOLS) {
     allow.add(tool);
+  }
+  if (allow.has("lazy_load_tools")) {
+    for (const tool of LAZY_CATALOG_TOOLS) allow.add(tool);
   }
 
   return [...allow].join(",");

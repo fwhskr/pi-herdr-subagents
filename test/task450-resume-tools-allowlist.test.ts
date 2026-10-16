@@ -316,6 +316,48 @@ describe("TASK-450 resume carries the recorded tools allowlist", () => {
   });
 });
 
+describe("TASK-256 lazy discovery admits its web catalogue as a dependency", () => {
+  const WEB = "donsetch_web_*";
+  const entries = (value: string | null): string[] => (value ?? "").split(",").map((tool) => tool.trim());
+
+  it("spawn and resume builders append the web pattern only when lazy_load_tools is requested", () => {
+    const build = (subagentsTest as any).buildSubagentToolAllowlist;
+    const resolve = (subagentsTest as any).resolveResumeToolAllowlist;
+    const lazy = "read,bash,lazy_load_tools";
+    assert.ok(entries(build(lazy)).includes(WEB), "spawn allowlist must admit the web catalogue");
+    assert.ok(entries(resolve(lazy, undefined)).includes(WEB), "resume of a recorded list must admit it");
+    assert.ok(entries(resolve(undefined, lazy)).includes(WEB), "resume falling back to profile defaults must admit it");
+    assert.equal(build(lazy), resolve(lazy, undefined), "spawn and resume produce the identical allowlist");
+    assert.equal(entries(build(lazy)).filter((tool) => tool === WEB).length, 1, "no duplicate entry");
+    assert.ok(entries(build(`${lazy},${WEB}`)).filter((tool) => tool === WEB).length === 1, "an explicit entry is not duplicated");
+  });
+
+  it("a list without lazy_load_tools, or with no restriction, gains nothing", () => {
+    const build = (subagentsTest as any).buildSubagentToolAllowlist;
+    const resolve = (subagentsTest as any).resolveResumeToolAllowlist;
+    assert.equal(entries(build("read,bash")).some((tool) => tool.startsWith("donsetch")), false);
+    assert.equal(entries(resolve("read,bash", "lazy_load_tools")).some((tool) => tool.startsWith("donsetch")), false,
+      "a recorded list without lazy discovery wins over profile defaults");
+    assert.equal(build(undefined), null);
+    assert.equal(resolve(null, "lazy_load_tools"), null, "recorded no-restriction stays unrestricted");
+  });
+
+  it("a resumed lazy child receives the pattern; a resumed no-lazy child does not", { timeout: 10_000 }, async () => {
+    const lazy = toolsFlag((await resumeWithSidecar({ tools: "read,lazy_load_tools" })).script);
+    assert.ok(entries(lazy).includes(WEB), `resume --tools: ${lazy}`);
+    const plain = toolsFlag((await resumeWithSidecar({ tools: "read,write" })).script);
+    assert.equal(entries(plain).includes(WEB), false, `resume --tools: ${plain}`);
+  });
+
+  it("the scoped verifier list never carries the web pattern and keeps its exclusions", async () => {
+    const { VERIFIER_TOOLS, VERIFIER_EXCLUSIONS } = await import("../pi-extension/subagents/verifier-scope.ts");
+    assert.equal(entries(VERIFIER_TOOLS).some((tool) => tool.startsWith("donsetch") || tool === "lazy_load_tools"), false);
+    for (const excluded of ["lazy_load_tools", "mcp__*", "tool_search", "codemode", "bash"]) {
+      assert.ok(entries(VERIFIER_EXCLUSIONS).includes(excluded), `verifier exclusion lost: ${excluded}`);
+    }
+  });
+});
+
 describe("TASK-450 control tools survive the lazy-tools session_start deferral", () => {
   const EAGER = ["read", "bash", "edit", "write", "todo", "lazy_load_tools"];
 
