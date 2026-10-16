@@ -3889,13 +3889,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // strip of the active loadout is never re-pushed, and the worker loses
         // its close tools ("Tool subagent_done not found").
         const resumeMetadata = readSpawnMetadata(params.sessionPath);
+        const resumeAgentDefs = resumeMetadata?.agent ? loadAgentDefaults(resumeMetadata.agent) : null;
         // One effective brief for durable registration, ACK and settlement.
         // A message-less resume continues the latest attempt, not the original task.
         const attemptTask = params.message ?? resumeMetadata?.attemptTask ?? resumeMetadata?.task ?? "resumed session";
         const verifierScope = resumeVerifierScope(resumeMetadata, params.sessionPath);
         const resumeTools = verifierScope ? VERIFIER_TOOLS : resolveResumeToolAllowlist(
           resumeMetadata?.tools,
-          resumeMetadata?.agent ? loadAgentDefaults(resumeMetadata.agent)?.tools : undefined,
+          resumeAgentDefs?.tools,
         );
         if (resumeTools) {
           parts.push("--tools", shellQuote(resumeTools));
@@ -4018,6 +4019,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           stderrFile,
           artifactDir,
           interactive,
+          // Resume is a fresh run, not an exemption from its owner's limits.
+          timeLimit: resolveTimeLimitConfig(resumeAgentDefs, interactive),
           runtimePlan: undefined,
           lifecycle: createLifecycle(startTime),
           owner: deliveryOwner(ctx),
