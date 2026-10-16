@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
@@ -323,6 +323,121 @@ describe("parent time-limit actions", () => {
     );
     assert.equal(recovery.action, null);
     assert.equal(hardStopped.recovery, undefined);
+  });
+});
+
+describe("TASK-204 first-turn and active warning boundaries", () => {
+  function paneOperations(calls: string[]) {
+    return {
+      interruptPane() { calls.push("escape"); },
+      closePane() { calls.push("close"); },
+      abortWatcher(controller: AbortController | undefined) {
+        calls.push("abort");
+        controller?.abort();
+      },
+      writeWrapup() { calls.push("wrapup"); },
+      removeWrapup() { calls.push("remove-wrapup"); },
+    };
+  }
+
+  it("ends a no-provider first-turn stall at the configured idle deadline even without a snapshot", () => {
+    withTempDir((dir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const controller = new AbortController();
+      const running = makeRunning({
+        sessionFile: join(dir, "not-created.jsonl"),
+        abortController: controller,
+        timeLimit: { idleTimeoutSeconds: 900 },
+      });
+      const calls: string[] = [];
+      const operations = paneOperations(calls);
+      assert.equal(testApi.advanceRunningTimeLimit(running, 899_999, operations).action, null);
+      assert.deepEqual(calls, []);
+      assert.equal(testApi.advanceRunningTimeLimit(running, 900_000, operations).action, "hard-stop");
+      assert.equal(controller.signal.aborted, true, "the parent completion wait is released");
+      assert.deepEqual(calls, ["remove-wrapup", "close", "abort"]);
+      const result = testApi.buildTimeLimitStoppedResult(running, 900_000);
+      assert.equal(result.exitCode, 1);
+      assert.equal(result.failureKind, "time-limit");
+      assert.match(testApi.resolveResultPresentation(result, running.name), /hard time limit/);
+      assert.match(result.summary, /timed out after 900s/);
+      assert.equal(testApi.advanceRunningTimeLimit(running, 901_000, operations).action, null);
+      assert.equal(calls.filter((call) => call === "close").length, 1);
+    });
+  });
+
+  it("treats growing session output as progress without a fresh activity snapshot", () => {
+    withTempDir((dir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const sessionFile = join(dir, "growing.jsonl");
+      const running = makeRunning({
+        sessionFile,
+        activity: { updatedAt: 0 },
+        timeLimit: { idleTimeoutSeconds: 900, timeoutWarnThreshold: 0.85 },
+      });
+      const calls: string[] = [];
+      const operations = paneOperations(calls);
+      // Disk progress is independent of the optional activity sidecar.
+      for (const now of [800_000, 1_600_000, 2_400_000]) {
+        writeFileSync(sessionFile, `${now}\n`, { flag: "a" });
+        utimesSync(sessionFile, now / 1_000, now / 1_000);
+        assert.equal(testApi.advanceRunningTimeLimit(running, now, operations).action, null);
+      }
+      assert.deepEqual(calls, [], "growing output must not be interrupted or killed");
+    });
+  });
+
+  it("expires a session-only startup only after its last disk progress goes idle", () => {
+    withTempDir((dir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const sessionFile = join(dir, "started.jsonl");
+      writeFileSync(sessionFile, "started\n");
+      utimesSync(sessionFile, 800, 800);
+      const running = makeRunning({ sessionFile, timeLimit: { idleTimeoutSeconds: 900 } });
+      const operations = paneOperations([]);
+      assert.equal(testApi.advanceRunningTimeLimit(running, 1_699_999, operations).action, null);
+      assert.equal(testApi.advanceRunningTimeLimit(running, 1_700_000, operations).action, "hard-stop");
+    });
+  });
+
+  it("does not charge a resumed run for silence before its own launch", () => {
+    withTempDir((dir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const sessionFile = join(dir, "resumed.jsonl");
+      writeFileSync(sessionFile, "old transcript\n");
+      utimesSync(sessionFile, 1, 1);
+      const running = makeRunning({
+        sessionFile,
+        startTime: 2_000_000,
+        activity: { updatedAt: 1_000 },
+        timeLimit: { idleTimeoutSeconds: 900 },
+      });
+      const calls: string[] = [];
+      assert.equal(testApi.advanceRunningTimeLimit(running, 2_000_000, paneOperations(calls)).action, null);
+      assert.deepEqual(calls, []);
+    });
+  });
+
+  it("attributes the 51-minute active abort boundary to the configured warning Escape, not idle expiry", () => {
+    withTempDir((dir) => {
+      const testApi = (subagentsModule as any).__test__;
+      const running = makeRunning({
+        sessionFile: join(dir, "active.jsonl"),
+        timeLimit: { timeLimitSeconds: 3_600, idleTimeoutSeconds: 900, timeoutWarnThreshold: 0.85 },
+      });
+      const calls: string[] = [];
+      const operations = paneOperations(calls);
+      for (const now of [3_059_999, 3_060_000, 3_061_000]) {
+        running.activity = { updatedAt: now };
+        writeFileSync(running.sessionFile, `${now}\n`, { flag: "a" });
+        utimesSync(running.sessionFile, now / 1_000, now / 1_000);
+        assert.equal(testApi.advanceRunningTimeLimit(running, now, operations).action,
+          now === 3_060_000 ? "warn" : null);
+      }
+      assert.deepEqual(calls, ["wrapup", "escape"], "the warning aborts an active turn exactly once");
+      assert.equal(running.timeLimitDeadlineAt, 3_600_000, "the hard runtime limit is unchanged");
+      assert.equal(testApi.buildTimeLimitStoppedResult(running, 3_061_000), null);
+    });
   });
 });
 
