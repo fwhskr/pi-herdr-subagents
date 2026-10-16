@@ -1995,7 +1995,18 @@ function advanceRunningTimeLimit(
     return { action: null };
   }
 
-  const lastActivityAt = running.activity?.updatedAt;
+  // A child can stall before publishing its first activity snapshot. Its
+  // configured idle budget still starts at launch; old resume activity must
+  // not charge the new run for time before launch. Session writes also count
+  // as progress when the optional activity sidecar is missing or stale.
+  let lastActivityAt = Math.max(running.startTime, running.activity?.updatedAt ?? running.startTime);
+  try {
+    const { mtimeMs } = statSync(running.sessionFile);
+    // A future file timestamp is not evidence of progress in this clock.
+    if (mtimeMs <= now) lastActivityAt = Math.max(lastActivityAt, mtimeMs);
+  } catch {
+    // No session yet (or unreadable): retain the launch/activity deadline.
+  }
   const action = running.timeLimitDeadlineAt != null
     ? now >= running.timeLimitDeadlineAt ? "hard-stop" : "none"
     : evalTimeLimit(
