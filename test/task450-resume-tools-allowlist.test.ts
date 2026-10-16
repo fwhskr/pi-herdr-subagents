@@ -68,7 +68,7 @@ function tempRoot(prefix: string): string {
   return root;
 }
 
-function fakeHerdr(root: string): string {
+function fakeHerdr(root: string, stall = false): string {
   const bin = join(root, "bin");
   const command = join(bin, "herdr");
   const log = join(root, "herdr.log");
@@ -90,7 +90,7 @@ elif args[:2] in (["pane", "rename"], ["pane", "report-metadata"], ["pane", "clo
     pass
 elif args[:2] == ["pane", "read"]:
     print("")
-elif args[:2] == ["pane", "run"]:
+elif args[:2] == ["pane", "run"] and ${stall ? "False" : "True"}:
     script = args[3] if len(args) > 3 else ""
     try:
         script_path = shlex.split(script)[1]
@@ -183,7 +183,7 @@ function createApi(parentSession: string, entries: object[]) {
 }
 
 /** Resume a child session with a given spawn sidecar; return the launch script. */
-async function resumeWithSidecar(sidecar: object): Promise<{ root: string; script: string }> {
+async function resumeWithSidecar(sidecar: object, stall = false): Promise<{ root: string; script: string; completion?: any }> {
   const root = tempRoot("task450-resume-");
   const parent = join(root, "parent.jsonl");
   const entries = [header("parent-id", root)];
@@ -202,7 +202,12 @@ async function resumeWithSidecar(sidecar: object): Promise<{ root: string; scrip
     ...sidecar,
   }), "utf8");
 
-  fakeHerdr(root);
+  fakeHerdr(root, stall);
+  if (stall) {
+    mkdirSync(join(root, "agent", "agents"), { recursive: true });
+    writeFileSync(join(root, "agent", "agents", "task204-worker.md"),
+      "---\nname: task204-worker\ntime-limit: 60\nidle-timeout: 1\n---\nSynthetic worker.\n");
+  }
   process.env.HERDR_ENV = "1";
   process.env.HERDR_PANE_ID = "parent-pane";
   process.env.HERDR_TAB_ID = "parent-tab";
@@ -238,15 +243,36 @@ async function resumeWithSidecar(sidecar: object): Promise<{ root: string; scrip
   assert.ok(resumeScript, `resume launch script written (found: ${scripts.join(", ")})`);
   const script = readFileSync(join(root, "artifacts", "parent-id", "subagent-scripts", resumeScript), "utf8");
 
-  const shutdown = built.handlers.get("session_shutdown")?.[0];
-  shutdown?.({ reason: "exit" }, built.ctx);
-  return { root, script };
+  let completion: any;
+  try {
+    if (stall) {
+      const deadline = Date.now() + 4_000;
+      while (!(completion = built.messages.find((message) => message.customType === "subagent_result")) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+  } finally {
+    built.handlers.get("session_shutdown")?.[0]?.({ reason: "exit" }, built.ctx);
+  }
+  return { root, script, completion };
 }
 
 function toolsFlag(script: string): string | null {
   const match = script.match(/--tools\s+'([^']*)'/) ?? script.match(/--tools\s+(\S+)/);
   return match ? match[1] : null;
 }
+
+describe("TASK-204 resumed first-turn stall", () => {
+  it("uses the original profile idle budget and delivers failure to the parent without a provider", { timeout: 8_000 }, async () => {
+    const { root, completion } = await resumeWithSidecar({ agent: "task204-worker" }, true);
+    assert.ok(completion, "a stalled resume must complete within its configured idle budget");
+    assert.equal(completion.details.exitCode, 1);
+    assert.equal(completion.details.failureKind, "time-limit");
+    assert.equal(completion.details.timeout, "hard-stop");
+    assert.match(completion.content, /hard time limit/);
+    assert.match(readFileSync(join(root, "herdr.log"), "utf8"), /pane close/, "the stalled resume pane is reaped");
+  });
+});
 
 describe("TASK-450 resume carries the recorded tools allowlist", () => {
   it("passes the spawn-recorded allowlist (with control tools) to the resumed pi", { timeout: 10_000 }, async () => {
