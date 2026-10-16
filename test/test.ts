@@ -30,6 +30,10 @@ import {
 
 import { isHerdrAvailable, __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
+  parseSubagentLayout,
+  resolveSubagentLayout,
+} from "../pi-extension/subagents/terminal.ts";
+import {
   loadModelConfig,
   parseModelConfig,
   resolveModelDefault,
@@ -4636,6 +4640,18 @@ describe("herdr.ts", () => {
       assert.deepEqual(result, { kind: "missing", error: "pane gone" });
     });
 
+    it("treats an already-missing pane as successful cleanup", () => {
+      assert.equal(__herdrTest__.isPaneMissingError({
+        stderr: JSON.stringify({ error: { code: "pane_not_found", message: "pane gone" } }),
+        stdout: "",
+      }), true);
+      assert.equal(__herdrTest__.isPaneMissingError({
+        message: "connection refused",
+        stderr: "",
+        stdout: "",
+      }), false);
+    });
+
     it("continues from non-JSON stderr to structured stdout", () => {
       const result = __herdrTest__.parsePaneGetError({
         stderr: "warning: connection closed",
@@ -5064,5 +5080,89 @@ describe("F-209 completion crash steering", () => {
     });
     assert.deepEqual(debounced, { reason: "sentinel", exitCode: 0 });
     assert.ok(inspections >= 2, "a single missing pane observation must not fail the run");
+  });
+});
+
+describe("subagent surface layout", () => {
+  describe("buildPaneSplitArgs", () => {
+    it("constructs a right-hand split against the parent pane", () => {
+      assert.deepEqual(__herdrTest__.buildPaneSplitArgs("w1:p1", "right", "/repo"), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "right",
+        "--no-focus",
+        "--cwd",
+        "/repo",
+        // L-339: delegated panes keep the downstream non-interactive env neutraliser.
+        "--env",
+        "GIT_SSH_COMMAND=/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0",
+        "--env",
+        "SSH_ASKPASS=/bin/false",
+        "--env",
+        "SSH_ASKPASS_REQUIRE=never",
+        "--env",
+        "DISPLAY=",
+      ]);
+    });
+
+    it("constructs a downward split against the parent pane", () => {
+      assert.deepEqual(__herdrTest__.buildPaneSplitArgs("w1:p1", "down", "/repo"), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "down",
+        "--no-focus",
+        "--cwd",
+        "/repo",
+        // L-339: delegated panes keep the downstream non-interactive env neutraliser.
+        "--env",
+        "GIT_SSH_COMMAND=/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0",
+        "--env",
+        "SSH_ASKPASS=/bin/false",
+        "--env",
+        "SSH_ASKPASS_REQUIRE=never",
+        "--env",
+        "DISPLAY=",
+      ]);
+    });
+  });
+
+  describe("parseSubagentLayout", () => {
+    it("defaults to a tab when the env var is unset", () => {
+      assert.equal(parseSubagentLayout(undefined), "tab");
+    });
+
+    it("defaults to a tab when the env var is empty or whitespace", () => {
+      assert.equal(parseSubagentLayout(""), "tab");
+      assert.equal(parseSubagentLayout("   "), "tab");
+    });
+
+    it("maps `split` to a right-hand split", () => {
+      assert.equal(parseSubagentLayout("split"), "right");
+    });
+
+    it("maps `split:right` to a right-hand split", () => {
+      assert.equal(parseSubagentLayout("split:right"), "right");
+    });
+
+    it("maps `split:down` to a downward split", () => {
+      assert.equal(parseSubagentLayout("split:down"), "down");
+    });
+
+    it("falls back to a tab for unknown values", () => {
+      assert.equal(parseSubagentLayout("side-by-side"), "tab");
+      assert.equal(parseSubagentLayout("tab"), "tab");
+    });
+  });
+
+  describe("resolveSubagentLayout", () => {
+    it("reads PI_SUBAGENT_LAYOUT from the provided environment", () => {
+      assert.equal(resolveSubagentLayout({ PI_SUBAGENT_LAYOUT: "split:down" }), "down");
+      assert.equal(resolveSubagentLayout({ PI_SUBAGENT_LAYOUT: "split" }), "right");
+      assert.equal(resolveSubagentLayout({}), "tab");
+    });
   });
 });

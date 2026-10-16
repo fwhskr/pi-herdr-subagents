@@ -26,7 +26,8 @@ import { homedir } from "node:os";
 import {
   isTerminalAvailable,
   terminalSetupHint,
-  createSubagentPane,
+  createSubagentSurface,
+  resolveSubagentLayout,
   runScriptInPane,
   closePane,
   interruptPane,
@@ -1616,7 +1617,15 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 
 function updateWidget() {
   for (const [owner, ctx] of sessionCtxs) {
-    if (!ctx.hasUI) continue;
+    try {
+      if (!ctx.hasUI) continue;
+    } catch {
+      // Ctx went stale (session replacement / reload) mid-flight. Drop it and
+      // wait for the next session_start to bind a fresh one.
+      sessionCtxs.delete(owner);
+      if (runtime.latestCtx === ctx) runtime.latestCtx = undefined;
+      continue;
+    }
     ctx.ui.setWidget(
       "subagent-status",
       lanesOf(owner).length === 0 ? undefined : (_tui: any, _theme: any) => ({
@@ -2373,6 +2382,8 @@ export const __test__ = {
   findActiveSessionRun,
   captureStderrTail,
   formatElapsed,
+  updateWidget,
+  sessionCtxs,
 };
 
 function startWidgetRefresh() {
@@ -2453,7 +2464,7 @@ async function launchSubagent(
   driver.validateRuntimePlan?.(runtimePlan, parentThinking);
 
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSubagentPane(params.name);
+  const surface = options?.surface ?? createSubagentSurface(params.name, resolveSubagentLayout());
   if (params.task) {
     setPaneTask(surface, params.task);
   }
@@ -3851,7 +3862,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const subagentDonePath = preflightSubagentDonePath();
-        const surface = createSubagentPane(name);
+        const surface = createSubagentSurface(name, resolveSubagentLayout());
         if (params.message) {
           setPaneTask(surface, params.message);
         }
