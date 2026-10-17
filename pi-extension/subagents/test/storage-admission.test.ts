@@ -17,6 +17,9 @@ import {
 // behavior; everything after dispatch runs against the REAL CLI on an isolated registry.
 const fixtures = "/home/kris/.pi/agent/var/TASK-283/rescue/fixtures";
 const MiB = 1024 ** 2;
+// Test-only seam for the real core under test (TASK-292 `run --attach job`). Unset = the production
+// constant, which is never edited here; the production path activates only when the core lands on main.
+const CORE_UNDER_TEST = process.env.TASK283_STORAGE_CORE_CLI ?? STORAGE_BUDGET_CLI;
 
 interface Call { op: string; req: Record<string, any>; argv: string[]; baseExists: boolean }
 
@@ -245,8 +248,8 @@ function realLedger() {
     version: 1, headroomMinBytes: 1, headroomPercent: 0, projectCapBytes: 2 * MiB,
     estimates: { source: MiB }, monitorIntervalMs: 100, stopGraceMs: 500,
   }), { mode: 0o600 });
-  const storage = { registryRoot, policy, project: "/home/kris/.pi" };
-  const status = (leaseId: string) => JSON.parse(execFileSync(process.execPath, [STORAGE_BUDGET_CLI, "status", "--registry-root", registryRoot], {
+  const storage = { registryRoot, policy, project: "/home/kris/.pi", cli: CORE_UNDER_TEST };
+  const status = (leaseId: string) => JSON.parse(execFileSync(process.execPath, [CORE_UNDER_TEST, "status", "--registry-root", registryRoot], {
     input: JSON.stringify({ leaseId, project: "/home/kris/.pi" }), encoding: "utf8", timeout: 10000,
   }));
   return { root, base: join(root, "leases"), storage, status, done: () => rmSync(root, { recursive: true, force: true }) };
@@ -290,7 +293,7 @@ test("owned output growth is reported to the shared ledger while the worker runs
   try {
     const seen = join(r.root, "mid-run-status.json");
     // The worker reads its lease id from a file the test writes after preparation.
-    const query = `${JSON.stringify(process.execPath)} ${JSON.stringify(STORAGE_BUDGET_CLI)} status --registry-root ${JSON.stringify(r.storage.registryRoot)}`;
+    const query = `${JSON.stringify(process.execPath)} ${JSON.stringify(CORE_UNDER_TEST)} status --registry-root ${JSON.stringify(r.storage.registryRoot)}`;
     const worker = [
       `head -c ${MiB} /dev/zero > "$TMPDIR/grown"; sync; sleep 1`,
       `printf '{"leaseId":"%s","project":"/home/kris/.pi"}' "$(cat "$(dirname "$TMPDIR")/test-lease-id")" | ${query} > '${seen}'`,
@@ -315,15 +318,16 @@ test("refused growth stops only the owned worker tree and never releases it as c
     const launch = prepareLaunchScript(`head -c ${4 * MiB} /dev/zero > "$TMPDIR/grown"; sync; sleep 6; touch '${finished}'`, {
       scratchBase: r.base, scriptPath: join(r.root, "launch.sh"), storage: r.storage,
     });
-    const started = Date.now();
     const status = inPty(launch.scriptPath);
-    assert.ok(Date.now() - started < 5000, "stopped promptly, not after the worker finished");
+    // Promptness is proven by ordering, not a wall-clock bound (host I/O stalls distort timing): the worker
+    // touches `finished` only after its own sleep, so its absence plus the real budget-stop event proves the stop came first.
     assert.equal(status, 75, "budget stop exit status");
-    assert.equal(existsSync(finished), false, "worker production stopped");
+    assert.equal(existsSync(finished), false, "worker production stopped before its own completion");
     assert.doesNotThrow(() => process.kill(Number(bystander), 0), "unrelated process untouched");
     const log = events(launch);
-    assert.ok(log.some((event) => event.event === "stop"));
-    assert.ok(!log.some((event) => event.event === "exit" && event.release === "completed"));
+    assert.equal(log.find((event) => event.event === "stop")?.reason, "project-cap-exceeded", "the real core's refused-growth reason");
+    assert.deepEqual(log.filter((event) => event.event === "exit").map((event) => [event.stoppedForBudget, event.release, event.released]), [[true, "failed", true]]);
+    assert.equal(r.status(launch.storage.leaseId).leaseState, "absent", "reservation released as failed, never completed");
   } finally {
     try { process.kill(Number(bystander), "SIGTERM"); } catch { /* gone */ }
     r.done();
