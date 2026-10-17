@@ -242,15 +242,18 @@ test("project identity resolves worktrees and aliases to one canonical repositor
 function realLedger() {
   mkdirSync(fixtures, { recursive: true });
   const root = realpathSync(mkdtempSync(join(fixtures, "real-")));
+  // The fixture owns its project identity: an ordinary .git directory marks it, so the live checkout is never mounted.
+  mkdirSync(join(root, ".git"));
+  assert.equal(canonicalProject(root), root, "fixture project identity");
   const registryRoot = join(root, "registry");
   const policy = join(root, "policy.json");
   writeFileSync(policy, JSON.stringify({
     version: 1, headroomMinBytes: 1, headroomPercent: 0, projectCapBytes: 2 * MiB,
     estimates: { source: MiB }, monitorIntervalMs: 100, stopGraceMs: 500,
   }), { mode: 0o600 });
-  const storage = { registryRoot, policy, project: "/home/kris/.pi", cli: CORE_UNDER_TEST };
+  const storage = { registryRoot, policy, project: root, cli: CORE_UNDER_TEST };
   const status = (leaseId: string) => JSON.parse(execFileSync(process.execPath, [CORE_UNDER_TEST, "status", "--registry-root", registryRoot], {
-    input: JSON.stringify({ leaseId, project: "/home/kris/.pi" }), encoding: "utf8", timeout: 10000,
+    input: JSON.stringify({ leaseId, project: root }), encoding: "utf8", timeout: 10000,
   }));
   return { root, base: join(root, "leases"), storage, status, done: () => rmSync(root, { recursive: true, force: true }) };
 }
@@ -296,7 +299,7 @@ test("owned output growth is reported to the shared ledger while the worker runs
     const query = `${JSON.stringify(process.execPath)} ${JSON.stringify(CORE_UNDER_TEST)} status --registry-root ${JSON.stringify(r.storage.registryRoot)}`;
     const worker = [
       `head -c ${MiB} /dev/zero > "$TMPDIR/grown"; sync; sleep 1`,
-      `printf '{"leaseId":"%s","project":"/home/kris/.pi"}' "$(cat "$(dirname "$TMPDIR")/test-lease-id")" | ${query} > '${seen}'`,
+      `printf '{"leaseId":"%s","project":"%s"}' "$(cat "$(dirname "$TMPDIR")/test-lease-id")" '${r.root}' | ${query} > '${seen}'`,
     ].join("\n");
     const launch = prepareLaunchScript(worker, { scratchBase: r.base, scriptPath: join(r.root, "launch.sh"), storage: r.storage });
     writeFileSync(join(dirname(launch.scratch.leasePath), "test-lease-id"), launch.storage.leaseId);
