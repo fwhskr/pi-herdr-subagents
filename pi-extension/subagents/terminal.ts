@@ -3,7 +3,8 @@ import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { allocateScratch, cancelUnstartedScratch, SCRATCH_BASE, type LaunchScratch } from "./scratch-lifecycle.ts";
 import {
-  releaseLaunchStorage, reserveLaunchStorage, type StorageAdmissionOptions, type StorageLease,
+  armDispatchDeadline, cancelLaunchStorage, EVENTS_NAME, reserveLaunchStorage, settleMeta, writeAdoptDescriptor,
+  type StorageAdmissionOptions, type StorageLease,
 } from "./storage-admission.ts";
 import { assertSpawnCodeFresh } from "./staleness-tripwire.ts";
 import {
@@ -116,7 +117,7 @@ export interface LaunchScriptOptions {
   sessionFile?: string;
   /** Synthetic fixture seam; allocation still enforces the .pi boundary. */
   scratchBase?: string;
-  /** TASK-283: shared-disk admission settings/seams (project, class, estimate, CLI path). */
+  /** TASK-283: shared-disk admission (project, class, estimate); CLI/registry seams are fixture-only. */
   storage?: StorageAdmissionOptions;
 }
 
@@ -126,13 +127,13 @@ export function prepareLaunchScript(command: string, options: LaunchScriptOption
 } {
   // Existing drivers already supply this generated comment; no entrypoint widening.
   const session = options.sessionFile ?? options.scriptPreamble?.match(/^# Session: (.+)$/m)?.[1];
-  // TASK-283: reserve shared headroom BEFORE any scratch/export/fork; refusal allocates nothing.
+  // TASK-283: reserve a pending handoff lease BEFORE any scratch/export/fork; refusal allocates nothing.
   const storage = reserveLaunchStorage(options.scratchBase ?? SCRATCH_BASE, options.storage);
   let scratch: LaunchScratch;
   try {
     scratch = allocateScratch(session && isAbsolute(session) ? session : null, { scratchBase: options.scratchBase });
   } catch (error) {
-    releaseLaunchStorage(storage, "cancelled");
+    cancelLaunchStorage(storage);
     throw error;
   }
   const scriptPath = options.scriptPath ?? join(scratch.scratchRoot, "launch.sh");
@@ -157,11 +158,16 @@ export function prepareLaunchScript(command: string, options: LaunchScriptOption
     let delimiter = `__PI_WORKER_${scratch.launchId.replaceAll("-", "_")}__`;
     while (scriptLines.join("\n").split("\n").includes(delimiter)) delimiter += "_";
     const helper = `${shellQuote(process.execPath)} ${shellQuote(fileURLToPath(new URL("./scratch-lifecycle.ts", import.meta.url)))} --scratch-lifecycle`;
+    // Token-bearing adopt request: 0600 beside the scratch lease, never TMPDIR/argv/env.
+    const descriptor = writeAdoptDescriptor(storage, scratch.leasePath, scratch.scratchRoot);
+    const launchRoot = dirname(scratch.leasePath);
     const storageHelper = `${shellQuote(process.execPath)} ${shellQuote(fileURLToPath(new URL("./storage-admission.ts", import.meta.url)))} --storage-admission`;
-    const lease = shellQuote(JSON.stringify(storage));
-    // Scratch closes first; the reservation is released only when the supervisor's identity
-    // and descendants prove completion, otherwise it stays reserved (fail closed).
-    const close = `status=$?; ${helper} close ${shellQuote(scratch.leasePath)} "$$"; ${storageHelper} settle ${lease} "$$" "$status" "$STORAGE_START"; exit "$status"`;
+    // The core runs in the pane's foreground job: it binds this job, monitors owned growth
+    // and only then starts the worker, which keeps the terminal, job control and SIGWINCH.
+    const core = [process.execPath, storage.cli, "run", ...storage.flags, "--attach", "job", "--request-fd", "3",
+      "--event-file", join(launchRoot, EVENTS_NAME), "--", "bash", workerPath].map(shellQuote).join(" ");
+    // Scratch closes first; the reservation settles from core answers only (fail closed).
+    const close = `status=$?; ${helper} close ${shellQuote(scratch.leasePath)} "$$"; ${storageHelper} settle ${shellQuote(settleMeta(storage))} ${shellQuote(descriptor)} "$status"; exit "$status"`;
     // Keep custody in a supervisor: preamble exits/execs cannot replace the EXIT trap.
     writeFileSync(scriptPath, [
       "#!/bin/bash",
@@ -170,19 +176,18 @@ export function prepareLaunchScript(command: string, options: LaunchScriptOption
       `export TMPDIR=${shellQuote(scratch.scratchRoot)}`,
       `trap ${shellQuote(close)} EXIT`,
       `${helper} start ${shellQuote(scratch.leasePath)} "$$"`,
-      `STORAGE_START=$(${storageHelper} bind ${lease} "$$") || exit 75`,
       // An explicitly retained launch script keeps session/command metadata;
       // the executable worker copy is always ephemeral.
       `cat > ${shellQuote(workerPath)} <<${shellQuote(delimiter)}`,
       ...scriptLines,
       delimiter,
-      `bash ${shellQuote(workerPath)}`,
+      `${core} 3< ${shellQuote(descriptor)}`,
       "",
     ].join("\n"), { mode: 0o700 });
     return { scriptPath, scratch, storage };
   } catch (error) {
     cancelUnstartedScratch(scratch);
-    releaseLaunchStorage(storage, "cancelled");
+    cancelLaunchStorage(storage);
     throw error;
   }
 }
@@ -197,10 +202,12 @@ export function runScriptInPane(
   const launch = prepareLaunchScript(command, options);
   try {
     runInPane(paneId, `TMPDIR=${shellQuote(launch.scratch.scratchRoot)} bash ${shellQuote(launch.scriptPath)}`);
+    // A job that never binds is cancelled with the token after one bounded deadline.
+    void armDispatchDeadline(launch.storage);
     return launch.scriptPath;
   } catch (error) {
     cancelUnstartedScratch(launch.scratch);
-    releaseLaunchStorage(launch.storage, "cancelled");
+    cancelLaunchStorage(launch.storage);
     throw error;
   }
 }
