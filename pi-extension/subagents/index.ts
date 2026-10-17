@@ -38,6 +38,7 @@ import {
   setPaneTask,
   listPaneSessionReferences,
 } from "./terminal.ts";
+import { piLaunchWord } from "./pi-executable.ts";
 import { waitForCompletion, type CompletionResult } from "./completion.ts";
 import type { HerdrReadSource } from "./herdr.ts";
 import {
@@ -3890,7 +3891,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         releaseResumeSession(params.sessionPath);
 
         // Build pi resume command
-        const parts = ["pi", "--session", shellQuote(params.sessionPath)];
+        const parts = [piLaunchWord(shellQuote), "--session", shellQuote(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         parts.push("-e", shellQuote(subagentDonePath));
