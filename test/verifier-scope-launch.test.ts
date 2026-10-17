@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { afterEach, it } from "node:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
-import { bindVerifierScope, resumeVerifierScope, VERIFIER_EXCLUSIONS } from "../pi-extension/subagents/verifier-scope.ts";
+import { bindVerifierScope, requiredEnginePins, resumeVerifierScope, VERIFIER_EXCLUSIONS } from "../pi-extension/subagents/verifier-scope.ts";
 import { basename, dirname, join } from "node:path";
 import { cancelUnstartedScratch } from "../pi-extension/subagents/scratch-lifecycle.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -160,6 +160,80 @@ it("resume keeps the exact recorded authorization even if it is unreadable", () 
   const auth = authorization();
   const binding = { auth_id: auth.auth_id };
   assert.deepEqual(resumeVerifierScope({ verifierScope: binding, task: "ordinary task" }, "fixture"), binding);
+});
+// TASK-266.1: launcher-sealed exact rootless-engine entries matching the runtime's verifier-real-engine-v1 binding.
+const digest = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
+const byKey = (o: Record<string, string>) => Object.entries(o).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+function runtimeBinding(auth: any, e: any): string {
+  // Independent copy of the runtime formula (verifier-scoped-runner.ts realEngineBinding).
+  const r = e.real_engine;
+  return createHash("sha256").update(JSON.stringify(["verifier-real-engine-v1", auth.auth_id, auth.candidate.repo_realpath, auth.candidate.commit_sha, e.id,
+    e.cwd_realpath, e.argv, e.selector, [...e.inputs].sort(), byKey(r.input_pins), byKey(r.engine_pins), r.storage_root,
+    [...(e.runtime_roots ?? [])].sort(), [...e.read_roots].sort(), [...e.write_roots].sort(), byKey(e.env), e.timeout_s, e.max_output_bytes ?? null])).digest("hex");
+}
+function engineRequest() {
+  const work = mkdtempSync("/home/kris/.pi/agent/var/scope-engine-"); roots.push(work);
+  const input = join(work, "engine-check.js"); writeFileSync(input, "console.log('engine')\n");
+  const auth = authorization();
+  const engine_pins: Record<string, string> = Object.fromEntries([process.execPath, ...requiredEnginePins()].map(p => [p, digest(p)]));
+  const entry: any = { id: "engine", cwd_realpath: work, argv: [process.execPath, input], selector: "task-266-real-engine", inputs: [input],
+    runtime_roots: [dirname(process.execPath)], read_roots: [], write_roots: [], env: {}, timeout_s: 30, max_output_bytes: 65536,
+    max_attempts: 1, retry_on_failure: false, network: false, real_engine: { engine_pins, input_pins: { [input]: digest(input) } } };
+  auth.entries.push(entry);
+  return { auth, entry, input, work };
+}
+const fence = (auth: unknown) => `\`\`\`verifier-scope\n${JSON.stringify(auth)}\n\`\`\``;
+it("requires the actual podman, OCI runtime and conmon executables Podman resolves in the jail", () => {
+  const [podman, runtime, conmon] = requiredEnginePins();
+  assert.equal(podman, "/usr/bin/podman");
+  assert.match(runtime, /^\/usr\/.*\/(?:crun|runc)$/); assert.equal(realpathSync(runtime), runtime);
+  assert.match(conmon, /^\/usr\/.*\/conmon$/);
+});
+it("seals a scoped exact rootless-engine entry: private store, runtime binding, locked and repeatable", () => {
+  const { auth, entry } = engineRequest(); const session = `engine-${randomUUID()}`;
+  const binding = bindVerifierScope(fence(auth), session)!;
+  assert.equal(binding.error, undefined); assert.equal(binding.auth_id, auth.auth_id);
+  const file = join(base, auth.auth_id, "authorization.json");
+  const published = JSON.parse(readFileSync(file, "utf8"));
+  const e = published.entries[0];
+  assert.equal(published.entries.length, 1);
+  assert.equal(e.real_engine.storage_root, join(base, auth.auth_id, "engine-stores", "engine"));
+  assert.deepEqual(e.real_engine.engine_pins, entry.real_engine.engine_pins); assert.deepEqual(e.real_engine.input_pins, entry.real_engine.input_pins);
+  assert.equal(e.real_engine.binding, runtimeBinding(published, e));
+  const { real_engine: _sealed, ...rest } = e; const { real_engine: _requested, ...requested } = entry;
+  assert.deepEqual(rest, requested);
+  const stat = statSync(file); assert.equal(stat.mode & 0o777, 0o444); assert.equal(stat.nlink, 1);
+  // Unchanged repeat reuses the identical locked record.
+  assert.deepEqual(bindVerifierScope(fence(auth), session), binding);
+});
+it("refuses caller-authored binding/storage and missing, dummy or mismatched engine pins before any engine launch", () => {
+  const [podman, runtime, conmon] = requiredEnginePins();
+  const cases: [string, (x: ReturnType<typeof engineRequest>) => void, RegExp][] = [
+    ["caller binding", x => { x.entry.real_engine.binding = "a".repeat(64); }, /launcher-authored/],
+    ["caller storage", x => { x.entry.real_engine.storage_root = join(base, x.auth.auth_id, "engine-stores", "engine"); }, /launcher-authored/],
+    ["dummy engine field", x => { x.entry.real_engine = { nested_userns: true }; }, /Unknown authorization field/],
+    ["empty engine request", x => { x.entry.real_engine = {}; }, /Invalid real-engine pins/],
+    ["missing podman pin", x => { delete x.entry.real_engine.engine_pins[podman]; }, /actual engine executable \/usr\/bin\/podman/],
+    ["missing OCI runtime pin", x => { delete x.entry.real_engine.engine_pins[runtime]; }, /actual engine executable/],
+    ["missing conmon pin", x => { delete x.entry.real_engine.engine_pins[conmon]; }, /actual engine executable/],
+    ["wrong podman digest", x => { x.entry.real_engine.engine_pins[podman] = "0".repeat(64); }, /executable pin mismatch/],
+    ["malformed digest", x => { x.entry.real_engine.engine_pins[podman] = "zz"; }, /Invalid real-engine pins/],
+    ["argv[0] unpinned", x => { delete x.entry.real_engine.engine_pins[process.execPath]; }, /argv\[0\]/],
+    ["input pins incomplete", x => { x.entry.real_engine.input_pins = { [join(x.work, "other")]: "a".repeat(64) }; }, /cover exactly/],
+    ["pin outside runtime roots", x => { x.entry.real_engine.engine_pins[x.input] = digest(x.input); }, /outside the runtime roots/],
+    ["symlinked pin", x => { x.entry.runtime_roots.push("/usr"); x.entry.real_engine.engine_pins["/usr/bin/runc"] = "a".repeat(64); }, /not a canonical path/],
+    ["engine config env", x => { x.entry.env.CONTAINERS_CONF = "/usr/share/containers/containers.conf"; }, /Engine configuration environment/],
+    ["socket env", x => { x.entry.env.CONTAINER_HOST = "unix:///run/user/1000/podman/podman.sock"; }, /Engine configuration environment/],
+    ["with runner self-test", x => { x.entry.runner_self_test = {}; }, /Invalid real-engine request/],
+    ["retry", x => { x.entry.retry_on_failure = true; }, /no-retry/],
+  ];
+  for (const [name, mutate, reason] of cases) {
+    const x = engineRequest(); mutate(x);
+    const binding = bindVerifierScope(fence(x.auth), `refuse-${randomUUID()}`)!; roots.push(join(base, binding.auth_id));
+    assert.notEqual(binding.auth_id, x.auth.auth_id, name); assert.match(binding.error ?? "", reason, `${name}: ${binding.error}`);
+    assert.deepEqual(JSON.parse(readFileSync(join(base, binding.auth_id, "authorization.json"), "utf8")).entries, [], name);
+    assert.equal(existsSync(join(base, x.auth.auth_id)), false, name);
+  }
 });
 it("leaves ordinary unfenced launch command selection unchanged", () => {
   const command = launch("ordinary task");
