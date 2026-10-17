@@ -8,6 +8,7 @@ import type {
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
 import { getSubagentActivityFile } from "../../activity.ts";
 import { resolveSpawnTrustFlag } from "../../spawn-trust.ts";
+import { piLaunchWord } from "../../pi-executable.ts";
 import { bindVerifierScope, VERIFIER_TOOLS, VERIFIER_EXCLUSIONS } from "../../verifier-scope.ts";
 
 export const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
@@ -117,7 +118,7 @@ export class PiHarnessDriver implements HarnessDriver {
       shellQuote,
     } = context;
 
-    const parts: string[] = ["pi"];
+    const parts: string[] = [piLaunchWord(shellQuote)];
     parts.push("--session", shellQuote(subagentSessionFile));
 
     const subagentDonePath = join(subagentsDir, "subagent-done.ts");
