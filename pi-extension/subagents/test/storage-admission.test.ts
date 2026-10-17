@@ -7,7 +7,7 @@ import { processIdentity } from "../scratch-lifecycle.ts";
 import { prepareLaunchScript, runScriptInPane } from "../terminal.ts";
 import {
   canonicalProject, releaseLaunchStorage, reserveLaunchStorage, settleLaunchStorage, StorageRefusal,
-  type StorageLease,
+  type StorageAdmissionOptions, type StorageLease,
 } from "../storage-admission.ts";
 
 // TASK-283: terminal launch preparation reserves shared disk headroom through the
@@ -39,6 +39,7 @@ else if (mode === "exit1") process.exit(1);
 else if (op === "reserve" && mode === "deny") out({ admitted: false, reason: "insufficient-headroom", freeBytes: 1000, reservedBytes: 500, estimatedBytes: req.estimatedBytes, remainingBytes: -1, floorBytes: 99 });
 else if (op === "reserve" && mode === "nolease") out({ admitted: true });
 else if (op !== "reserve" && mode === "failrelease") process.exit(1);
+else if (op === "renew" && mode === "denygrow" && ("consumedBytes" in req || "estimatedBytes" in req)) out({ ok: true, admitted: false, reason: "insufficient-space", action: "stop-owned-producer", leaseId: req.leaseId, freeBytes: 1, reservedBytes: 0, estimatedBytes: ${2 * GiB}, remainingBytes: -1, floorBytes: 1 });
 else if (op === "reserve") out({ admitted: true, leaseId: "lease-" + req.launchId, freeBytes: 100 * ${GiB}, reservedBytes: 0, estimatedBytes: req.estimatedBytes, remainingBytes: 98 * ${GiB}, floorBytes: 64 * ${GiB} });
 else out({ ok: true });
 `);
@@ -216,4 +217,70 @@ test("project identity resolves worktrees and aliases to one canonical repositor
     assert.equal(canonicalProject(join(work, "sub")), repo);
     assert.equal(canonicalProject(repo), repo);
   } finally { f.done(); }
+});
+
+// ---- TASK-283 rescue red contract: interactive terminal + shared-ledger growth monitoring ----
+// Architecture for binding the pane job is pending; these pin the behavior any choice must keep.
+// Monitoring seam requested from the adapter: StorageAdmissionOptions.monitorIntervalMs (test cadence only).
+const fast = (cli: string): StorageAdmissionOptions => ({ cli, monitorIntervalMs: 100 } as StorageAdmissionOptions);
+
+function inPty(scriptPath: string, timeout = 15000): number {
+  // `script` gives the launch a real pseudo-terminal, as the herdr pane does.
+  try { execFileSync("script", ["-qec", `bash ${scriptPath}`, "/dev/null"], { timeout, stdio: ["ignore", "ignore", "ignore"] }); return 0; }
+  catch (error) { return (error as { status: number }).status; }
+}
+
+test("the worker keeps the pane terminal: tty stdin/stdout, foreground job control and resize SIGWINCH", () => {
+  const f = fixture();
+  try {
+    const out = join(f.root, "tty.out");
+    const worker = [
+      `trap 'echo winch >> ${out}' WINCH`,
+      `[ -t 0 ] && echo stdin-tty >> '${out}'`,
+      `[ -t 1 ] && echo stdout-tty >> '${out}'`,
+      `read pg tp < <(ps -o pgid=,tpgid= -p $$); [ "$pg" = "$tp" ] && echo foreground >> '${out}'`,
+      // TIOCSWINSZ on the controlling tty signals only its foreground process group.
+      "stty cols 101 rows 31 </dev/tty; sleep 0.3; true",
+    ].join("\n");
+    const launch = prepareLaunchScript(worker, { scratchBase: f.base, scriptPath: join(f.root, "launch.sh"), storage: fast(f.cli) });
+    assert.equal(inPty(launch.scriptPath), 0);
+    assert.deepEqual(readFileSync(out, "utf8").trim().split("\n"), ["stdin-tty", "stdout-tty", "foreground", "winch"]);
+  } finally { f.done(); }
+});
+
+test("owned output growth is reported to the shared ledger while the worker runs", () => {
+  const f = fixture();
+  try {
+    const launch = prepareLaunchScript(`head -c 4194304 /dev/zero > "$TMPDIR/grown"; sync; sleep 1.5`, {
+      scratchBase: f.base, scriptPath: join(f.root, "launch.sh"), storage: fast(f.cli),
+    });
+    assert.equal(inPty(launch.scriptPath), 0);
+    const leaseId = launch.storage.leaseId;
+    const growth = f.calls().filter((call) => call.op === "renew" && call.req.leaseId === leaseId
+      && call.req.consumedBytes !== undefined && BigInt(call.req.consumedBytes) >= 4194304n);
+    assert.ok(growth.length >= 1, `expected a consumedBytes renewal, saw ${JSON.stringify(f.calls().map((c) => [c.op, c.req.consumedBytes]))}`);
+    assert.ok(f.calls().some((call) => call.op === "release" && call.req.leaseId === leaseId), "settled after exit");
+  } finally { f.done(); }
+});
+
+test("refused growth stops only the owned worker tree and keeps the reservation", () => {
+  const f = fixture();
+  const finished = join(f.root, "finished");
+  const bystander = execFileSync("bash", ["-c", "setsid sleep 30 >/dev/null 2>&1 & echo $!"], { encoding: "utf8" }).trim();
+  try {
+    const launch = prepareLaunchScript(`head -c 4194304 /dev/zero > "$TMPDIR/grown"; sync; sleep 6; touch '${finished}'`, {
+      scratchBase: f.base, scriptPath: join(f.root, "launch.sh"), storage: fast(f.cli),
+    });
+    f.mode("denygrow");
+    const started = Date.now();
+    const status = inPty(launch.scriptPath);
+    assert.ok(Date.now() - started < 5000, "stopped promptly, not after the worker finished");
+    assert.equal(status, 75, "budget stop exit status");
+    assert.equal(existsSync(finished), false, "worker production stopped");
+    assert.doesNotThrow(() => process.kill(Number(bystander), 0), "unrelated process untouched");
+    assert.equal(f.calls().filter((call) => call.op === "release" && call.req.reason === "completed").length, 0);
+  } finally {
+    try { process.kill(Number(bystander), "SIGTERM"); } catch { /* gone */ }
+    f.done();
+  }
 });
