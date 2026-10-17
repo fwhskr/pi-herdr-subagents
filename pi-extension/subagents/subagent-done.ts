@@ -249,20 +249,25 @@ export function resolveFallbackAwareExit(params: {
 
 // Failover-eligibility mirrors the live agent-fallback-chain classifier
 // (~/.pi/agent/extensions/agent-fallback-chain.ts). Kept in sync by contract:
-// a drift only changes whether the bounded grace runs, never whether recovery
-// succeeds, because a non-eligible error gets an `agent-fallback-terminal`
-// entry from that extension and exits on the next guard tick.
+// this handler settles BEFORE that extension records its rotation (CLI `-e`
+// extensions load first), so an error the producer would recover from but this
+// mirror misses exits under the queued continuation (TASK-206: a rejected
+// account login). A non-eligible error gets an `agent-fallback-terminal` entry
+// from that extension and exits on the next guard tick.
 const FALLBACK_LIMIT_ERROR_RE =
   /\b429\b|rate[ _-]?limit|too many requests|quota|usage[ _-]?limit|usage_limit_reached|usage_not_included|insufficient_quota|out of budget|available balance|billing hard limit|monthly usage limit|freeusagelimiterror|gousagelimiterror/i;
 const FALLBACK_TRANSPORT_ERROR_RE =
   /upstream request failed|bad gateway|service unavailable|internal server error|gateway time-?out|connection (?:error|reset|refused|closed)|socket hang ?up|fetch failed|network error|temporarily unavailable|stream stalled|streaming stalled|timed? ?out|\btimeout\b|\b(?:404|500|502|503|504)\b|<!doctype html|<html\b/i;
+const FALLBACK_AUTH_ERROR_RE =
+  /\b401\b|unauthorized|authentication_error|(?:authentication )?token has been invalidated|invalid authentication|invalid[ _-]token|token (?:(?:has|is) )?expired|expired token|invalid_grant|(?:invalid|incorrect|missing|no) api key|revoked|oauth token/i;
 const FALLBACK_REASONING_STATE_RE =
   /encrypted_content|was not issued to this caller|thinking_?signature|reasoning (?:content |state )?(?:is )?not (?:issued|found|present)|invalid_request_error.*reasoning/i;
 
 export function isFailoverEligibleError(errorMessage: string | undefined): boolean {
   if (!errorMessage) return false;
   if (FALLBACK_REASONING_STATE_RE.test(errorMessage)) return false;
-  return FALLBACK_LIMIT_ERROR_RE.test(errorMessage) || FALLBACK_TRANSPORT_ERROR_RE.test(errorMessage);
+  return FALLBACK_LIMIT_ERROR_RE.test(errorMessage) || FALLBACK_TRANSPORT_ERROR_RE.test(errorMessage) ||
+    FALLBACK_AUTH_ERROR_RE.test(errorMessage);
 }
 
 /**
