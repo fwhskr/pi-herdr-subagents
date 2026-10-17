@@ -1,6 +1,6 @@
-import { constants, closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { accessSync, constants, closeSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { isAbsolute, join, normalize } from "node:path";
+import { basename, isAbsolute, join, normalize } from "node:path";
 
 const BASE = "/home/kris/.pi/agent/var/verifier-scope";
 const ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,95}$/;
@@ -58,13 +58,9 @@ function validate(value: unknown): asserts value is Authorization {
   }
 }
 // Engine configuration seen inside the jail: /etc and HOME config are absent there, so only the
-// /usr/share drop-ins documented in containers.conf(5) apply. Unresolvable overrides are refused.
+// /usr/share drop-ins documented in containers.conf(5) apply. Runtime/conmon path overrides are
+// refused; a selected OCI runtime must be one of the discovered trusted roles below.
 const SHARE = "/usr/share/containers";
-const CONMON = ["/usr/libexec/podman/conmon", "/usr/local/libexec/podman/conmon", "/usr/local/lib/podman/conmon", "/usr/bin/conmon", "/usr/sbin/conmon", "/usr/local/bin/conmon", "/usr/local/sbin/conmon", "/run/current-system/sw/bin/conmon"];
-const RUNTIMES: Record<string, string[]> = {
-  crun: ["/usr/bin/crun", "/usr/sbin/crun", "/usr/local/bin/crun", "/usr/local/sbin/crun", "/sbin/crun", "/bin/crun", "/run/current-system/sw/bin/crun"],
-  runc: ["/usr/bin/runc", "/usr/sbin/runc", "/usr/local/bin/runc", "/usr/local/sbin/runc", "/sbin/runc", "/bin/runc", "/usr/lib/cri-o-runc/sbin/runc"],
-};
 function engineRuntime(): string | undefined {
   const dropins = new Map<string, string>();
   for (const dir of [`${SHARE}/containers.rootless.conf.d/${process.getuid!()}`, `${SHARE}/containers.rootless.conf.d`, `${SHARE}/containers.conf.d`]) {
@@ -88,21 +84,65 @@ function engineRuntime(): string | undefined {
   }
   return runtime;
 }
-function firstReal(candidates: string[], what: string): string {
-  const found = candidates.find(p => existsSync(p));
-  demand(found, `No ${what} executable is installed`);
-  const real = realpathSync(found);
-  demand(inside(real, "/usr"), `The ${what} executable is outside /usr and unavailable in the jail`);
-  return real;
+// Same contract as the runtime's realEngineRoles() (verifier-scoped-runner.ts): Podman itself and
+// every OCI runtime, conmon and helper Podman may exec, in Podman's default search directories.
+const ENGINE_ROLES: Record<string, string[]> = {
+  engine: ["podman"], conmon: ["conmon"],
+  "oci-runtime": ["crun", "runc", "krun", "youki", "runsc", "kata-runtime", "ocijail", "runj", "crun-vm", "crun-wasm"],
+  helper: ["catatonit", "netavark", "aardvark-dns", "pasta", "slirp4netns", "rootlessport", "fuse-overlayfs"],
+};
+const ENGINE_ROLE_DIRS = ["/usr/local/libexec/podman", "/usr/local/lib/podman", "/usr/libexec/podman", "/usr/lib/podman",
+  "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin", "/usr/lib/cri-o-runc/sbin"];
+const forbiddenComponent = /^(?:\.ssh|\.gnupg|\.netrc|\.git-credentials|\.aws|\.kube|keyrings|Trash|auth\.json|mcp-auth\.json|provider-credentials(?:\.json)?|credentials\.json|\.credentials|\.env)$/i;
+function forbidden(p: string): boolean {
+  return p.split("/").some(x => forbiddenComponent.test(x)) || /\/\.docker(?:\/config\.json)?(?:\/|$)/.test(p) || ["/run", "/proc", "/dev", "/etc"].some(r => inside(p, r));
 }
-/** The exact rootless engine executables Podman resolves inside the jail: podman, its OCI runtime and conmon. */
-export function requiredEnginePins(): string[] {
-  const name = engineRuntime();
-  demand(name === undefined || name in RUNTIMES, `Unsupported OCI runtime ${name}; only crun or runc`);
-  // containers.conf(5): default runtime priority is crun, then runc.
-  const runtime = name ? firstReal(RUNTIMES[name], name) : firstReal([...RUNTIMES.crun, ...RUNTIMES.runc], "OCI runtime");
-  return [firstReal(["/usr/bin/podman"], "podman"), runtime, firstReal(CONMON, "conmon")];
+// Root-owned along the whole canonical path and not group/other writable (the overflow uid stands
+// for unmapped root inside a user namespace, never the caller's own uid): a renamed or copied user
+// binary, a symlink or a file below a user-writable directory is never an engine role.
+function trustedExecutable(p: string): boolean {
+  if (!isAbsolute(p) || normalize(p) !== p || p === "/" || forbidden(p)) return false;
+  let overflow = 65534;
+  try { overflow = Number(readFileSync("/proc/sys/kernel/overflowuid", "utf8").trim()); } catch { /* kernel default */ }
+  const self = process.getuid!();
+  let fd = openSync("/", constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    const trusted = (uid: number, mode: number): boolean => uid !== self && (uid === 0 || uid === overflow) && (mode & 0o022) === 0;
+    const readOnly = (): boolean => { try { accessSync("/", constants.W_OK); return false; } catch { return true; } };
+    const top = fstatSync(fd);
+    if (!trusted(top.uid, top.mode) && !(top.uid === self && readOnly())) return false;
+    for (const part of p.split("/").filter(Boolean)) {
+      const next = openSync(`/proc/self/fd/${fd}/${part}`, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      closeSync(fd); fd = next;
+      const st = fstatSync(fd);
+      if (!trusted(st.uid, st.mode)) return false;
+    }
+    const st = fstatSync(fd);
+    return st.isFile() && (st.mode & 0o111) !== 0 && realpathSync(`/proc/self/fd/${fd}`) === p;
+  } catch { return false; } finally { closeSync(fd); }
 }
+function discoverEngineRoles(dirs: string[]): Record<string, string> {
+  const found: Record<string, string> = {};
+  for (const dir of dirs) {
+    for (const [role, names] of Object.entries(ENGINE_ROLES)) {
+      for (const name of names) {
+        const candidate = join(dir, name);
+        let real: string;
+        try { lstatSync(candidate); real = realpathSync(candidate); } catch (e) {
+          if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; throw e;
+        }
+        demand(trustedExecutable(real), `Engine role executable is not a trusted system executable: ${candidate}`);
+        demand(found[real] === undefined || found[real] === role, `Ambiguous engine role executable: ${real}`);
+        found[real] = role;
+      }
+    }
+  }
+  for (const role of ["engine", "conmon", "oci-runtime"]) demand(Object.values(found).includes(role), `Real-engine role unavailable on this host: ${role}`);
+  return found;
+}
+/** Canonical path -> role for every trusted engine role executable present; engine entries pin exactly this set. */
+export function realEngineRoles(): Record<string, string> { return discoverEngineRoles(ENGINE_ROLE_DIRS); }
+export const __engineTest__ = { discoverEngineRoles };
 function digestFile(p: string): string {
   demand(realpathSync(p) === p, `Engine pin ${p} is not a canonical path`);
   const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -125,22 +165,27 @@ export function realEngineBinding(auth: { auth_id: string; candidate: { repo_rea
     entry.cwd_realpath, entry.argv, entry.selector, sortedList(entry.inputs), pairs(r.input_pins), pairs(r.engine_pins), r.storage_root,
     sortedList(entry.runtime_roots ?? []), sortedList(entry.read_roots), sortedList(entry.write_roots), pairs(entry.env), entry.timeout_s, entry.max_output_bytes ?? null]));
 }
-// Seal requested engine entries: verify the actual engine pins, choose the private store and bind.
+// Seal requested engine entries before publication: argv[0] is genuine Podman, engine_pins equal
+// exactly the discovered trusted roles with verified digests, then choose the private store and bind.
 function seal(auth: Authorization): Authorization {
   // SAFETY: validate() has checked every entry's shape.
   if (!(auth.entries as Entry[]).some(e => e.real_engine !== undefined)) return auth;
-  const required = requiredEnginePins();
+  const roles = realEngineRoles();
+  const selected = engineRuntime();
+  demand(selected === undefined || Object.entries(roles).some(([p, role]) => role === "oci-runtime" && basename(p) === selected),
+    `Configured OCI runtime ${selected} is not a trusted discovered engine role`);
   const entries = (auth.entries as Entry[]).map(e => {
     if (e.real_engine === undefined) return e;
     const { engine_pins, input_pins } = e.real_engine;
     demand(e.inputs.length > 0 && JSON.stringify(sortedList(e.inputs)) === JSON.stringify(sortedList(Object.keys(input_pins))), "Real-engine input pins must cover exactly the inputs");
-    for (const p of required) demand(Object.hasOwn(engine_pins, p), `Real-engine pins must include the actual engine executable ${p}`);
-    demand(Object.hasOwn(engine_pins, e.argv[0]), "Real-engine argv[0] must be an exact pinned executable");
-    for (const [p, digest] of Object.entries(engine_pins)) {
-      demand(["/usr", ...(e.runtime_roots ?? [])].some((root: string) => inside(p, root)), `Engine pin ${p} is outside the runtime roots`);
-      demand(digestFile(p) === digest, `Real-engine executable pin mismatch for ${p}`);
-    }
+    demand(roles[e.argv[0]] === "engine", "Real-engine argv[0] must be the trusted engine executable itself, not a wrapper, interpreter or renamed binary");
+    const missing = Object.keys(roles).filter(p => !Object.hasOwn(engine_pins, p)).sort();
+    const extra = Object.keys(engine_pins).filter(p => !Object.hasOwn(roles, p)).sort();
+    demand(missing.length === 0 && extra.length === 0, `Real-engine pins must cover exactly the trusted engine role executables (missing: ${missing.join(", ") || "none"}; unexpected: ${extra.join(", ") || "none"})`);
+    // Engine roles come only from trusted discovery; a caller runtime root never hosts or shadows one.
+    for (const root of e.runtime_roots ?? []) demand(!Object.keys(roles).some(p => inside(p, root) || inside(root, p)), `Runtime root ${root} may not host an engine role executable`);
     demand(!Object.keys(e.env).some(k => ENGINE_ENV.test(k)), "Engine configuration environment is not permitted");
+    for (const [p, digest] of pairs(engine_pins)) demand(digestFile(p) === digest, `Real-engine executable pin mismatch for ${p}`);
     const sealed: Entry & { real_engine: RealEngine } = { ...e, real_engine: { storage_root: join(BASE, auth.auth_id, "engine-stores", e.id), engine_pins, input_pins, binding: "" } };
     sealed.real_engine.binding = realEngineBinding(auth, sealed);
     return sealed;

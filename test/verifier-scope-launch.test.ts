@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { afterEach, it } from "node:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
-import { bindVerifierScope, requiredEnginePins, resumeVerifierScope, VERIFIER_EXCLUSIONS } from "../pi-extension/subagents/verifier-scope.ts";
-import { basename, dirname, join } from "node:path";
+import { __engineTest__, bindVerifierScope, realEngineRoles, resumeVerifierScope, VERIFIER_EXCLUSIONS } from "../pi-extension/subagents/verifier-scope.ts";
+import { basename, dirname, join, resolve } from "node:path";
+import { createRequire } from "node:module";
 import { cancelUnstartedScratch } from "../pi-extension/subagents/scratch-lifecycle.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { PiHarnessDriver } from "../pi-extension/subagents/harness/drivers/pi.ts";
@@ -161,72 +162,117 @@ it("resume keeps the exact recorded authorization even if it is unreadable", () 
   const binding = { auth_id: auth.auth_id };
   assert.deepEqual(resumeVerifierScope({ verifierScope: binding, task: "ordinary task" }, "fixture"), binding);
 });
-// TASK-266.1: launcher-sealed exact rootless-engine entries matching the runtime's verifier-real-engine-v1 binding.
-const digest = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
-const byKey = (o: Record<string, string>) => Object.entries(o).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-function runtimeBinding(auth: any, e: any): string {
-  // Independent copy of the runtime formula (verifier-scoped-runner.ts realEngineBinding).
-  const r = e.real_engine;
-  return createHash("sha256").update(JSON.stringify(["verifier-real-engine-v1", auth.auth_id, auth.candidate.repo_realpath, auth.candidate.commit_sha, e.id,
-    e.cwd_realpath, e.argv, e.selector, [...e.inputs].sort(), byKey(r.input_pins), byKey(r.engine_pins), r.storage_root,
-    [...(e.runtime_roots ?? [])].sort(), [...e.read_roots].sort(), [...e.write_roots].sort(), byKey(e.env), e.timeout_s, e.max_output_bytes ?? null])).digest("hex");
+// TASK-266.1: launcher-sealed exact rootless-engine entries matching the runtime's tightened contract:
+// argv[0] is genuine Podman, engine_pins equal exactly the trusted discovered roles, verifier-real-engine-v1 binding.
+// Test-only shared contract oracle: the actual scoped runtime (never a production import).
+const ORACLE = process.env.PI_VERIFIER_RUNNER_ORACLE ?? "/home/kris/.pi/agent/extensions/verifier-scoped-runner.ts";
+async function runtimeOracle(): Promise<any> {
+  const host = resolve(dirname(process.execPath), "../lib/node_modules/@earendil-works/pi-coding-agent");
+  const req = createRequire(import.meta.url);
+  const { createJiti } = req(req.resolve("jiti", { paths: [host] }));
+  const jiti = createJiti(import.meta.url, { fsCache: false, moduleCache: false, alias: { typebox: req.resolve("typebox", { paths: [host] }) } });
+  const runtime: any = await jiti.import(ORACLE);
+  assert.ok(runtime.realEngineRoles && runtime.realEngineBinding && runtime.createScopedRunner, `runtime oracle ${ORACLE} lacks the TASK-266 real-engine contract`);
+  return runtime;
 }
+const digest = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
+const rolePins = () => Object.fromEntries(Object.keys(realEngineRoles()).map(p => [p, digest(p)]));
 function engineRequest() {
   const work = mkdtempSync("/home/kris/.pi/agent/var/scope-engine-"); roots.push(work);
-  const input = join(work, "engine-check.js"); writeFileSync(input, "console.log('engine')\n");
-  const auth = authorization();
-  const engine_pins: Record<string, string> = Object.fromEntries([process.execPath, ...requiredEnginePins()].map(p => [p, digest(p)]));
-  const entry: any = { id: "engine", cwd_realpath: work, argv: [process.execPath, input], selector: "task-266-real-engine", inputs: [input],
-    runtime_roots: [dirname(process.execPath)], read_roots: [], write_roots: [], env: {}, timeout_s: 30, max_output_bytes: 65536,
-    max_attempts: 1, retry_on_failure: false, network: false, real_engine: { engine_pins, input_pins: { [input]: digest(input) } } };
+  const fsRoot = join(work, "rootfs");
+  for (const d of ["bin", "etc", "proc", "sys", "dev", "tmp", "run", "w"]) mkdirSync(join(fsRoot, d), { recursive: true });
+  const busybox = join(fsRoot, "bin/busybox"); copyFileSync("/usr/bin/busybox-static", busybox); chmodSync(busybox, 0o755);
+  symlinkSync("busybox", join(fsRoot, "bin/sh"));
+  for (const f of ["mtab", "hosts", "resolv.conf", "hostname"]) writeFileSync(join(fsRoot, "etc", f), "");
+  writeFileSync(join(fsRoot, "etc/passwd"), "root:x:0:0:root:/:/bin/sh\n"); writeFileSync(join(fsRoot, "etc/group"), "root:x:0:\n");
+  writeFileSync(join(fsRoot, "run/.containerenv"), "");
+  const out = join(work, "out"); mkdirSync(out, { mode: 0o700 });
+  const input = join(work, "engine-check.sh"); writeFileSync(input, "printf x >> /w/out/counter\necho ENGINE-OK\n");
+  const auth = authorization(); auth.candidate.repo_realpath = work;
+  const entry: any = { id: "engine", cwd_realpath: work,
+    argv: ["/usr/bin/podman", "run", "--rm", "--pull=never", "--tmpfs", "/sys:ro", "--network=none", "-v", `${work}:/w`, "--rootfs", fsRoot, "/bin/sh", "/w/engine-check.sh"],
+    selector: "task-266-real-engine", inputs: [input, busybox], read_roots: [fsRoot], write_roots: [out], env: {}, timeout_s: 30, max_output_bytes: 65536,
+    max_attempts: 1, retry_on_failure: false, network: false, real_engine: { engine_pins: rolePins(), input_pins: { [input]: digest(input), [busybox]: digest(busybox) } } };
   auth.entries.push(entry);
-  return { auth, entry, input, work };
+  return { auth, entry, input, work, out };
 }
 const fence = (auth: unknown) => `\`\`\`verifier-scope\n${JSON.stringify(auth)}\n\`\`\``;
-it("requires the actual podman, OCI runtime and conmon executables Podman resolves in the jail", () => {
-  const [podman, runtime, conmon] = requiredEnginePins();
-  assert.equal(podman, "/usr/bin/podman");
-  assert.match(runtime, /^\/usr\/.*\/(?:crun|runc)$/); assert.equal(realpathSync(runtime), runtime);
-  assert.match(conmon, /^\/usr\/.*\/conmon$/);
+it("discovers exactly the runtime's trusted engine roles: genuine Podman, conmon, OCI runtimes and present helpers", async () => {
+  const runtime = await runtimeOracle();
+  const roles = realEngineRoles();
+  assert.deepEqual(roles, runtime.realEngineRoles());
+  assert.equal(roles["/usr/bin/podman"], "engine");
+  for (const role of ["engine", "conmon", "oci-runtime"]) assert.ok(Object.values(roles).includes(role), role);
+  for (const p of Object.keys(roles)) { assert.equal(realpathSync(p), p); assert.equal(statSync(p).uid, 0, p); }
 });
-it("seals a scoped exact rootless-engine entry: private store, runtime binding, locked and repeatable", () => {
-  const { auth, entry } = engineRequest(); const session = `engine-${randomUUID()}`;
+it("discovery refuses an untrusted user-owned role executable and an incomplete role set", () => {
+  const dir = mkdtempSync("/home/kris/.pi/agent/var/scope-engine-roles-"); roots.push(dir);
+  copyFileSync("/usr/bin/podman", join(dir, "podman")); chmodSync(join(dir, "podman"), 0o755);
+  assert.throws(() => __engineTest__.discoverEngineRoles([dir]), /not a trusted system executable/);
+  assert.throws(() => __engineTest__.discoverEngineRoles(["/usr/libexec/podman"]), /role unavailable on this host: engine/);
+});
+it("seals a genuine Podman entry the real runtime accepts, runs once confined and refuses to repeat", { timeout: 60000 }, async () => {
+  const runtime = await runtimeOracle();
+  const { auth, entry, out } = engineRequest(); const session = `engine-${randomUUID()}`;
   const binding = bindVerifierScope(fence(auth), session)!;
   assert.equal(binding.error, undefined); assert.equal(binding.auth_id, auth.auth_id);
   const file = join(base, auth.auth_id, "authorization.json");
   const published = JSON.parse(readFileSync(file, "utf8"));
   const e = published.entries[0];
-  assert.equal(published.entries.length, 1);
   assert.equal(e.real_engine.storage_root, join(base, auth.auth_id, "engine-stores", "engine"));
   assert.deepEqual(e.real_engine.engine_pins, entry.real_engine.engine_pins); assert.deepEqual(e.real_engine.input_pins, entry.real_engine.input_pins);
-  assert.equal(e.real_engine.binding, runtimeBinding(published, e));
+  assert.equal(e.real_engine.binding, runtime.realEngineBinding(published, e));
   const { real_engine: _sealed, ...rest } = e; const { real_engine: _requested, ...requested } = entry;
   assert.deepEqual(rest, requested);
   const stat = statSync(file); assert.equal(stat.mode & 0o777, 0o444); assert.equal(stat.nlink, 1);
-  // Unchanged repeat reuses the identical locked record.
   assert.deepEqual(bindVerifierScope(fence(auth), session), binding);
+  const runner = runtime.createScopedRunner(auth.auth_id);
+  assert.deepEqual(runner.ids, ["engine"]);
+  const result = await runner.run({ entry_id: "engine" });
+  assert.equal(result.ok, true, JSON.stringify(result)); assert.match(result.stdout, /ENGINE-OK/);
+  assert.equal(readFileSync(join(out, "counter"), "utf8"), "x");
+  assert.equal(readdirSync(e.real_engine.storage_root).length, 1);
+  const repeat = await runtime.createScopedRunner(auth.auth_id).run({ entry_id: "engine" });
+  assert.equal(repeat.ok, false); assert.match(repeat.reason, /prior attempt/); assert.equal(readFileSync(join(out, "counter"), "utf8"), "x");
 });
-it("refuses caller-authored binding/storage and missing, dummy or mismatched engine pins before any engine launch", () => {
-  const [podman, runtime, conmon] = requiredEnginePins();
-  const cases: [string, (x: ReturnType<typeof engineRequest>) => void, RegExp][] = [
+it("refuses wrappers, interpreters, user binaries, missing or extra roles and bad pins before publication", () => {
+  const roles = realEngineRoles();
+  const userBinary = (x: ReturnType<typeof engineRequest>, link = false) => {
+    const dir = join(x.work, link ? "link" : "bin"); mkdirSync(dir, { recursive: true }); const p = join(dir, "podman");
+    if (link) symlinkSync("/usr/bin/podman", p); else { copyFileSync("/usr/bin/podman", p); chmodSync(p, 0o755); }
+    return p;
+  };
+  const pinned = (x: ReturnType<typeof engineRequest>, p: string) => { x.entry.real_engine.engine_pins[p] = digest(p); };
+  type Case = [string, (x: ReturnType<typeof engineRequest>) => void, RegExp];
+  const cases: Case[] = [
     ["caller binding", x => { x.entry.real_engine.binding = "a".repeat(64); }, /launcher-authored/],
     ["caller storage", x => { x.entry.real_engine.storage_root = join(base, x.auth.auth_id, "engine-stores", "engine"); }, /launcher-authored/],
     ["dummy engine field", x => { x.entry.real_engine = { nested_userns: true }; }, /Unknown authorization field/],
     ["empty engine request", x => { x.entry.real_engine = {}; }, /Invalid real-engine pins/],
-    ["missing podman pin", x => { delete x.entry.real_engine.engine_pins[podman]; }, /actual engine executable \/usr\/bin\/podman/],
-    ["missing OCI runtime pin", x => { delete x.entry.real_engine.engine_pins[runtime]; }, /actual engine executable/],
-    ["missing conmon pin", x => { delete x.entry.real_engine.engine_pins[conmon]; }, /actual engine executable/],
-    ["wrong podman digest", x => { x.entry.real_engine.engine_pins[podman] = "0".repeat(64); }, /executable pin mismatch/],
-    ["malformed digest", x => { x.entry.real_engine.engine_pins[podman] = "zz"; }, /Invalid real-engine pins/],
-    ["argv[0] unpinned", x => { delete x.entry.real_engine.engine_pins[process.execPath]; }, /argv\[0\]/],
+    ...Object.keys(roles).map((p): Case => [`missing ${roles[p]} ${p}`, x => { delete x.entry.real_engine.engine_pins[p]; }, new RegExp(`missing: [^;]*${p.replace(/[.]/g, "\\.")}`)]),
+    ["Podman only", x => { x.entry.real_engine.engine_pins = { "/usr/bin/podman": digest("/usr/bin/podman") }; }, /missing: /],
+    ["Node argv[0] only Node pinned", x => { x.entry.argv = [process.execPath, x.input]; x.entry.runtime_roots = [process.execPath]; x.entry.real_engine.engine_pins = { [process.execPath]: digest(process.execPath) }; }, /argv\[0\]/],
+    ["Node argv[0] with all roles", x => { x.entry.argv = [process.execPath, x.input]; x.entry.runtime_roots = [process.execPath]; pinned(x, process.execPath); }, /argv\[0\]/],
+    ["Node argv[0] exact roles", x => { x.entry.argv = [process.execPath, x.input]; }, /argv\[0\]/],
+    ["shell wrapper", x => { x.entry.argv = ["/usr/bin/sh", "-c", "exec /usr/bin/podman info"]; pinned(x, "/usr/bin/sh"); }, /argv\[0\]/],
+    ["unshare wrapper", x => { x.entry.argv = ["/usr/bin/unshare", "--user", "--map-root-user", "/usr/bin/podman", "info"]; pinned(x, "/usr/bin/unshare"); }, /argv\[0\]/],
+    ["renamed user binary", x => { const p = userBinary(x); x.entry.argv = [p, "info"]; x.entry.runtime_roots = [p]; pinned(x, p); }, /argv\[0\]/],
+    ["user symlink to engine", x => { x.entry.argv = [userBinary(x, true), "info"]; }, /argv\[0\]/],
+    ["extra non-role pin", x => pinned(x, process.execPath), /unexpected: [^;]*node/],
+    ["extra user podman in runtime root", x => { const p = userBinary(x); x.entry.runtime_roots = [dirname(p)]; pinned(x, p); }, /unexpected: [^;]*\/bin\/podman/],
+    ["runtime root hosting every role", x => { x.entry.runtime_roots = ["/usr"]; }, /Runtime root \/usr may not host an engine role/],
+    ["runtime root is a role", x => { x.entry.runtime_roots = ["/usr/bin/podman"]; }, /may not host an engine role/],
+    ["wrong podman digest", x => { x.entry.real_engine.engine_pins["/usr/bin/podman"] = "0".repeat(64); }, /executable pin mismatch for \/usr\/bin\/podman/],
+    ["wrong helper digest", x => { const p = Object.keys(roles).find(k => roles[k] === "helper") ?? "/usr/bin/conmon"; x.entry.real_engine.engine_pins[p] = "0".repeat(64); }, /executable pin mismatch/],
+    ["malformed digest", x => { x.entry.real_engine.engine_pins["/usr/bin/podman"] = "zz"; }, /Invalid real-engine pins/],
     ["input pins incomplete", x => { x.entry.real_engine.input_pins = { [join(x.work, "other")]: "a".repeat(64) }; }, /cover exactly/],
-    ["pin outside runtime roots", x => { x.entry.real_engine.engine_pins[x.input] = digest(x.input); }, /outside the runtime roots/],
-    ["symlinked pin", x => { x.entry.runtime_roots.push("/usr"); x.entry.real_engine.engine_pins["/usr/bin/runc"] = "a".repeat(64); }, /not a canonical path/],
     ["engine config env", x => { x.entry.env.CONTAINERS_CONF = "/usr/share/containers/containers.conf"; }, /Engine configuration environment/],
+    ["storage env", x => { x.entry.env.CONTAINERS_STORAGE_CONF = "/usr/share/containers/storage.conf"; }, /Engine configuration environment/],
     ["socket env", x => { x.entry.env.CONTAINER_HOST = "unix:///run/user/1000/podman/podman.sock"; }, /Engine configuration environment/],
     ["with runner self-test", x => { x.entry.runner_self_test = {}; }, /Invalid real-engine request/],
     ["retry", x => { x.entry.retry_on_failure = true; }, /no-retry/],
   ];
+  assert.ok(cases.length >= 20);
   for (const [name, mutate, reason] of cases) {
     const x = engineRequest(); mutate(x);
     const binding = bindVerifierScope(fence(x.auth), `refuse-${randomUUID()}`)!; roots.push(join(base, binding.auth_id));
