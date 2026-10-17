@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import { PiHarnessDriver, type SubagentLaunchContext } from "../pi-extension/subagents/harness/index.ts";
@@ -236,6 +237,29 @@ async function launchResume(root: string, t: any): Promise<{ script: string; cwd
   while (!delivered() && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
   return { script: result.details.launchScriptFile, cwd, child };
 }
+
+describe("TASK-236 SDK agent-dir parity on both routes", () => {
+  for (const style of ["tilde", "raw trailing space", "file URL"] as const) {
+    for (const route of ["spawn", "resume"] as const) {
+      it(`uses the wrapper for ${style} on ${route}`, { timeout: 20_000 }, async (t) => {
+        const root = scratch("task236-sdk-parity-");
+        const home = join(root, "home");
+        const agent = join(home, style === "raw trailing space" ? "alt-agent " : "alt-agent");
+        const configured = style === "tilde" ? "~/alt-agent" : style === "file URL" ? pathToFileURL(agent).href : agent;
+        const record = join(root, "record");
+        writeStub(join(agent, "bin", "pi"), "wrapper", record);
+        process.env.HOME = home;
+        process.env.PI_CODING_AGENT_DIR = configured;
+        const { script, cwd } = route === "spawn" ? buildSpawn(root) : await launchResume(root, t);
+        const result = runBare(script, cwd, { HOME: home, PI_CODING_AGENT_DIR: configured });
+        assert.equal(result.status, 0, result.stderr);
+        assert.ok(existsSync(record), "SDK-resolved wrapper was bypassed");
+        assert.equal(parseRecord(record).launcher, "wrapper");
+        assert.equal(parseRecord(record).cwd, cwd);
+      });
+    }
+  }
+});
 
 describe("TASK-236 resume route (subagent_resume) under a bare PATH", () => {
   it("launches the installed wrapper when <agent dir>/bin/pi exists", { timeout: 20_000 }, async (t) => {
