@@ -637,6 +637,48 @@ describe("subagent-done auto-exit hardening (L-95)", () => {
       assert.deepEqual(sidecarOf(child), errorSidecar(errorMessage));
     });
 
+    // TASK-206 // this child-side handler settles before the live
+    // agent-fallback-chain records its rotation. A rejected account login is
+    // failover-eligible for that producer, so it must get the same bounded grace
+    // as a limit error instead of exiting under the queued continuation.
+    describe("TASK-206 rejected-login grace", () => {
+      const invalidOAuth =
+        '401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token is invalid."}}';
+
+      it("rejected-login texts are failover-eligible", () => {
+        for (const text of [
+          invalidOAuth,
+          "Your authentication token has expired. Please try refreshing it.",
+          "Provided authentication token is expired",
+        ]) {
+          assert.equal(isFailoverEligibleError(text), true, text);
+        }
+        assert.equal(isFailoverEligibleError("invalid_request_error: malformed request"), false);
+      });
+
+      it("declared chain + invalid OAuth waits for the fallback entry", async () => {
+        declareChain();
+        const entries: any[] = [];
+        const child = boot({ entries, cwd: dir! });
+        child.settle([{ role: "assistant", stopReason: "error", errorMessage: invalidOAuth }]);
+        assert.equal(child.ctx.shutdowns, 0, "must not exit before the chain records its continuation");
+        entries.push({ type: "custom", customType: "agent-fallback-rotate", data: {} });
+        child.fire("turn_start", { turnIndex: 1 });
+        await delay(260);
+        assert.equal(child.ctx.shutdowns, 0);
+        assert.equal(sidecarOf(child), null);
+      });
+
+      it("declared chain + non-eligible error still exits at once", () => {
+        declareChain();
+        const message = "invalid_request_error: malformed request";
+        const child = boot({ entries: [], cwd: dir! });
+        child.settle([{ role: "assistant", stopReason: "error", errorMessage: message }]);
+        assert.equal(child.ctx.shutdowns, 1);
+        assert.deepEqual(sidecarOf(child), errorSidecar(message));
+      });
+    });
+
     it("grace recovers when the fallback entry lands before the guard expires", async () => {
       declareChain();
       const entries: any[] = [];
