@@ -42,7 +42,10 @@ export function parseRecoveryDelays(raw: string | undefined): RecoveryDelays {
     return defaultRecoveryDelays();
   }
 
-  return values.map((value) => Math.max(MIN_RECOVERY_DELAY_MS, value)) as RecoveryDelays;
+  // parts.length === 3 is guarded above; destructuring keeps the tuple without a cast.
+  const [first, second, third] = values.map((value) => Math.max(MIN_RECOVERY_DELAY_MS, value));
+  const delays: RecoveryDelays = [first, second, third];
+  return delays;
 }
 
 /** Advance one stalled-child recovery tick using the caller's clock. */

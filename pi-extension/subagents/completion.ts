@@ -52,13 +52,11 @@ export function isProcessAliveInProc(pid: number): boolean {
 
 function activityWorkerIdentity(read: ActivityReadResult): SubagentProcessIdentity | undefined {
   if (!read.ok) return undefined;
-  const identity = {
-    pid: read.activity.workerPid,
-    startTime: read.activity.workerStartTime,
-  };
-  return identity.pid != null && identity.startTime != null && validProcessIdentity(identity)
-    ? identity
-    : undefined;
+  const pid = read.activity.workerPid;
+  const startTime = read.activity.workerStartTime;
+  if (pid == null || startTime == null) return undefined;
+  const identity = { pid, startTime };
+  return validProcessIdentity(identity) ? identity : undefined;
 }
 
 /** Compatibility for pre-F-209 callers; live Pi launches use activity identity. */

@@ -45,6 +45,15 @@ describe("recovery delay parsing", () => {
       assert.deepEqual(parseRecoveryDelays(raw), expected, String(raw));
     }
   });
+
+  it("always yields a fresh three-stage tuple, never the shared defaults array", () => {
+    const fallback = parseRecoveryDelays("not,valid");
+    assert.equal(fallback.length, 3);
+    assert.notEqual(fallback, DEFAULT_RECOVERY_DELAYS);
+    const parsed = parseRecoveryDelays("12000,22000,32000");
+    assert.equal(parsed.length, 3);
+    assert.deepEqual(parsed, [12_000, 22_000, 32_000]);
+  });
 });
 
 describe("recovery ladder", () => {

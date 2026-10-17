@@ -80,7 +80,7 @@ export interface ResolvedRuntimePlan {
 
 export function modelForCli(
   cli: string,
-  runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId">,
+  runtimePlan: Pick<ResolvedRuntimePlan, "model" | "modelId" | "provider">,
 ): string {
   const driver = getHarnessDriver(cli);
   return driver.formatModel(runtimePlan);

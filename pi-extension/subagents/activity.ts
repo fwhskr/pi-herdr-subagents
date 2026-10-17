@@ -221,7 +221,7 @@ function validateOptionalInteger(object: Record<string, unknown>, fieldName: str
 
 function validateOptionalPositiveInteger(object: Record<string, unknown>, fieldName: string): string | null {
   const value = object[fieldName];
-  return value == null || (Number.isSafeInteger(value) && value > 0)
+  return value == null || (typeof value === "number" && Number.isSafeInteger(value) && value > 0)
     ? null
     : `${fieldName} must be a positive safe integer when present`;
 }
@@ -408,7 +408,7 @@ export function createSubagentActivityRecorder(params: {
   now?: () => number;
 }): SubagentActivityRecorder {
   const runningChildId = params.runningChildId?.trim();
-  const activityFile = params.activityFile?.trim();
+  const activityFile = params.activityFile?.trim() ?? "";
   if (!runningChildId || !activityFile) return createNoopRecorder();
 
   const now = params.now ?? (() => Date.now());
