@@ -1,7 +1,10 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { allocateScratch, cancelUnstartedScratch, type LaunchScratch } from "./scratch-lifecycle.ts";
+import { allocateScratch, cancelUnstartedScratch, SCRATCH_BASE, type LaunchScratch } from "./scratch-lifecycle.ts";
+import {
+  releaseLaunchStorage, reserveLaunchStorage, type StorageAdmissionOptions, type StorageLease,
+} from "./storage-admission.ts";
 import { assertSpawnCodeFresh } from "./staleness-tripwire.ts";
 import {
   closeHerdrSurface,
@@ -113,15 +116,25 @@ export interface LaunchScriptOptions {
   sessionFile?: string;
   /** Synthetic fixture seam; allocation still enforces the .pi boundary. */
   scratchBase?: string;
+  /** TASK-283: shared-disk admission settings/seams (project, class, estimate, CLI path). */
+  storage?: StorageAdmissionOptions;
 }
 
 /** Local launch preparation, separately testable without Herdr or a provider. */
 export function prepareLaunchScript(command: string, options: LaunchScriptOptions = {}): {
-  scriptPath: string; scratch: LaunchScratch;
+  scriptPath: string; scratch: LaunchScratch; storage: StorageLease;
 } {
   // Existing drivers already supply this generated comment; no entrypoint widening.
   const session = options.sessionFile ?? options.scriptPreamble?.match(/^# Session: (.+)$/m)?.[1];
-  const scratch = allocateScratch(session && isAbsolute(session) ? session : null, { scratchBase: options.scratchBase });
+  // TASK-283: reserve shared headroom BEFORE any scratch/export/fork; refusal allocates nothing.
+  const storage = reserveLaunchStorage(options.scratchBase ?? SCRATCH_BASE, options.storage);
+  let scratch: LaunchScratch;
+  try {
+    scratch = allocateScratch(session && isAbsolute(session) ? session : null, { scratchBase: options.scratchBase });
+  } catch (error) {
+    releaseLaunchStorage(storage, "cancelled");
+    throw error;
+  }
   const scriptPath = options.scriptPath ?? join(scratch.scratchRoot, "launch.sh");
   try {
     mkdirSync(dirname(scriptPath), { recursive: true });
@@ -144,7 +157,11 @@ export function prepareLaunchScript(command: string, options: LaunchScriptOption
     let delimiter = `__PI_WORKER_${scratch.launchId.replaceAll("-", "_")}__`;
     while (scriptLines.join("\n").split("\n").includes(delimiter)) delimiter += "_";
     const helper = `${shellQuote(process.execPath)} ${shellQuote(fileURLToPath(new URL("./scratch-lifecycle.ts", import.meta.url)))} --scratch-lifecycle`;
-    const close = `status=$?; ${helper} close ${shellQuote(scratch.leasePath)} "$$"; exit "$status"`;
+    const storageHelper = `${shellQuote(process.execPath)} ${shellQuote(fileURLToPath(new URL("./storage-admission.ts", import.meta.url)))} --storage-admission`;
+    const lease = shellQuote(JSON.stringify(storage));
+    // Scratch closes first; the reservation is released only when the supervisor's identity
+    // and descendants prove completion, otherwise it stays reserved (fail closed).
+    const close = `status=$?; ${helper} close ${shellQuote(scratch.leasePath)} "$$"; ${storageHelper} settle ${lease} "$$" "$status" "$STORAGE_START"; exit "$status"`;
     // Keep custody in a supervisor: preamble exits/execs cannot replace the EXIT trap.
     writeFileSync(scriptPath, [
       "#!/bin/bash",
@@ -153,6 +170,7 @@ export function prepareLaunchScript(command: string, options: LaunchScriptOption
       `export TMPDIR=${shellQuote(scratch.scratchRoot)}`,
       `trap ${shellQuote(close)} EXIT`,
       `${helper} start ${shellQuote(scratch.leasePath)} "$$"`,
+      `STORAGE_START=$(${storageHelper} bind ${lease} "$$") || exit 75`,
       // An explicitly retained launch script keeps session/command metadata;
       // the executable worker copy is always ephemeral.
       `cat > ${shellQuote(workerPath)} <<${shellQuote(delimiter)}`,
@@ -161,9 +179,10 @@ export function prepareLaunchScript(command: string, options: LaunchScriptOption
       `bash ${shellQuote(workerPath)}`,
       "",
     ].join("\n"), { mode: 0o700 });
-    return { scriptPath, scratch };
+    return { scriptPath, scratch, storage };
   } catch (error) {
     cancelUnstartedScratch(scratch);
+    releaseLaunchStorage(storage, "cancelled");
     throw error;
   }
 }
@@ -181,6 +200,7 @@ export function runScriptInPane(
     return launch.scriptPath;
   } catch (error) {
     cancelUnstartedScratch(launch.scratch);
+    releaseLaunchStorage(launch.storage, "cancelled");
     throw error;
   }
 }

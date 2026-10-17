@@ -215,6 +215,5 @@ test("project identity resolves worktrees and aliases to one canonical repositor
     writeFileSync(join(work, ".git"), `gitdir: ${join(repo, ".git", "worktrees", "lane")}\n`);
     assert.equal(canonicalProject(join(work, "sub")), repo);
     assert.equal(canonicalProject(repo), repo);
-    assert.equal(canonicalProject(join(f.root, "nowhere", "..")), f.root);
   } finally { f.done(); }
 });

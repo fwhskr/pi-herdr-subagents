@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import {
   assertSpawnCodeFresh,
   __stalenessTest__,
@@ -90,7 +91,7 @@ describe("L-357 staleness tripwire", () => {
     const log = fakeHerdrBin(root);
     watchedStandin();
     const scriptPath = join(root, "launch.sh");
-    const written = runScriptInPane("pane-x", "echo hi", { scriptPath });
+    const written = runScriptInPane("pane-x", "echo hi", { scriptPath, storage: { cli: fileURLToPath(new URL("../pi-extension/subagents/test/storage-double.mjs", import.meta.url)) } });
     assert.equal(written, scriptPath);
     const head = readFileSync(scriptPath, "utf8").split("\n").slice(0, 3);
     assert.deepEqual(head, [

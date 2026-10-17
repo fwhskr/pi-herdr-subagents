@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { allocateScratch, cancelUnstartedScratch, capacityWarning, cleanupClosedScratch, closeScratch, processIdentity, startScratch } from "../scratch-lifecycle.ts";
 
+const storage = { cli: fileURLToPath(new URL("./storage-double.mjs", import.meta.url)) };
 const fixtures = "/home/kris/.pi/agent/var/task-187-fixtures";
 
 test("successful and failed fake workers inherit unique owned scratch, retaining session outputs", async () => {
@@ -23,7 +25,7 @@ test("successful and failed fake workers inherit unique owned scratch, retaining
         scriptPath: join(root, `retained-${exit}.sh`),
         scriptPreamble: `# Session: ${sessionFile}\nprintf preamble > "$TMPDIR/preamble"`,
         stderrFile: join(root, `stderr-${exit}.log`),
-        scratchBase: join(root, "leases"),
+        scratchBase: join(root, "leases"), storage,
       });
       paths.push(launch.scratch.scratchRoot);
       try { execFileSync("bash", [launch.scriptPath], { timeout: 5000 }); } catch (error) { assert.equal((error as { status: number }).status, exit); }
@@ -79,7 +81,7 @@ test("lifecycle helpers receive sanitized transport settings despite unsafe inhe
     let launch: ReturnType<typeof prepareLaunchScript>;
     try {
       Object.defineProperty(process, "execPath", { value: fakeHelper });
-      launch = prepareLaunchScript("true", { scratchBase: base });
+      launch = prepareLaunchScript("true", { scratchBase: base, storage });
     } finally {
       Object.defineProperty(process, "execPath", { value: originalExecPath });
     }
@@ -97,7 +99,7 @@ test("lifecycle helpers receive sanitized transport settings despite unsafe inhe
         },
       });
       const safeEnvironment = "/usr/bin/ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0|/bin/false|never|";
-      assert.deepEqual(readFileSync(capture, "utf8").trimEnd().split("\n"), [safeEnvironment, safeEnvironment]);
+      assert.deepEqual(readFileSync(capture, "utf8").trimEnd().split("\n"), [safeEnvironment, safeEnvironment, safeEnvironment, safeEnvironment]);
     } finally {
       cancelled = cancelUnstartedScratch(launch.scratch);
     }
@@ -214,7 +216,7 @@ test("preamble failure cleans default ephemeral scripts without running worker",
   const { prepareLaunchScript } = await import("../terminal.ts");
   withScratch((base) => {
     const output = join(base, "must-not-run");
-    const launch = prepareLaunchScript(`touch '${output}'`, { scratchBase: base, scriptPreamble: "exit 9" });
+    const launch = prepareLaunchScript(`touch '${output}'`, { scratchBase: base, scriptPreamble: "exit 9", storage });
     assert.throws(() => execFileSync("bash", [launch.scriptPath], { timeout: 5000 }), (error: unknown) => (error as { status: number }).status === 9);
     assert.equal(existsSync(output), false);
     assert.equal(existsSync(launch.scriptPath), false);
@@ -230,7 +232,7 @@ test("script preparation failure closes only the just-allocated scratch", async 
     assert.equal(startScratch(other.leasePath, 123, () => "456"), true);
     const obstruction = join(base, "file-not-directory");
     writeFileSync(obstruction, "retained");
-    assert.throws(() => prepareLaunchScript("true", { scratchBase: base, scriptPath: join(obstruction, "launch.sh") }));
+    assert.throws(() => prepareLaunchScript("true", { scratchBase: base, scriptPath: join(obstruction, "launch.sh"), storage }));
     const created = readdirSync(base).filter((name) => name !== other.launchId && name !== "file-not-directory");
     assert.equal(created.length, 1);
     const lease = JSON.parse(readFileSync(join(base, created[0], "lease.json"), "utf8"));
