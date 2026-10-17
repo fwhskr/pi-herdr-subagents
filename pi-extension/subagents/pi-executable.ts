@@ -1,14 +1,22 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Pi's agent config dir: PI_CODING_AGENT_DIR, else ~/.pi/agent (the SDK's own
  * resolution, mirrored here because this module must stay SDK-free).
  */
 function installedAgentDir(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.PI_CODING_AGENT_DIR?.trim();
-  return configured ? configured : join(env.HOME?.trim() || homedir(), ".pi", "agent");
+  const home = env.HOME ?? homedir();
+  const configured = env.PI_CODING_AGENT_DIR;
+  // Match SDK getAgentDir()/normalizePath(): raw whitespace is meaningful,
+  // leading ~ expands against the home directory, and file URLs are paths.
+  if (!configured) return join(home, ".pi", "agent");
+  if (configured === "~") return home;
+  if (configured.startsWith("~/")) return join(home, configured.slice(2));
+  if (configured.startsWith("file://")) return fileURLToPath(configured);
+  return configured;
 }
 
 /**
