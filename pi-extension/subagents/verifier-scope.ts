@@ -20,7 +20,7 @@ const DETACHED_MIN_S = 10, DETACHED_MAX_S = 900;
 type Entry = {
   id: string; cwd_realpath: string; argv: string[]; selector: string; inputs: string[]; runtime_roots?: string[];
   read_roots: string[]; write_roots: string[]; env: Record<string, string>; timeout_s: number; max_output_bytes?: number;
-  real_engine?: EngineRequest | RealEngine; detached?: Detached;
+  real_engine?: EngineRequest | RealEngine; detached?: Detached; tmp_root?: string;
 };
 const sha = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
 const inside = (p: string, root: string): boolean => p === root || p.startsWith(root + "/");
@@ -42,10 +42,13 @@ function validate(value: unknown): asserts value is Authorization {
   const ids = new Set<string>();
   for (const e of value.entries) {
     demand(object(e), "Invalid entry");
-    keys(e, ["id", "cwd_realpath", "argv", "selector", "inputs", "runtime_roots", "read_roots", "write_roots", "env", "timeout_s", "max_output_bytes", "max_attempts", "retry_on_failure", "network", "runner_self_test", "real_engine", "detached"]);
+    keys(e, ["id", "cwd_realpath", "argv", "selector", "inputs", "runtime_roots", "read_roots", "write_roots", "env", "timeout_s", "max_output_bytes", "max_attempts", "retry_on_failure", "network", "runner_self_test", "real_engine", "detached", "tmp_root"]);
     demand(typeof e.id === "string" && ID.test(e.id) && !ids.has(e.id), "Invalid/duplicate entry id"); ids.add(e.id);
     demand(typeof e.cwd_realpath === "string" && strings(e.argv) && e.argv.length > 0 && e.argv[0].startsWith("/"), "Invalid command");
     demand(typeof e.selector === "string" && strings(e.inputs) && strings(e.read_roots) && strings(e.write_roots) && (e.runtime_roots === undefined || strings(e.runtime_roots)), "Invalid roots or selector");
+    // Optional caller-owned temporary/home root: must be exactly one declared write root and is never a real-engine entry
+    // (its /tmp is the engine's private store). Canonical containment in cwd is the runtime's check, before reservation.
+    demand(e.tmp_root === undefined || (typeof e.tmp_root === "string" && e.write_roots.includes(e.tmp_root) && e.real_engine === undefined), "Invalid tmp_root: it must be one of the entry's write_roots and is not available to real-engine entries");
     demand(e.max_attempts === 1 && e.retry_on_failure === false && e.network === false, "Only once, no-retry, offline entries are supported");
     if (e.detached !== undefined) {
       const d = e.detached;
