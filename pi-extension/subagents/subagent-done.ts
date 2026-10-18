@@ -405,21 +405,47 @@ export function buildCompletionSidecar(messages: any[] | undefined, wrapup = fal
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done", ...(wrapup ? { wrapup: true } : {}) };
 }
 
+/**
+ * The settled run's outcome is an abort when its latest assistant turn says
+ * so, or whenever Pi's own `agent_settled` event reports `aborted`. Pi sets
+ * that flag only when `session.abort()` interrupted the active run, and the
+ * interrupted turn's assistant message may then carry stopReason `error`
+ * ("This operation was aborted") or none at all: the flag wins either way.
+ */
+export function isAbortedSettle(stopReason: string | undefined, settleAborted: boolean): boolean {
+  return stopReason === "aborted" || settleAborted;
+}
+
 /** A settled autonomous delegation must not silently become an operator session. */
-export function buildForcedCompletionSidecar(messages: any[] | undefined, wrapup = false) {
+export function buildForcedCompletionSidecar(
+  messages: any[] | undefined,
+  wrapup = false,
+  settleAborted = false,
+) {
   const stopReason = latestAssistantStopReason(messages);
-  if (stopReason === "stop" || stopReason === "error") {
+  if (!isAbortedSettle(stopReason, settleAborted) && isTerminalAutoExitStopReason(stopReason)) {
     const completion = buildCompletionSidecar(messages, wrapup);
     return { ...completion, forcedExit: true, exitCode: completion.type === "error" ? 1 : 0 };
+  }
+  if (isAbortedSettle(stopReason, settleAborted)) {
+    return {
+      type: "error" as const,
+      forcedExit: true,
+      stopReason: "aborted",
+      exitCode: 130,
+      errorMessage: stopReason === "aborted"
+        ? "Delegated turn was aborted without a terminal control signal; forced exit (interrupt source unknown)."
+        : `Delegated run was aborted (settle reported aborted; assistant stopReason=${stopReason ?? "missing"}); ` +
+          "forced exit (interrupt source unknown).",
+    };
   }
   return {
     type: "error" as const,
     forcedExit: true,
     stopReason,
-    exitCode: stopReason === "aborted" ? 130 : 1,
-    errorMessage: stopReason === "aborted"
-      ? "Delegated turn was aborted without a terminal control signal; forced exit (interrupt source unknown)."
-      : `Delegated turn settled without a terminal assistant response (stopReason=${stopReason ?? "missing"}); forced exit.`,
+    exitCode: 1,
+    errorMessage:
+      `Delegated turn settled without a terminal assistant response (stopReason=${stopReason ?? "missing"}); forced exit.`,
   };
 }
 
@@ -540,6 +566,13 @@ export default function (
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
   let wrapupInProgress = false;
+  // TASK-321: Pi's own abort flag for the latest settle feeds the delegated
+  // forced-exit classification. Once Pi shut this session down (quit,
+  // SIGTERM/SIGHUP, reload, replacement) any later settle is a stale echo of
+  // the teardown — its ctx is invalid and its run carries no outcome — so the
+  // shutdown reason is kept for the process-exit record instead.
+  let latestSettleAborted = false;
+  let sessionShutdownReason: string | undefined;
   let exitSidecarWritten = false;
   let processExitHandler: ((code: number) => void) | undefined;
   let uncaughtExceptionHandler: ((error: Error) => void) | undefined;
@@ -607,7 +640,10 @@ export default function (
           message: issuer
             ? `Subagent process ended by a deliberate interrupt from ${issuer} at ${String(interrupt?.interruptedAt)} ` +
               `(exit code ${exitCode}: the parent closed the pane after the interrupt grace). Not a crash.`
-            : `Subagent process exited before completing (exit code ${exitCode}).`,
+            : sessionShutdownReason
+              ? `Subagent session shut down (reason=${sessionShutdownReason}) before completing ` +
+                `(exit code ${exitCode}).`
+              : `Subagent process exited before completing (exit code ${exitCode}).`,
         });
         writeExitSidecar(issuer ? { ...sidecar, interruptedBy: issuer } : sidecar, targetSessionFile);
       } catch {
@@ -683,7 +719,7 @@ export default function (
           ? { type: "error" as const, forcedExit: true, exitCode: 1, errorMessage: heldFailure.reason,
               holdId: heldFailure.holdId, queuedAt: heldFailure.queuedAt, deadlineAt: heldFailure.deadlineAt }
           : delegatedTerminalRequired
-            ? buildForcedCompletionSidecar(latestAgentMessages, wrapupInProgress)
+            ? buildForcedCompletionSidecar(latestAgentMessages, wrapupInProgress, latestSettleAborted)
             : buildCompletionSidecar(latestAgentMessages, wrapupInProgress);
         writeExitSidecar(stampedSidecar(
           completion,
@@ -857,6 +893,7 @@ export default function (
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    latestSettleAborted = false;
     clearPendingChildGuard();
     recorder.agentStart();
   });
@@ -869,18 +906,29 @@ export default function (
     recorder.agentEndWaiting();
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
+  pi.on("agent_settled", (event, ctx) => {
     if (exitSidecarWritten) return;
+    // TASK-321: Pi's dispose emits session_shutdown before it stops the run,
+    // so the run's tool end and agent_end never reach this extension and its
+    // settle arrives un-aborted on a stale ctx. That settle has no outcome to
+    // classify; the process-exit hook records the shutdown instead.
+    if (sessionShutdownReason !== undefined) return;
     // A newer settled turn supersedes any pending-child wait from an earlier one.
     clearPendingChildGuard();
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
-    const stopReason = latestAssistantStopReason(latestAgentMessages);
+    // Pi reports whether the run itself was aborted. That flag wins over the
+    // interrupted turn's own stopReason (missing, or `error` for an abort
+    // that cut a request or tool short), so an abort is never mistaken for a
+    // provider failure, a fallback candidate or a completed turn.
+    latestSettleAborted = (event as any)?.aborted === true;
+    const aborted = isAbortedSettle(latestAssistantStopReason(latestAgentMessages), latestSettleAborted);
+    const stopReason = aborted ? "aborted" : latestAssistantStopReason(latestAgentMessages);
 
     // Time-limit wrap-up: an interrupt left the latest assistant turn aborted
     // and a .wrapup directive exists. Consume it once and inject a report-only
     // continuation. Checked BEFORE the Escape-disarm below so a machine-caused
     // time-limit interrupt is never mistaken for operator takeover.
-    const directive = !wrapupInProgress && stopReason === "aborted"
+    const directive = !wrapupInProgress && aborted
       ? consumeWrapupDirective(sessionFile)
       : null;
     if (directive) {
@@ -894,7 +942,7 @@ export default function (
 
     // An Escape-triggered abort is operator takeover too: permanently disarm
     // (single warning above) and leave the session open for inspection.
-    if (stopReason === "aborted" && !delegatedTerminalRequired) {
+    if (aborted && !delegatedTerminalRequired) {
       disarmAutoExit("Escape", ctx);
     }
 
@@ -1006,6 +1054,7 @@ export default function (
   });
 
   pi.on("session_shutdown", (event) => {
+    sessionShutdownReason = String((event as any)?.reason ?? "unknown");
     unsubscribeHeldFailure?.();
     unsubscribeHeldFailure = undefined;
     clearFallbackGuard();
