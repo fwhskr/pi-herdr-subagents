@@ -51,8 +51,23 @@ function writeStub(path: string, label: string, record: string): void {
   chmodSync(path, 0o755);
 }
 
+/**
+ * Absolute `setsid` from the host PATH. The launch script runs as a fresh foreground job (own
+ * session and process group, as the pane's worker does); the storage core's `run --attach job`
+ * refuses a launcher that inherits the test runner's group. Fails closed when the platform has
+ * no setsid instead of silently running in the inherited group.
+ */
+function resolveSetsid(hostPath: string | undefined = process.env.PATH): string {
+  for (const dir of (hostPath ?? "").split(":")) {
+    if (!dir) continue;
+    const candidate = join(dir, "setsid");
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error("setsid is unavailable on this platform: cannot run the launch script as a fresh foreground job");
+}
+
 function runBare(script: string, cwd: string, extraEnv: Record<string, string> = {}) {
-  return spawnSync("bash", [script], {
+  return spawnSync(resolveSetsid(), ["-w", "bash", script], {
     cwd, encoding: "utf8", timeout: 10_000,
     env: { PATH: BARE_PATH, HOME: "/nonexistent-task236-home", ...extraEnv },
   });
@@ -291,5 +306,19 @@ describe("TASK-236 resume route (subagent_resume) under a bare PATH", () => {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(parseRecord(record).launcher, "stock");
     assert.deepEqual(parseRecord(record).args.slice(0, 2), ["--session", child]);
+  });
+});
+
+describe("TASK-326 fresh foreground job helper", () => {
+  it("resolves setsid from the host PATH", () => {
+    const dir = scratch("task326-setsid-present-");
+    writeStub(join(dir, "setsid"), "setsid", join(dir, "record"));
+    assert.equal(resolveSetsid(dir), join(dir, "setsid"));
+  });
+
+  it("fails closed when the platform has no setsid", () => {
+    const dir = scratch("task326-setsid-absent-");
+    assert.throws(() => resolveSetsid(dir), /setsid is unavailable on this platform/);
+    assert.throws(() => resolveSetsid(""), /setsid is unavailable/);
   });
 });
