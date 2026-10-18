@@ -11,11 +11,16 @@ export interface VerifierScopeMetadata { verifierScope?: VerifierScopeBinding }
 type Authorization = { schema: 1; auth_id: string; candidate: { repo_realpath: string; commit_sha: string }; entries: unknown[] };
 type EngineRequest = { engine_pins: Record<string, string>; input_pins: Record<string, string> };
 type RealEngine = EngineRequest & { storage_root: string; binding: string };
+// Launcher-authored detached bounded attempt (TASK-267): finite kernel ceilings the runtime must PROVE on the
+// owned service cgroup before dispatch; timeout_s then becomes the whole-attempt deadline (10..900s).
+type Detached = { memory_max_bytes: number; pids_max: number };
+const DETACHED_MEMORY_MIN = 16 * 1024 * 1024, DETACHED_MEMORY_MAX = 64 * 1024 * 1024 * 1024, DETACHED_PIDS_MAX = 4096;
+const DETACHED_MIN_S = 10, DETACHED_MAX_S = 900;
 // Validated entry shape (validate() checks every field); other fields are carried through verbatim.
 type Entry = {
   id: string; cwd_realpath: string; argv: string[]; selector: string; inputs: string[]; runtime_roots?: string[];
   read_roots: string[]; write_roots: string[]; env: Record<string, string>; timeout_s: number; max_output_bytes?: number;
-  real_engine?: EngineRequest | RealEngine;
+  real_engine?: EngineRequest | RealEngine; detached?: Detached;
 };
 const sha = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
 const inside = (p: string, root: string): boolean => p === root || p.startsWith(root + "/");
@@ -37,12 +42,21 @@ function validate(value: unknown): asserts value is Authorization {
   const ids = new Set<string>();
   for (const e of value.entries) {
     demand(object(e), "Invalid entry");
-    keys(e, ["id", "cwd_realpath", "argv", "selector", "inputs", "runtime_roots", "read_roots", "write_roots", "env", "timeout_s", "max_output_bytes", "max_attempts", "retry_on_failure", "network", "runner_self_test", "real_engine"]);
+    keys(e, ["id", "cwd_realpath", "argv", "selector", "inputs", "runtime_roots", "read_roots", "write_roots", "env", "timeout_s", "max_output_bytes", "max_attempts", "retry_on_failure", "network", "runner_self_test", "real_engine", "detached"]);
     demand(typeof e.id === "string" && ID.test(e.id) && !ids.has(e.id), "Invalid/duplicate entry id"); ids.add(e.id);
     demand(typeof e.cwd_realpath === "string" && strings(e.argv) && e.argv.length > 0 && e.argv[0].startsWith("/"), "Invalid command");
     demand(typeof e.selector === "string" && strings(e.inputs) && strings(e.read_roots) && strings(e.write_roots) && (e.runtime_roots === undefined || strings(e.runtime_roots)), "Invalid roots or selector");
     demand(e.max_attempts === 1 && e.retry_on_failure === false && e.network === false, "Only once, no-retry, offline entries are supported");
-    demand(Number.isInteger(e.timeout_s) && Number(e.timeout_s) >= 1 && Number(e.timeout_s) <= 60, "Invalid timeout (1..60 seconds)");
+    if (e.detached !== undefined) {
+      const d = e.detached;
+      demand(object(d) && e.runner_self_test === undefined, "Invalid detached authorization");
+      keys(d, ["memory_max_bytes", "pids_max"]);
+      // Both finite kernel ceilings are mandatory; no "max"/unlimited, fractional, string or non-finite value is accepted.
+      demand(Number.isSafeInteger(d.memory_max_bytes) && Number(d.memory_max_bytes) >= DETACHED_MEMORY_MIN && Number(d.memory_max_bytes) <= DETACHED_MEMORY_MAX
+        && Number.isSafeInteger(d.pids_max) && Number(d.pids_max) >= 1 && Number(d.pids_max) <= DETACHED_PIDS_MAX, "Invalid detached kernel ceilings");
+      // Only a detached entry may exceed the synchronous 60-second bound.
+      demand(Number.isInteger(e.timeout_s) && Number(e.timeout_s) >= DETACHED_MIN_S && Number(e.timeout_s) <= DETACHED_MAX_S, `Invalid detached overall deadline (${DETACHED_MIN_S}..${DETACHED_MAX_S} seconds)`);
+    } else demand(Number.isInteger(e.timeout_s) && Number(e.timeout_s) >= 1 && Number(e.timeout_s) <= 60, "Invalid timeout (1..60 seconds)");
     demand(e.max_output_bytes === undefined || (Number.isInteger(e.max_output_bytes) && Number(e.max_output_bytes) >= 1 && Number(e.max_output_bytes) <= 1048576), "Invalid output cap");
     demand(object(e.env) && Object.entries(e.env).every(([k, v]) => /^[A-Z_][A-Z0-9_]*$/.test(k) && typeof v === "string" && !v.includes("\0")), "Invalid environment");
     demand(!Object.keys(e.env).some(k => /TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH|SSH|DBUS|DISPLAY|WAYLAND/.test(k) || ["HOME", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"].includes(k)), "Credential/session environment is not permitted");
@@ -163,7 +177,9 @@ export function realEngineBinding(auth: { auth_id: string; candidate: { repo_rea
   const r = entry.real_engine;
   return sha(JSON.stringify(["verifier-real-engine-v1", auth.auth_id, auth.candidate.repo_realpath, auth.candidate.commit_sha, entry.id,
     entry.cwd_realpath, entry.argv, entry.selector, sortedList(entry.inputs), pairs(r.input_pins), pairs(r.engine_pins), r.storage_root,
-    sortedList(entry.runtime_roots ?? []), sortedList(entry.read_roots), sortedList(entry.write_roots), pairs(entry.env), entry.timeout_s, entry.max_output_bytes ?? null]));
+    sortedList(entry.runtime_roots ?? []), sortedList(entry.read_roots), sortedList(entry.write_roots), pairs(entry.env), entry.timeout_s, entry.max_output_bytes ?? null,
+    // Appended only for detached entries (exactly the runtime's order), so every non-detached binding is unchanged.
+    ...(entry.detached ? [["detached", entry.detached.memory_max_bytes, entry.detached.pids_max]] : [])]));
 }
 // Seal requested engine entries before publication: argv[0] is genuine Podman, engine_pins equal
 // exactly the discovered trusted roles with verified digests, then choose the private store and bind.
