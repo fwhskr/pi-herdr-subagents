@@ -19,7 +19,8 @@ export interface ScratchLease {
   [key: string]: unknown;
 }
 export interface LaunchScratch { launchId: string; leasePath: string; scratchRoot: string }
-export interface Capacity { availableBytes: number; availableInodes: number }
+/** availableInodes = null when the filesystem does not track an inode pool (unknown, not exhausted). */
+export interface Capacity { availableBytes: number; availableInodes: number | null }
 export type ProcessIdentity = (pid: number) => string | null | undefined;
 
 /** null = absent, undefined = identity cannot be proved. Never guess at PID reuse. */
