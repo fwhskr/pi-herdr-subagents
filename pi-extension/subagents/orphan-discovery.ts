@@ -29,6 +29,10 @@ export interface SpawnMetadataRecord {
   completionId?: string;
   /** TASK-13: the exact effective brief of this attempt (spawn task or resume message). */
   attemptTask?: string;
+  /** TASK-313: the caller-supplied delegation label, recorded verbatim; never derived. */
+  delegationId?: string;
+  /** TASK-313: the launcher's run id for this attempt (aliases the started `id`). */
+  runId?: string;
   taskArtifactPath?: string;
   launchedAt?: string;
 }
@@ -207,6 +211,10 @@ function normalizeMetadata(value: unknown): SpawnMetadataRecord | null {
     "name",
     "agent",
     "task",
+    "completionId",
+    "attemptTask",
+    "delegationId",
+    "runId",
     "taskArtifactPath",
     "launchedAt",
   ] as const) {
