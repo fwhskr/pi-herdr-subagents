@@ -414,6 +414,68 @@ function durableDelegationId(metadata: SpawnMetadataRecord | null | undefined): 
 }
 
 /**
+ * TASK-313: durable delegation identity for sessions with no spawn metadata.
+ * A resume of a metadata-less session (no first-launch `.spawn.json` sidecar)
+ * must still record an explicit delegation label durably BEFORE the child
+ * runs — but it must never gain spawn rights or fabricated lineage from that
+ * label. So the label lives in this separate, minimal sidecar instead of spawn
+ * metadata: no allowance, no parent lineage, no task, no agent, no tools. The
+ * absent-metadata clamp (deny) reads `readSpawnMetadata → null` exactly as
+ * before, and orphan discovery (which enumerates only `*.spawn.json`) never
+ * sees this record, so no historical spawning or adoption right is created.
+ */
+interface DelegationIdentityRecord {
+  delegationId: string;
+  /** The attempt whose resume durably recorded (or last refreshed) the label. */
+  completionId: string;
+  /** The launcher run id of that attempt (aliases the started `id`). */
+  runId: string;
+  recordedAt: string;
+}
+
+function delegationRecordPath(sessionFile: string): string {
+  return `${sessionFile}.delegation.json`;
+}
+
+function readDelegationRecord(sessionFile: string): DelegationIdentityRecord | null {
+  try {
+    const value = JSON.parse(readFileSync(delegationRecordPath(sessionFile), "utf8")) as Partial<DelegationIdentityRecord> | null;
+    if (!value || typeof value !== "object") return null;
+    const delegationId = typeof value.delegationId === "string" ? value.delegationId : "";
+    if (!delegationId.trim()) return null;
+    return {
+      delegationId,
+      completionId: typeof value.completionId === "string" ? value.completionId : "",
+      runId: typeof value.runId === "string" ? value.runId : "",
+      recordedAt: typeof value.recordedAt === "string" ? value.recordedAt : "",
+    };
+  } catch {
+    // Missing, corrupt or unreadable: no durable label, exactly like a missing
+    // spawn metadata sidecar. Never a guessed identity.
+    return null;
+  }
+}
+
+/** Write one complete delegation identity record without exposing a partial JSON. */
+function writeDelegationRecord(sessionFile: string, record: DelegationIdentityRecord): void {
+  const target = delegationRecordPath(sessionFile);
+  const temporary = join(
+    dirname(target),
+    `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(temporary, JSON.stringify(record), { flag: "wx", mode: 0o600 });
+    renameSync(temporary, target);
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The rename succeeded, or the temporary file was never created.
+    }
+  }
+}
+
+/**
  * Identity env for a RESUMED child. The resume tool takes no agent argument,
  * so the agent identity recorded at first launch (session .spawn.json) must be
  * exported explicitly: PI_SUBAGENT_AGENT is what profile-aware behavior reads
@@ -3895,7 +3957,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
         const resumeMetadata = readSpawnMetadata(params.sessionPath);
-        const durableLabel = durableDelegationId(resumeMetadata);
+        // TASK-313: a metadata-less session carries its durable label in the
+        // minimal delegation identity record instead of spawn metadata.
+        const delegationRecord = resumeMetadata ? null : readDelegationRecord(params.sessionPath);
+        const durableLabel = durableDelegationId(resumeMetadata) ?? delegationRecord?.delegationId;
         if (delegationCheck.value && durableLabel && delegationCheck.value !== durableLabel) {
           return {
             content: [{
@@ -4079,6 +4144,38 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             runId: id,
             launchedAt: new Date(startTime).toISOString(),
           });
+        } else if (delegationId) {
+          // TASK-313: no spawn metadata exists, so the label's only durable
+          // home is the minimal identity record — written before the child
+          // runs, refreshed per attempt. It grants no rights and fabricates no
+          // lineage, and spawn metadata is never created for it. If even this
+          // minimal write is impossible, refuse before any launch rather than
+          // run an execute whose label would silently evaporate on a crash.
+          try {
+            writeDelegationRecord(params.sessionPath, {
+              delegationId,
+              completionId,
+              runId: id,
+              recordedAt: new Date(startTime).toISOString(),
+            });
+          } catch {
+            closePaneQuietly(surface);
+            return {
+              content: [{
+                type: "text",
+                text:
+                  `Refused to resume ${params.sessionPath}: the delegation label ` +
+                  `"${delegationId}" could not be recorded durably, so nothing was launched. ` +
+                  `Resolve the write failure and retry the resume.`,
+              }],
+              details: {
+                error: "delegation label not durable",
+                status: "refused",
+                sessionPath: params.sessionPath,
+                delegationId,
+              },
+            };
+          }
         }
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
