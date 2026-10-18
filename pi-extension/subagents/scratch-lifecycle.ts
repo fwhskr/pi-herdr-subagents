@@ -33,17 +33,22 @@ export const processIdentity: ProcessIdentity = (pid) => {
   }
 };
 
+/** f_files = 0 means the filesystem does not track an inode pool: unknown accounting, not exhaustion. */
+export function statfsCapacity(stat: { files: number; ffree: number; bavail: number; bsize: number }): Capacity {
+  return { availableBytes: stat.bavail * stat.bsize, availableInodes: stat.files > 0 ? stat.ffree : null };
+}
+
 function readCapacity(path: string): Capacity {
-  const stat = statfsSync(path);
-  return { availableBytes: stat.bavail * stat.bsize, availableInodes: stat.ffree };
+  return statfsCapacity(statfsSync(path));
 }
 
 /** Advisory only: an unavailable or low capacity observation never refuses a launch. */
 export function capacityWarning(path: string, inspect = readCapacity): string | null {
   try {
     const capacity = inspect(path);
-    if (capacity.availableBytes < 16 * 1024 * 1024 || capacity.availableInodes < 1024) {
-      return `[subagent scratch] low capacity: ${capacity.availableBytes} bytes, ${capacity.availableInodes} inodes available`.slice(0, 240);
+    const inodes = capacity.availableInodes === null ? "inode usage unreported" : `${capacity.availableInodes} inodes available`;
+    if (capacity.availableBytes < 16 * 1024 * 1024 || (capacity.availableInodes !== null && capacity.availableInodes < 1024)) {
+      return `[subagent scratch] low capacity: ${capacity.availableBytes} bytes available, ${inodes}`.slice(0, 240);
     }
   } catch { return "[subagent scratch] capacity observation unavailable; launch continues"; }
   return null;
