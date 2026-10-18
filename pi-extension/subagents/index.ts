@@ -194,8 +194,18 @@ const ThinkingLevelSchema = Type.Union(
   },
 );
 
+const DELEGATION_ID_MAX_LENGTH = 256;
+
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
+  delegation_id: Type.Optional(
+    Type.String({
+      description:
+        "Caller-supplied delegation label recorded verbatim with this launch and returned unchanged in the started result and every completion. Never derived from the task or name; omit when the caller has no label.",
+      minLength: 1,
+      maxLength: DELEGATION_ID_MAX_LENGTH,
+    }),
+  ),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
   agent: Type.Optional(
     Type.String({
@@ -380,6 +390,88 @@ function readSpawnMetadata(sessionFile: string): SpawnMetadataRecord | null {
     return JSON.parse(readFileSync(`${sessionFile}.spawn.json`, "utf8"));
   } catch {
     return null;
+  }
+}
+
+/**
+ * TASK-313: validate a caller-supplied delegation label. The label is exact
+ * caller text: never trimmed, parsed or defaulted. Absent is valid.
+ */
+function checkDelegationId(value: unknown): { ok: true; value?: string } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true };
+  if (typeof value !== "string" || !value.trim()) {
+    return { ok: false, error: "delegation_id must be a non-empty string" };
+  }
+  if (value.length > DELEGATION_ID_MAX_LENGTH || [...value].some((ch) => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127)) {
+    return { ok: false, error: `delegation_id must be at most ${DELEGATION_ID_MAX_LENGTH} characters with no control characters` };
+  }
+  return { ok: true, value };
+}
+
+function durableDelegationId(metadata: SpawnMetadataRecord | null | undefined): string | undefined {
+  const value = metadata?.delegationId;
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/**
+ * TASK-313: durable delegation identity for sessions with no spawn metadata.
+ * A resume of a metadata-less session (no first-launch `.spawn.json` sidecar)
+ * must still record an explicit delegation label durably BEFORE the child
+ * runs — but it must never gain spawn rights or fabricated lineage from that
+ * label. So the label lives in this separate, minimal sidecar instead of spawn
+ * metadata: no allowance, no parent lineage, no task, no agent, no tools. The
+ * absent-metadata clamp (deny) reads `readSpawnMetadata → null` exactly as
+ * before, and orphan discovery (which enumerates only `*.spawn.json`) never
+ * sees this record, so no historical spawning or adoption right is created.
+ */
+interface DelegationIdentityRecord {
+  delegationId: string;
+  /** The attempt whose resume durably recorded (or last refreshed) the label. */
+  completionId: string;
+  /** The launcher run id of that attempt (aliases the started `id`). */
+  runId: string;
+  recordedAt: string;
+}
+
+function delegationRecordPath(sessionFile: string): string {
+  return `${sessionFile}.delegation.json`;
+}
+
+function readDelegationRecord(sessionFile: string): DelegationIdentityRecord | null {
+  try {
+    const value = JSON.parse(readFileSync(delegationRecordPath(sessionFile), "utf8")) as Partial<DelegationIdentityRecord> | null;
+    if (!value || typeof value !== "object") return null;
+    const delegationId = typeof value.delegationId === "string" ? value.delegationId : "";
+    if (!delegationId.trim()) return null;
+    return {
+      delegationId,
+      completionId: typeof value.completionId === "string" ? value.completionId : "",
+      runId: typeof value.runId === "string" ? value.runId : "",
+      recordedAt: typeof value.recordedAt === "string" ? value.recordedAt : "",
+    };
+  } catch {
+    // Missing, corrupt or unreadable: no durable label, exactly like a missing
+    // spawn metadata sidecar. Never a guessed identity.
+    return null;
+  }
+}
+
+/** Write one complete delegation identity record without exposing a partial JSON. */
+function writeDelegationRecord(sessionFile: string, record: DelegationIdentityRecord): void {
+  const target = delegationRecordPath(sessionFile);
+  const temporary = join(
+    dirname(target),
+    `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(temporary, JSON.stringify(record), { flag: "wx", mode: 0o600 });
+    renameSync(temporary, target);
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The rename succeeded, or the temporary file was never created.
+    }
   }
 }
 
@@ -1264,6 +1356,8 @@ interface RunningSubagent extends VerifierScopeMetadata {
   id: string;
   /** Immutable delivery identity of this launch, never the shared session. */
   completionId: string;
+  /** TASK-313: caller-supplied delegation label, verbatim; absent when none was given. */
+  delegationId?: string;
   name: string;
   task: string;
   agent?: string;
@@ -2558,6 +2652,7 @@ async function launchSubagent(
     id,
     ...(verifierScope ? { verifierScope } : {}),
     completionId: randomUUID(),
+    ...(params.delegation_id ? { delegationId: params.delegation_id } : {}),
     name: params.name,
     task: params.task,
     agent: params.agent,
@@ -2601,6 +2696,9 @@ async function launchSubagent(
       // TASK-13: publish this attempt's settlement identity before the pane runs.
       completionId: running.completionId,
       attemptTask: running.task,
+      // TASK-313: the caller's label and this launch's run id, durable before the pane runs.
+      ...(running.delegationId ? { delegationId: running.delegationId } : {}),
+      runId: running.id,
       launchedAt: new Date(startTime).toISOString(),
     });
   } catch {
@@ -3367,6 +3465,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // TASK-313: refuse a malformed caller label before any launch side effect.
+        const delegationCheck = checkDelegationId(params.delegation_id);
+        if (!delegationCheck.ok) {
+          return {
+            content: [{ type: "text", text: `Refused: ${delegationCheck.error}. Nothing was launched.` }],
+            details: { error: "invalid delegation_id", status: "refused" },
+          };
+        }
+
         // Validate prerequisites
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
@@ -3436,6 +3543,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                     message: result.ping.message,
                     agent: running.agent,
                     sessionFile: result.sessionFile,
+                    ...(running.delegationId ? { delegationId: running.delegationId } : {}),
+                    runId: running.id,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -3461,6 +3570,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: {
                   name: running.name,
                   completionId: running.completionId,
+                  ...(running.delegationId ? { delegationId: running.delegationId } : {}),
+                  runId: running.id,
                   task: running.task,
                   agent: running.agent,
                   exitCode: result.exitCode,
@@ -3493,7 +3604,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
                 display: true,
                 // TASK-460: the failure names its session like the success path, so it correlates.
-                details: { name: running.name, completionId: running.completionId, task: running.task, agent: running.agent, sessionFile: running.sessionFile, error: err?.message },
+                details: { name: running.name, completionId: running.completionId, ...(running.delegationId ? { delegationId: running.delegationId } : {}), runId: running.id, task: running.task, agent: running.agent, sessionFile: running.sessionFile, error: err?.message },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -3518,6 +3629,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name: params.name,
             task: params.task,
             completionId: running.completionId,
+            ...(running.delegationId ? { delegationId: running.delegationId } : {}),
+            runId: running.id,
             attemptTask: running.task,
             agent: params.agent,
             sessionFile: running.sessionFile,
@@ -3739,6 +3852,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
           }),
         ),
+        delegation_id: Type.Optional(
+          Type.String({
+            description:
+              "Caller-supplied delegation label. A resume inherits the session's durable label; an explicit value must equal it (a conflicting label is refused, never silently relabelled). Omit to inherit.",
+            minLength: 1,
+            maxLength: DELEGATION_ID_MAX_LENGTH,
+          }),
+        ),
         allowTerminalTask: Type.Optional(
           Type.Boolean({
             description:
@@ -3826,6 +3947,36 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (bindingRefusal) {
           return { content: [{ type: "text", text: bindingRefusal.text }], details: bindingRefusal.details };
         }
+        // TASK-313: a resume inherits the durable label; a conflicting explicit
+        // label is refused before any launch side effect, never relabelled.
+        const delegationCheck = checkDelegationId(params.delegation_id);
+        if (!delegationCheck.ok) {
+          return {
+            content: [{ type: "text", text: `Refused to resume ${params.sessionPath}: ${delegationCheck.error}. Nothing was launched.` }],
+            details: { error: "invalid delegation_id", status: "refused", sessionPath: params.sessionPath },
+          };
+        }
+        const resumeMetadata = readSpawnMetadata(params.sessionPath);
+        // TASK-313: a metadata-less session carries its durable label in the
+        // minimal delegation identity record instead of spawn metadata.
+        const delegationRecord = resumeMetadata ? null : readDelegationRecord(params.sessionPath);
+        const durableLabel = durableDelegationId(resumeMetadata) ?? delegationRecord?.delegationId;
+        if (delegationCheck.value && durableLabel && delegationCheck.value !== durableLabel) {
+          return {
+            content: [{
+              type: "text",
+              text: `Refused to resume ${params.sessionPath}: it is durably labelled "${durableLabel}", but the request names "${delegationCheck.value}". Nothing was launched. Omit delegation_id to inherit the label.`,
+            }],
+            details: {
+              error: "delegation label mismatch",
+              status: "refused",
+              sessionPath: params.sessionPath,
+              delegationId: durableLabel,
+              requestedDelegationId: delegationCheck.value,
+            },
+          };
+        }
+        const delegationId = delegationCheck.value ?? durableLabel;
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -3900,7 +4051,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // resumed pi has no allowed-tool set, the lazy-tools session_start
         // strip of the active loadout is never re-pushed, and the worker loses
         // its close tools ("Tool subagent_done not found").
-        const resumeMetadata = readSpawnMetadata(params.sessionPath);
         const resumeAgentDefs = resumeMetadata?.agent ? loadAgentDefaults(resumeMetadata.agent) : null;
         // One effective brief for durable registration, ACK and settlement.
         // A message-less resume continues the latest attempt, not the original task.
@@ -3990,8 +4140,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(params.message && /^Task name:\s*TASK-\d+/im.test(params.message) ? { task: params.message } : {}),
             completionId,
             attemptTask,
+            ...(delegationId ? { delegationId } : {}),
+            runId: id,
             launchedAt: new Date(startTime).toISOString(),
           });
+        } else if (delegationId) {
+          // TASK-313: no spawn metadata exists, so the label's only durable
+          // home is the minimal identity record — written before the child
+          // runs, refreshed per attempt. It grants no rights and fabricates no
+          // lineage, and spawn metadata is never created for it. If even this
+          // minimal write is impossible, refuse before any launch rather than
+          // run an execute whose label would silently evaporate on a crash.
+          try {
+            writeDelegationRecord(params.sessionPath, {
+              delegationId,
+              completionId,
+              runId: id,
+              recordedAt: new Date(startTime).toISOString(),
+            });
+          } catch {
+            closePaneQuietly(surface);
+            return {
+              content: [{
+                type: "text",
+                text:
+                  `Refused to resume ${params.sessionPath}: the delegation label ` +
+                  `"${delegationId}" could not be recorded durably, so nothing was launched. ` +
+                  `Resolve the write failure and retry the resume.`,
+              }],
+              details: {
+                error: "delegation label not durable",
+                status: "refused",
+                sessionPath: params.sessionPath,
+                delegationId,
+              },
+            };
+          }
         }
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -4021,6 +4205,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const running: RunningSubagent = {
           id,
           completionId,
+          ...(delegationId ? { delegationId } : {}),
           name,
           task: attemptTask,
           surface,
@@ -4069,6 +4254,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                     name: result.ping.name,
                     message: result.ping.message,
                     sessionFile: params.sessionPath,
+                    ...(running.delegationId ? { delegationId: running.delegationId } : {}),
+                    runId: running.id,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -4101,6 +4288,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: {
                   name,
                   completionId: running.completionId,
+                  ...(running.delegationId ? { delegationId: running.delegationId } : {}),
+                  runId: running.id,
                   task: running.task,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
@@ -4130,7 +4319,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name, completionId: running.completionId, task: running.task, sessionFile: running.sessionFile, error: err?.message },
+                details: { name, completionId: running.completionId, ...(running.delegationId ? { delegationId: running.delegationId } : {}), runId: running.id, task: running.task, sessionFile: running.sessionFile, error: err?.message },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -4144,6 +4333,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name,
             sessionPath: params.sessionPath,
             completionId,
+            ...(delegationId ? { delegationId } : {}),
+            runId: id,
             attemptTask: running.task,
             launchScriptFile,
             ...(resumeMsgFile ? { promptFile: resumeMsgFile, promptSha256 } : {}),

@@ -11,12 +11,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { launchScriptParser } from "./fake-launcher-helper.ts";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 
 const originalEnv = new Map([
-  "HERDR_ENV",
+  "TMPDIR", "HERDR_ENV",
   "HERDR_PANE_ID",
   "HERDR_TAB_ID",
   "HERDR_WORKSPACE_ID",
@@ -94,8 +94,11 @@ function fakeHerdr(root: string, panes: object[]): { bin: string; log: string } 
   const command = join(bin, "herdr");
   const log = join(root, "herdr.log");
   mkdirSync(bin, { recursive: true });
+  mkdirSync(join(root, "agent"), { recursive: true });
+  process.env.TMPDIR = root;
   writeFileSync(command, `#!/usr/bin/env python3
 import json, os, re, shlex, sys
+${launchScriptParser}
 args = sys.argv[1:]
 with open(os.environ["HERDR_LOG"], "a", encoding="utf-8") as f:
     f.write(" ".join(args) + "\\n")
@@ -114,7 +117,7 @@ elif args[:2] == ["pane", "read"]:
 elif args[:2] == ["pane", "run"]:
     script = args[3] if len(args) > 3 else ""
     try:
-        script_path = shlex.split(script)[1]
+        script_path = launch_script_path(script)
         text = open(script_path, encoding="utf-8").read()
         match = re.search(r"PI_SUBAGENT_SESSION='([^']+)'", text)
         if not match:
@@ -216,7 +219,7 @@ function contextFor(parent: string, root: string, entries: object[]) {
 
 for (const toolName of ["subagent", "subagent_resume"]) {
   it(`${toolName} contains a throwing queued error continuation`, { timeout: 10_000 }, async () => {
-    const root = mkdtempSync(join(tmpdir(), "f255-continuation-"));
+    const root = mkdtempSync("/home/kris/.pi/agent/var/f255-continuation-");
     tempRoots.add(root);
     const parent = join(root, "parent.jsonl");
     const entries = [header("parent-id", root)];
@@ -270,7 +273,7 @@ for (const toolName of ["subagent", "subagent_resume"]) {
 
 describe("F-111.2 restore flow", () => {
   it("injects the startup report, closes only the matching stale pane, resumes children, and is idempotent", async () => {
-    const root = mkdtempSync(join(tmpdir(), "f111-flow-"));
+    const root = mkdtempSync("/home/kris/.pi/agent/var/f111-flow-");
     tempRoots.add(root);
     const parent = join(root, "parent.jsonl");
     const entries: object[] = [header("parent-id", root)];
@@ -334,7 +337,7 @@ describe("F-111.2 restore flow", () => {
   });
 
   it("relaunches a phantom through subagent with its recorded task", async () => {
-    const root = mkdtempSync(join(tmpdir(), "f111-phantom-flow-"));
+    const root = mkdtempSync("/home/kris/.pi/agent/var/f111-phantom-flow-");
     tempRoots.add(root);
     const parent = join(root, "parent.jsonl");
     const entries: object[] = [header("parent-id", root)];
@@ -378,7 +381,7 @@ describe("F-111.2 restore flow", () => {
 // needs its own terminal-task guard (TASK-458's lives in subagent_resume).
 describe("TASK-464 phantom relaunch terminal-task guard", () => {
   async function phantomRestore(brief: string, boardStatus?: string) {
-    const root = mkdtempSync(join(tmpdir(), "task464-phantom-"));
+    const root = mkdtempSync("/home/kris/.pi/agent/var/task464-phantom-");
     tempRoots.add(root);
     if (boardStatus) {
       mkdirSync(join(root, "backlog", "tasks"), { recursive: true });
@@ -462,7 +465,7 @@ describe("TASK-464 phantom relaunch terminal-task guard", () => {
   });
 
   it("TASK-464 AC4 an explicit subagent spawn for a Done task's brief is not blocked", async () => {
-    const root = mkdtempSync(join(tmpdir(), "task464-explicit-"));
+    const root = mkdtempSync("/home/kris/.pi/agent/var/task464-explicit-");
     tempRoots.add(root);
     mkdirSync(join(root, "backlog", "tasks"), { recursive: true });
     writeFileSync(join(root, "backlog", "tasks", "task-464 - Phantom-lane.md"),
