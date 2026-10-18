@@ -2,8 +2,21 @@ import { after, it } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { launchScriptParser } from "./fake-launcher-helper.ts";
 import extension, { __test__ as testApi } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+
+it("fake launcher parses bare and owned-TMPDIR bash commands with quoted path spaces", () => {
+  const script = "/home/kris/.pi/agent/var/test fixture/launch script.sh";
+  for (const command of [
+    `bash '${script}'`,
+    `TMPDIR='/home/kris/.pi/agent/var/owned scratch' bash '${script}'`,
+  ]) {
+    const actual = execFileSync("python3", ["-c", `import shlex, sys\n${launchScriptParser}\nprint(launch_script_path(sys.argv[1]))`, command], { encoding: "utf8", timeout: 5000 }).trim();
+    assert.equal(actual, script, command);
+  }
+});
 
 const root = mkdtempSync("/home/kris/.pi/agent/var/task13-brief-");
 const keys = ["PATH", "HERDR_ENV", "PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_DENY_TOOLS", "PI_SUBAGENT_SHELL_READY_DELAY_MS"];
