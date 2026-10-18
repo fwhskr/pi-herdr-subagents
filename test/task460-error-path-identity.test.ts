@@ -1,8 +1,9 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { launchScriptParser } from "./fake-launcher-helper.ts";
+import { dirname, join } from "node:path";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 
@@ -19,7 +20,7 @@ import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 const EXT = join(homedir(), ".pi", "agent", "extensions", "nova-notify-watch.ts");
 const NO_MATCH = "completion lacks a matching child session/run and original task identity";
 const ENV_NAMES = [
-  "HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_LOG", "PATH",
+  "TMPDIR", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_LOG", "PATH",
   "PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_SUBAGENT_NAME", "PI_SUBAGENT_SESSION",
   "PI_SUBAGENT_SPAWN_DEPTH", "PI_SUBAGENT_SURFACE", "PI_SUBAGENT_ACTIVITY_FILE",
   "PI_SUBAGENT_AGENT", "PI_SUBAGENT_SHELL_READY_DELAY_MS", "SULA_DESKTOP_PARENT_THREAD_ID",
@@ -45,6 +46,7 @@ function fakeHerdr(root: string, done: boolean): void {
   const command = join(bin, "herdr");
   writeFileSync(command, `#!/usr/bin/env python3
 import json, os, re, shlex, sys
+${launchScriptParser}
 args = sys.argv[1:]
 if args[:2] == ["pane", "list"]:
     print(json.dumps({"result": {"type": "pane_list", "panes": []}}))
@@ -55,7 +57,7 @@ elif args[:2] == ["tab", "create"]:
 elif args[:2] == ["pane", "get"]:
     print(json.dumps({"result": {"pane": {"pane_id": args[2], "agent_status": "working"}}}))
 elif args[:2] == ["pane", "run"] and ${done ? "True" : "False"}:
-    text = open(shlex.split(args[3])[1]).read()
+    text = open(launch_script_path(args[3])).read()
     m = re.search(r"PI_SUBAGENT_SESSION='([^']+)'", text)
     if m:
         s = m.group(1)
@@ -77,7 +79,7 @@ type Captured = { customType: string; content: string; details: Record<string, a
  * rejects (the TASK-460 trigger) and the `.catch` error completion is sent.
  */
 async function launch(kind: "spawn" | "resume", failWatcher: boolean | "once", task: string): Promise<{ root: string; message: Captured; childSession: string }> {
-  const root = mkdtempSync(join(tmpdir(), "task460-"));
+  const root = mkdtempSync("/home/kris/.pi/agent/var/task460-");
   roots.push(root);
   const agentDir = join(root, "agent");
   mkdirSync(join(agentDir, "agents"), { recursive: true });
@@ -87,7 +89,7 @@ async function launch(kind: "spawn" | "resume", failWatcher: boolean | "once", t
   fakeHerdr(root, !failWatcher);
   Object.assign(process.env, {
     HERDR_ENV: "1", HERDR_PANE_ID: "parent-pane", HERDR_TAB_ID: "parent-tab", HERDR_WORKSPACE_ID: "parent-workspace",
-    PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_SHELL_READY_DELAY_MS: "0",
+    TMPDIR: root, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_SHELL_READY_DELAY_MS: "0",
   });
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_SUBAGENT_AGENT;
@@ -164,11 +166,12 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
   // resolveAgentIdentity() returns the lane persona instead of Nova and
   // session_start stays silent, so no completion envelope is ever retained.
   for (const name of ENV_NAMES) {
-    if (name === "SULA_DESKTOP_AGENT" || name === "PATH") continue;
+    if (["SULA_DESKTOP_AGENT", "PATH", "TMPDIR", "PI_CODING_AGENT_DIR"].includes(name)) continue;
     delete process.env[name];
   }
   process.env.SULA_DESKTOP_AGENT = "Nova";
   const watch = await import(EXT);
+  const { completionEnvelopePath } = await import(join(dirname(EXT), "lib/nova-completion-delivery.ts"));
   const project = join(root, "project");
   mkdirSync(project);
   if (!existsSync(delegation.sessionPath)) writeFileSync(delegation.sessionPath, "{}\n");
@@ -185,7 +188,7 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
   const start = async (event?: unknown) => {
     const handlers: Record<string, Function> = {};
     watch.default({ on: (name: string, h: Function) => { handlers[name] = h; }, sendMessage: (m: any, options?: any) => { sends.push(m); deliveries.push({ message: m, options }); } });
-    handlers.session_start({}, { cwd: project, sessionManager: { getSessionFile: () => undefined, getSessionId: () => "nova-460" } });
+    await handlers.session_start({}, { cwd: project, sessionManager: { getSessionFile: () => undefined, getSessionId: () => "nova-460" } });
     const before = sends.length;
     await new Promise((resolve) => setTimeout(resolve, 300)); // deferred replay
     const replayed = sends.slice(before);
@@ -196,7 +199,9 @@ async function throughNova(root: string, message: Captured, delegation: { id: st
     handlers.session_shutdown?.();
   };
   await start({ message: { role: "custom", ...message } }); // live ingestion (message_end)
-  const dir = join(project, ".nova-completions");
+  // Follow the watcher's storage contract: current receipts live in the
+  // fixture agent directory's runtime namespace, not necessarily the project.
+  const dir = dirname(completionEnvelopePath(project, message.details.completionId));
   const envelopeAfterLive = JSON.parse(readFileSync(join(dir, readdirSync(dir).find((n) => n.endsWith(".json"))!), "utf8"));
   await start(); // replacement session: replay the retained envelope
   // Track the live-retained envelope by id: an identity-less replay re-retains under a fresh random id.

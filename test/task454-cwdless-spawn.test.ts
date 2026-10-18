@@ -1,7 +1,8 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
+import { launchScriptParser } from "./fake-launcher-helper.ts";
 import { join } from "node:path";
 import subagentsExtension, { __test__ as subagentsTest } from "../pi-extension/subagents/index.ts";
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
@@ -12,7 +13,7 @@ import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 // threw `The "paths[0]" argument must be of type string. Received null`.
 
 const ENV_NAMES = [
-  "HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_LOG", "PATH",
+  "TMPDIR", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_LOG", "PATH",
   "PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_SUBAGENT_AGENT", "PI_SUBAGENT_SHELL_READY_DELAY_MS",
 ] as const;
 const originalEnv = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
@@ -35,6 +36,7 @@ function fakeHerdr(root: string): void {
   const command = join(bin, "herdr");
   writeFileSync(command, `#!/usr/bin/env python3
 import json, os, re, shlex, sys
+${launchScriptParser}
 args = sys.argv[1:]
 with open(os.environ["HERDR_LOG"], "a") as f:
     f.write(" ".join(args) + "\\n")
@@ -47,7 +49,7 @@ elif args[:2] == ["tab", "create"]:
 elif args[:2] == ["pane", "get"]:
     print(json.dumps({"result": {"pane": {"pane_id": args[2], "agent_status": "done"}}}))
 elif args[:2] == ["pane", "run"]:
-    text = open(shlex.split(args[3])[1]).read()
+    text = open(launch_script_path(args[3])).read()
     m = re.search(r"PI_SUBAGENT_SESSION='([^']+)'", text)
     if m:
         s = m.group(1)
@@ -64,7 +66,7 @@ elif args[:2] == ["pane", "run"]:
 
 /** Spawn through the real `subagent` tool; return the written launch script. */
 async function spawn(params: Record<string, unknown>, profileCwd?: string): Promise<{ root: string; script: string }> {
-  const root = mkdtempSync(join(tmpdir(), "task454-"));
+  const root = mkdtempSync("/home/kris/.pi/agent/var/task454-");
   roots.push(root);
   const agentDir = join(root, "agent");
   mkdirSync(join(agentDir, "agents"), { recursive: true });
@@ -84,6 +86,7 @@ async function spawn(params: Record<string, unknown>, profileCwd?: string): Prom
     HERDR_PANE_ID: "parent-pane",
     HERDR_TAB_ID: "parent-tab",
     HERDR_WORKSPACE_ID: "parent-workspace",
+    TMPDIR: root,
     PI_CODING_AGENT_DIR: agentDir,
     PI_SUBAGENT_SHELL_READY_DELAY_MS: "0",
   });
@@ -146,14 +149,14 @@ describe("TASK-454 cwd-less subagent spawn", () => {
   });
 
   it("control: an explicit cwd still resolves and launches there", async () => {
-    const explicit = mkdtempSync(join(tmpdir(), "task454-explicit-"));
+    const explicit = mkdtempSync("/home/kris/.pi/agent/var/task454-explicit-");
     roots.push(explicit);
     const { script } = await spawn({ cwd: explicit });
     assert.ok(script.includes(`cd '${explicit}' && `), "launch command enters the explicit cwd");
   });
 
   it("control: a profile-declared cwd wins over the parent-cwd default", async () => {
-    const declared = mkdtempSync(join(tmpdir(), "task454-profile-"));
+    const declared = mkdtempSync("/home/kris/.pi/agent/var/task454-profile-");
     roots.push(declared);
     const { root, script } = await spawn({}, declared);
     assert.ok(script.includes(`cd '${declared}' && `), "launch command enters the profile cwd");
@@ -170,7 +173,7 @@ describe("TASK-454 cwd-less subagent spawn", () => {
     let handler: Function | undefined;
     strictAgentProfiles({ on(event: string, h: Function) { if (event === "tool_call") handler = h; } } as any);
     delete process.env.PI_SUBAGENT_ID;
-    const cwd = mkdtempSync(join(tmpdir(), "task454-guard-"));
+    const cwd = mkdtempSync("/home/kris/.pi/agent/var/task454-guard-");
     roots.push(cwd);
     const input = { name: "probe-b45", agent: "small", task: "noop", interactive: true };
     const verdict = handler!({ toolName: "subagent", input }, { cwd });

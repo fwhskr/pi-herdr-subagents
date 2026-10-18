@@ -18,8 +18,8 @@ it("fake launcher parses bare and owned-TMPDIR bash commands with quoted path sp
   }
 });
 
-const root = mkdtempSync("/home/kris/.pi/agent/var/task13-brief-");
-const keys = ["PATH", "HERDR_ENV", "PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_DENY_TOOLS", "PI_SUBAGENT_SHELL_READY_DELAY_MS"];
+const root = mkdtempSync("/home/kris/.pi/agent/var/task13-brief with spaces-");
+const keys = ["TMPDIR", "PATH", "HERDR_ENV", "PI_CODING_AGENT_DIR", "PI_SUBAGENT_ID", "PI_DENY_TOOLS", "PI_SUBAGENT_SHELL_READY_DELAY_MS"];
 const env = Object.fromEntries(keys.map(key => [key, process.env[key]]));
 after(() => {
   for (const key of keys) { if (env[key] == null) delete process.env[key]; else process.env[key] = env[key]; }
@@ -33,13 +33,14 @@ it("no-message resume registers and delivers the same effective brief before lau
   const herdr = join(root, "bin/herdr");
   writeFileSync(herdr, `#!/usr/bin/env python3
 import json, re, shlex, sys
+${launchScriptParser}
 args = sys.argv[1:]
 if args[:2] == ['pane', 'list']:
  print(json.dumps({'result': {'type': 'pane_list', 'panes': []}}))
 elif args[:2] == ['tab', 'create']:
  print(json.dumps({'result': {'root_pane': {'pane_id': 'child-pane'}}}))
 elif args[:2] == ['pane', 'run']:
- text = open(shlex.split(args[3])[1]).read()
+ text = open(launch_script_path(args[3])).read()
  session = re.search(r"PI_SUBAGENT_SESSION='([^']+)'", text).group(1)
  meta = json.load(open(session + '.spawn.json'))
  json.dump(meta, open(session + '.at-launch.json', 'w'))
@@ -50,7 +51,9 @@ elif args[:2] == ['pane', 'run']:
   chmodSync(herdr, 0o755);
   process.env.PATH = `${join(root, "bin")}:${env.PATH}`;
   process.env.HERDR_ENV = "1";
+  process.env.TMPDIR = root;
   process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+  mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
   process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
   delete process.env.PI_SUBAGENT_ID;
   delete process.env.PI_DENY_TOOLS;
