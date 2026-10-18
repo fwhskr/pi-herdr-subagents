@@ -338,6 +338,20 @@ function pendingChildPollMs(): number {
   return Math.min(raw, 10_000);
 }
 
+/**
+ * TASK-321: bounded wait for tool calls still executing when a delegated run
+ * settles without a terminal assistant response. The forced exit is deferred
+ * until those tools end or this deadline passes, never longer.
+ */
+const DEFAULT_INFLIGHT_TOOL_GRACE_MS = 60_000;
+const INFLIGHT_TOOL_GRACE_CEILING_MS = 600_000;
+
+function inflightToolGraceMs(): number {
+  const raw = Number(process.env.PI_SUBAGENT_INFLIGHT_TOOL_GRACE_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_INFLIGHT_TOOL_GRACE_MS;
+  return Math.min(raw, INFLIGHT_TOOL_GRACE_CEILING_MS);
+}
+
 function fallbackGuardMs(): number {
   const raw = Number(process.env.PI_SUBAGENT_FALLBACK_GUARD_MS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_FALLBACK_GUARD_MS;
@@ -405,21 +419,46 @@ export function buildCompletionSidecar(messages: any[] | undefined, wrapup = fal
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done", ...(wrapup ? { wrapup: true } : {}) };
 }
 
+/**
+ * The settled run's outcome is an abort when its latest assistant turn says
+ * so, or when Pi's own `agent_settled` event reports `aborted` for a run whose
+ * latest assistant turn is not terminal (e.g. aborted before any assistant
+ * message, leaving stopReason missing).
+ */
+export function isAbortedSettle(stopReason: string | undefined, settleAborted: boolean): boolean {
+  return stopReason === "aborted" || (settleAborted && !isTerminalAutoExitStopReason(stopReason));
+}
+
 /** A settled autonomous delegation must not silently become an operator session. */
-export function buildForcedCompletionSidecar(messages: any[] | undefined, wrapup = false) {
+export function buildForcedCompletionSidecar(
+  messages: any[] | undefined,
+  wrapup = false,
+  settleAborted = false,
+) {
   const stopReason = latestAssistantStopReason(messages);
   if (stopReason === "stop" || stopReason === "error") {
     const completion = buildCompletionSidecar(messages, wrapup);
     return { ...completion, forcedExit: true, exitCode: completion.type === "error" ? 1 : 0 };
   }
+  if (isAbortedSettle(stopReason, settleAborted)) {
+    return {
+      type: "error" as const,
+      forcedExit: true,
+      stopReason: "aborted",
+      exitCode: 130,
+      errorMessage: stopReason === "aborted"
+        ? "Delegated turn was aborted without a terminal control signal; forced exit (interrupt source unknown)."
+        : `Delegated run was aborted (settle reported aborted; assistant stopReason=${stopReason ?? "missing"}); ` +
+          "forced exit (interrupt source unknown).",
+    };
+  }
   return {
     type: "error" as const,
     forcedExit: true,
     stopReason,
-    exitCode: stopReason === "aborted" ? 130 : 1,
-    errorMessage: stopReason === "aborted"
-      ? "Delegated turn was aborted without a terminal control signal; forced exit (interrupt source unknown)."
-      : `Delegated turn settled without a terminal assistant response (stopReason=${stopReason ?? "missing"}); forced exit.`,
+    exitCode: 1,
+    errorMessage:
+      `Delegated turn settled without a terminal assistant response (stopReason=${stopReason ?? "missing"}); forced exit.`,
   };
 }
 
@@ -540,6 +579,10 @@ export default function (
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
   let wrapupInProgress = false;
+  // TASK-321: Pi's own abort flag for the latest settle, and tool calls that
+  // started but have not ended. Both feed the delegated forced-exit decision.
+  let latestSettleAborted = false;
+  const inflightToolCalls = new Set<string>();
   let exitSidecarWritten = false;
   let processExitHandler: ((code: number) => void) | undefined;
   let uncaughtExceptionHandler: ((error: Error) => void) | undefined;
@@ -641,6 +684,8 @@ export default function (
 
   let fallbackGuardTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingChildTimer: ReturnType<typeof setTimeout> | undefined;
+  let inflightToolTimer: ReturnType<typeof setTimeout> | undefined;
+  let inflightToolCtx: any;
   // TASK-23: cumulative cooling-wait time spent this session, and when the
   // active cooling wait was armed (for accounting on clear/exit).
   let coolingWaitSpentMs = 0;
@@ -651,6 +696,40 @@ export default function (
       clearTimeout(pendingChildTimer);
       pendingChildTimer = undefined;
     }
+  }
+
+  function clearInflightToolGuard(): void {
+    if (inflightToolTimer) clearTimeout(inflightToolTimer);
+    inflightToolTimer = undefined;
+    inflightToolCtx = undefined;
+  }
+
+  /**
+   * TASK-321: a delegated run settled without a terminal assistant response
+   * while tool calls are still executing. Defer the forced exit until those
+   * tools end or a bounded deadline passes, so the settle never tears down an
+   * in-flight tool. A started turn (or a newer settle) cancels the wait.
+   */
+  function armInflightToolGuard(ctx: any): void {
+    clearInflightToolGuard();
+    inflightToolCtx = ctx;
+    inflightToolTimer = setTimeout(() => {
+      inflightToolTimer = undefined;
+      inflightToolCtx = undefined;
+      performExit(ctx);
+    }, inflightToolGraceMs());
+  }
+
+  function releaseInflightToolGuardIfIdle(): void {
+    if (!inflightToolCtx || inflightToolCalls.size > 0) return;
+    const ctx = inflightToolCtx;
+    // Let a continuation that starts on the same tick claim the lifecycle first.
+    if (inflightToolTimer) clearTimeout(inflightToolTimer);
+    inflightToolTimer = setTimeout(() => {
+      inflightToolTimer = undefined;
+      inflightToolCtx = undefined;
+      performExit(ctx);
+    }, 0);
   }
 
   function clearFallbackGuard(): void {
@@ -676,6 +755,7 @@ export default function (
     if (exitSidecarWritten) return;
     clearFallbackGuard();
     clearPendingChildGuard();
+    clearInflightToolGuard();
     const targetSessionFile = process.env.PI_SUBAGENT_SESSION;
     if (targetSessionFile) {
       try {
@@ -683,7 +763,7 @@ export default function (
           ? { type: "error" as const, forcedExit: true, exitCode: 1, errorMessage: heldFailure.reason,
               holdId: heldFailure.holdId, queuedAt: heldFailure.queuedAt, deadlineAt: heldFailure.deadlineAt }
           : delegatedTerminalRequired
-            ? buildForcedCompletionSidecar(latestAgentMessages, wrapupInProgress)
+            ? buildForcedCompletionSidecar(latestAgentMessages, wrapupInProgress, latestSettleAborted)
             : buildCompletionSidecar(latestAgentMessages, wrapupInProgress);
         writeExitSidecar(stampedSidecar(
           completion,
@@ -857,7 +937,9 @@ export default function (
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    latestSettleAborted = false;
     clearPendingChildGuard();
+    clearInflightToolGuard();
     recorder.agentStart();
   });
 
@@ -869,18 +951,23 @@ export default function (
     recorder.agentEndWaiting();
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
+  pi.on("agent_settled", (event, ctx) => {
     if (exitSidecarWritten) return;
     // A newer settled turn supersedes any pending-child wait from an earlier one.
     clearPendingChildGuard();
+    clearInflightToolGuard();
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     const stopReason = latestAssistantStopReason(latestAgentMessages);
+    // Pi reports whether the run itself was aborted; an abort before any
+    // assistant message leaves stopReason missing but is still an abort.
+    latestSettleAborted = (event as any)?.aborted === true;
+    const aborted = isAbortedSettle(stopReason, latestSettleAborted);
 
     // Time-limit wrap-up: an interrupt left the latest assistant turn aborted
     // and a .wrapup directive exists. Consume it once and inject a report-only
     // continuation. Checked BEFORE the Escape-disarm below so a machine-caused
     // time-limit interrupt is never mistaken for operator takeover.
-    const directive = !wrapupInProgress && stopReason === "aborted"
+    const directive = !wrapupInProgress && aborted
       ? consumeWrapupDirective(sessionFile)
       : null;
     if (directive) {
@@ -894,7 +981,7 @@ export default function (
 
     // An Escape-triggered abort is operator takeover too: permanently disarm
     // (single warning above) and leave the session open for inspection.
-    if (stopReason === "aborted" && !delegatedTerminalRequired) {
+    if (aborted && !delegatedTerminalRequired) {
       disarmAutoExit("Escape", ctx);
     }
 
@@ -942,6 +1029,15 @@ export default function (
       }
     }
 
+    // TASK-321: a delegated run that settled non-terminally (not aborted)
+    // while tools are still executing waits, bounded, for those tools to end.
+    // An abort stays authoritative and exits at once.
+    if (shouldExit && delegatedTerminalRequired && !aborted &&
+        !isTerminalAutoExitStopReason(stopReason) && inflightToolCalls.size > 0) {
+      armInflightToolGuard(ctx);
+      return;
+    }
+
     if (shouldExit) {
       if (autoExitShouldFire && oneShotReArm) {
         // Consume the one-shot re-arm: after this exit auto-exit is disarmed
@@ -966,6 +1062,7 @@ export default function (
     // cancel the bounded guards so the normal lifecycle owns the session again.
     clearFallbackGuard();
     clearPendingChildGuard();
+    clearInflightToolGuard();
     recorder.turnStart((event as any).turnIndex);
   });
 
@@ -986,6 +1083,8 @@ export default function (
   });
 
   pi.on("tool_execution_start", (event) => {
+    const id = (event as any).toolCallId;
+    if (typeof id === "string" && id) inflightToolCalls.add(id);
     recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
   });
 
@@ -1003,6 +1102,8 @@ export default function (
 
   pi.on("tool_execution_end", (event) => {
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
+    inflightToolCalls.delete((event as any).toolCallId);
+    releaseInflightToolGuardIfIdle();
   });
 
   pi.on("session_shutdown", (event) => {
@@ -1010,6 +1111,7 @@ export default function (
     unsubscribeHeldFailure = undefined;
     clearFallbackGuard();
     clearPendingChildGuard();
+    clearInflightToolGuard();
     recorder.sessionShutdown((event as any).reason);
   });
 
